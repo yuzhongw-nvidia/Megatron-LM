@@ -84,6 +84,9 @@ class TransformerConfig(ModelParallelConfig):
         vpp rank 1 pp rank 0~2 holds: decoder
         vpp rank 1 pp rank 3 holds: mtp, loss"""
 
+    seq1f1b_splits: Optional[int] = None
+    """Number of seq1f1b splits."""
+
     account_for_embedding_in_pipeline_split: bool = False
     """If set, the embedding layer will be treated as a standard transformer
     layer in the context of partition and placement for pipeline parallelism."""

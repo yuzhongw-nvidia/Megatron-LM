@@ -102,6 +102,7 @@ from megatron.core.num_microbatches_calculator import (
 
 from .async_utils import maybe_finalize_async_save
 from .utils import (
+    Seq1F1BDataIterator,
     append_to_progress_log,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
@@ -111,9 +112,9 @@ from .utils import (
     print_rank_0,
     print_rank_last,
     report_memory,
+    to_empty_if_meta_device,
     unwrap_model,
     update_use_dist_ckpt,
-    to_empty_if_meta_device,
 )
 from .global_vars import (
     destroy_global_vars,
@@ -2781,6 +2782,8 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
 
     if train_dataloader is not None:
         train_data_iterator = _get_iterator(dl_type, train_dataloader)
+        if args.seq1f1b_splits > 1:
+            train_data_iterator = Seq1F1BDataIterator(train_data_iterator, args)
     else:
         train_data_iterator = None
 

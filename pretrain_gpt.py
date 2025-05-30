@@ -12,9 +12,10 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.pipeline_parallel.seq_utils import Seq1F1BInfo
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_attr_wrapped_model, StragglerDetector
 from megatron.core.tokenizers.text.utils.build_tokenizer import build_tokenizer
+from megatron.core.utils import get_attr_wrapped_model, StragglerDetector
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -37,8 +38,31 @@ except ImportError:
 stimer = StragglerDetector()
 
 
+def update_seq1f1b_info():
+    from megatron.core.pipeline_parallel.sequence_split import get_splits
+    args = get_args()
+    if args.seq1f1b_splits == 1:
+        return None
+
+    splits = get_splits(args)
+    seq1f1b_info = parallel_state.get_pipeline_seq1f1b_info()
+    if seq1f1b_info is None:
+        seq1f1b_info = Seq1F1BInfo(0, 0, 0, splits[0], args.seq1f1b_splits, splits)
+    else:
+        last_span_idx = seq1f1b_info.span_idx_in_micro
+        seq1f1b_info.span_idx_in_micro = (seq1f1b_info.span_idx_in_micro + 1)  % args.seq1f1b_splits
+        seq1f1b_info.micro_batch_idx += 1 if seq1f1b_info.span_idx_in_micro == 0 else 0
+        seq1f1b_info.span_start = (seq1f1b_info.span_start + splits[last_span_idx]) % args.seq_length
+        seq1f1b_info.span_end = seq1f1b_info.span_start + splits[seq1f1b_info.span_idx_in_micro]
+    parallel_state.set_pipeline_seq1f1b_info(seq1f1b_info)
+    return seq1f1b_info
+
+
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
+
+    seq1f1b_info = update_seq1f1b_info()
+
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage):
         return None, None, None, None, None
@@ -73,9 +97,16 @@ def loss_func(
             the data parallel ranks
     """
     args = get_args()
+    seq1f1b_info = parallel_state.get_pipeline_seq1f1b_info()
 
     if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
         return loss_func_modelopt(loss_mask, output_tensor, model=model)
+    
+    if args.seq1f1b_splits > 1:
+        start = seq1f1b_info.span_start
+        end = seq1f1b_info.span_end
+        losses = output_tensor[..., start:end].contiguous()
+        loss_mask = loss_mask[..., start:end].contiguous()
 
     losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
@@ -135,8 +166,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, vp_stage)
-    timers('batch-generator').stop()
 
+    timers('batch-generator').stop()
     with stimer:
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)

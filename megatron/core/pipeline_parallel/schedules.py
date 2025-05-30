@@ -8,6 +8,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.pipeline_parallel.sequence_split import sequence_1f1b_queue
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
@@ -686,7 +687,8 @@ def get_pp_rank_microbatches(
     microbatch_group_size_per_vp_stage,
     forward_only=False,
     overlap_moe_expert_parallel_comm=False,
-    p2p_communicator: Optional[P2PCommunicator] = None,
+    p2p_communicator: Optional[P2PCommunicator]=None,
+    seq1f1b_splits=1,
 ):
     """Get the number of total, warmup, and remaining microbatches in PP scheduling."""
     if p2p_communicator is not None:
@@ -700,7 +702,7 @@ def get_pp_rank_microbatches(
             parallel_state.get_virtual_pipeline_model_parallel_world_size()
         )
 
-    total_num_microbatches = num_microbatches * num_model_chunks
+    total_num_microbatches = num_microbatches * num_model_chunks * seq1f1b_splits
     are_all_microbatches_in_warmup = False
 
     if forward_only:
@@ -708,7 +710,7 @@ def get_pp_rank_microbatches(
     elif pipeline_parallel_size > 1:
         if virtual_pipeline_parallel_size is None:
             # forward_backward_pipelining_without_interleaving
-            num_warmup_microbatches = pipeline_parallel_size - pipeline_parallel_rank - 1
+            num_warmup_microbatches = pipeline_parallel_size - pipeline_parallel_rank + seq1f1b_splits - 2
         else:
             # forward_backward_pipelining_with_interleaving
             # Run (num_model_chunks-1)*microbatch_group_size_per_vp_stage on
@@ -717,6 +719,7 @@ def get_pp_rank_microbatches(
             # immediately start with 1F1B).
             num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
             num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
+            num_warmup_microbatches += seq1f1b_splits - 1
             # When enabling overlap_moe_expert_parallel_comm, we schedule one extra micro-batch
             # forward step before the 1f1b stages. This is needed to ensure the forward
             # and backward computations are independent in all 1f1b steps.
@@ -947,15 +950,23 @@ def forward_backward_pipelining_with_interleaving(
 
     # Model chunk IDs with synchronized grads
     synchronized_model_chunks = set()
-
-    input_tensors = [[] for _ in range(len(model))]
-    output_tensors = [[] for _ in range(len(model))]
+    if config.seq1f1b_splits == 1:
+        input_tensors = [[] for _ in range(len(model))]
+        output_tensors = [[] for _ in range(len(model))]
+    else:
+        # assert config.variable_seq_lengths, "seq1f1b needs variable_seq_lengths"
+        config.variable_seq_lengths = True
+        input_tensors = [sequence_1f1b_queue(config.seq1f1b_splits, print=False, chunk=i, add_msg="input") for i in range(len(model))]
+        output_tensors = [sequence_1f1b_queue(config.seq1f1b_splits, print=False, chunk=i, add_msg="output") for i in range(len(model))]
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     forward_data_store = []
     output_tensor_grads = None
     if not forward_only:
-        output_tensor_grads = [[] for _ in range(len(model))]
+        if config.seq1f1b_splits == 1:
+            output_tensor_grads = [[] for _ in range(len(model))]
+        else:
+            output_tensor_grads = [sequence_1f1b_queue(config.seq1f1b_splits) for _ in range(len(model))]
     else:
         output_tensor_grads = None
 
@@ -1006,7 +1017,14 @@ def forward_backward_pipelining_with_interleaving(
         forward_only=forward_only,
         overlap_moe_expert_parallel_comm=config.overlap_moe_expert_parallel_comm,
         p2p_communicator=p2p_communicator,
+        seq1f1b_splits=config.seq1f1b_splits,
     )
+    if torch.distributed.get_rank() == 0:
+        print(f"total micro: {total_num_microbatches}, "
+          f"all in warmup: {are_all_microbatches_in_warmup}, "
+          f"warmup micro: {num_warmup_microbatches}, "
+          f"microbatch_group_size_per_vp_stage : {config.microbatch_group_size_per_vp_stage }, "
+          f"remaining micro: {num_microbatches_remaining}")
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
@@ -1032,8 +1050,9 @@ def forward_backward_pipelining_with_interleaving(
     # virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
     # microbatch_id         | 0 1 2 0 1 2 3 4 3 4
     # model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
+    num_microbatches = num_microbatches * config.seq1f1b_splits
     schedule_table = get_schedule_table(
-        num_microbatches, len(model), config.microbatch_group_size_per_vp_stage
+        num_microbatches, len(model), config.microbatch_group_size_per_vp_stage 
     )
 
     # Decouple individual lookup table for microbatch_id and model_chunk_id.
@@ -1167,8 +1186,19 @@ def forward_backward_pipelining_with_interleaving(
         # This input buffering is needed to overlap the computation with the receipt of
         # the next inputs. To index the proper buffered inputs for forword_step, we use
         # microbatch_id offset with number of released microbatches that have completed backprop.
-        offset = num_released_microbatches(virtual_microbatch_id, model_chunk_id)
-        input_tensor = input_tensors[model_chunk_id][microbatch_id - offset]
+        if config.seq1f1b_splits > 1:
+            assert (
+                config.microbatch_group_size_per_vp_stage
+                == parallel_state.get_pipeline_model_parallel_world_size()
+            ), "Seq1F1B does not support tunable pipeline parallel"
+            assert (
+                not config.overlap_p2p_comm_warmup_flush
+            ), "Seq1F1B does not support overlap in warmup/flush"
+            input_tensor = input_tensors[model_chunk_id][-1]
+        else:
+            offset = num_released_microbatches(virtual_microbatch_id, model_chunk_id)
+            input_tensor = input_tensors[model_chunk_id][microbatch_id - offset]
+
 
         return input_tensor
 
@@ -2051,8 +2081,10 @@ def forward_backward_pipelining_without_interleaving(
 
     # Compute number of warmup microbatches.
     num_warmup_microbatches = (
-        p2p_communicator.pp_group.size() - p2p_communicator.pp_group.rank() - 1
+        (p2p_communicator.pp_group.size() - p2p_communicator.pp_group.rank() - 1)
+        + (config.seq1f1b_splits - 1)
     )
+    num_microbatches *= config.seq1f1b_splits
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
 
@@ -2098,10 +2130,20 @@ def forward_backward_pipelining_without_interleaving(
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     if not forward_only:
-        input_tensors = []
-        output_tensors = []
+        if config.seq1f1b_splits > 1:
+            config.variable_seq_lengths = True
+            config.batch_p2p_comm = False
+            input_tensors = sequence_1f1b_queue(config.seq1f1b_splits, print=False, add_msg="input") 
+            output_tensors = sequence_1f1b_queue(config.seq1f1b_splits, print=False, add_msg="output")
+        else:
+            input_tensors = []
+            output_tensors = []
     forward_data_store = []
 
+    if torch.distributed.get_rank() == 0:
+        print(f"total micro: {num_microbatches }, "
+          f"warmup micro: {num_warmup_microbatches}, "
+          f"remaining micro: {num_microbatches_remaining}")
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
         # Decide to checkpoint all layers' activations of the current micro-batch

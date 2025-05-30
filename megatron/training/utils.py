@@ -31,16 +31,19 @@ except ImportError:
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
-from megatron.training import get_args, get_adlr_autoresume
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.pipeline_parallel.sequence_split import get_splits
+from megatron.core.pipeline_parallel.seq_utils import Seq1F1BInfo
+from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
     to_local_if_dtensor,
     unwrap_model,
 )
+from megatron.training import get_args, get_adlr_autoresume
 from megatron.legacy.model.module import param_is_not_shared
 
 
@@ -498,6 +501,69 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
+########################
+###      Seq1F1B     ###
+########################
+class Seq1F1BDataIterator:
+    def __init__(self, data_iterator: RerunDataIterator, global_args):
+        self.offset = -1
+        self.original_data = self.token_slices = self.position_ids_slices = self.labels_slices = None
+        self.count = 0
+        self.global_args = global_args
+        self.split_span = get_splits(global_args)
+        self.num_splits = global_args.seq1f1b_splits
+        self.split_cumsum = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                torch.cumsum(torch.tensor(self.split_span, dtype=torch.int32), dim=0),
+            ]
+        )
+        self.data_iterator = data_iterator
+
+    def __getattr__(self, name):
+        if name in ['load_state_dict', 'state_dict']:
+            attr = getattr(self.data_iterator, name)
+        return attr
+
+    def __next__(self):
+        if self.offset == -1 or self.offset + 1 == self.num_splits:
+            self.original_data = next(self.data_iterator)
+            tokens, labels, loss_mask, position_ids = (
+                self.original_data["tokens"],
+                self.original_data["labels"],
+                self.original_data["loss_mask"],
+                self.original_data["position_ids"],
+            )
+            self.token_slices, self.position_ids_slices = (
+                t.split(self.split_span, dim=1) for t in (tokens, position_ids)
+            )
+            self.labels_slices = labels.split(self.split_span, dim=1)
+            self.count += 1
+        else:
+            tokens, labels, loss_mask, position_ids = (
+                self.original_data["tokens"],
+                self.original_data["labels"],
+                self.original_data["loss_mask"],
+                self.original_data["position_ids"],
+            )
+            
+        self.offset = (self.offset + 1) % self.num_splits
+        slice_start = self.split_cumsum[self.offset].item()
+        slice_end = self.split_cumsum[self.offset + 1].item()
+
+        labels_slice = self.labels_slices[self.offset]
+
+        token_slice = self.token_slices[self.offset]
+        position_ids_slice = self.position_ids_slices[self.offset]
+        slice_data = {
+            'tokens': token_slice,
+            'labels': labels_slice,
+            'loss_mask': loss_mask,
+            'position_ids': position_ids_slice,
+        }
+
+        return slice_data
+
 def get_batch_on_this_tp_rank(data_iterator):
 
     args = get_args()
@@ -525,6 +591,8 @@ def get_batch_on_this_tp_rank(data_iterator):
             ),
             'position_ids': data["position_ids"].cuda(non_blocking=True),
         }
+        if args.seq1f1b_splits > 1:
+            assert batch['attention_mask'] is None, "attention_mask must be None if you want to use seq1f1b"
 
         if args.pipeline_model_parallel_size == 1:
             _broadcast(batch['tokens'])

@@ -6,12 +6,16 @@ from typing import NoReturn, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
+from collections import defaultdict
+import inspect
 
-from megatron.core import tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
+    get_pos_emb_on_this_cp_rank,
+    get_pos_emb_on_this_span
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -23,6 +27,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.seq1f1b_attn import Seq1F1BAttn, SpanInfo
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
@@ -132,6 +137,7 @@ class Attention(MegatronModule, ABC):
         self.layer_number = layer_number
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+        self.kv_cache_pool = defaultdict(dict)
 
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
@@ -256,6 +262,16 @@ class Attention(MegatronModule, ABC):
             dtype=dtype,
             device=torch.cuda.current_device(),
         )
+    def _adjust_rotary_pos_emb_for_sp(self, emb):
+        if parallel_state.get_pipeline_seq1f1b_info() is not None:
+            emb = get_pos_emb_on_this_span(emb, 0)
+
+        if parallel_state.get_context_parallel_world_size() > 1 and not packed_seq:
+            # slice rotary_pos_emb along sequence dimension and select the parition of the current
+            # CP rank
+            emb = get_pos_emb_on_this_cp_rank(emb, 0)
+        return emb
+        
 
     def _adjust_key_value_for_inference(
         self,
@@ -727,6 +743,8 @@ class Attention(MegatronModule, ABC):
             )
         )
 
+        rotary_pos_emb = (self._adjust_rotary_pos_emb_for_sp(emb) for emb in rotary_pos_emb)
+
         if packed_seq_params is not None:
             query = query.squeeze(1)
             key = key.squeeze(1)
@@ -787,6 +805,7 @@ class Attention(MegatronModule, ABC):
 
         nvtx_range_push(suffix="core_attention")
         if self.checkpoint_core_attention and self.training:
+            assert False, "no checkpointing"
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
@@ -799,15 +818,36 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    attn_mask_type=attn_mask_type,
-                    attention_bias=attention_bias,
-                    packed_seq_params=packed_seq_params,
-                )
+                seq1f1b_info = parallel_state.get_pipeline_seq1f1b_info()
+                if seq1f1b_info is not None:
+                    span_info = SpanInfo(
+                        seq1f1b_info.span_idx_in_micro,
+                        seq1f1b_info.num_spans,
+                        self.kv_cache_pool[seq1f1b_info.micro_batch_idx],
+                        0
+                    )
+                    signature = inspect.signature(self.core_attention.forward)
+                    bound_args = signature.bind(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                    )
+                    args = bound_args.args
+                    core_attn_out = Seq1F1BAttn.apply(self.core_attention, span_info, *args)
+                else:
+                    core_attn_out = self.core_attention(
+                        query,
+                        key,
+                        value,
+                        attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                    )
 
             else:
                 # Dynamic batching attention kernel.
