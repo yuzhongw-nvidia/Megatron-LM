@@ -45,12 +45,6 @@ def _batched_p2p_ops(
         )
         ops.append(recv_next_op)
 
-    def pairwise_swap(lst):
-        return [lst[i + 1] if i % 2 == 0 else lst[i - 1] for i in range(len(lst))]
-
-    if get_pipeline_model_parallel_rank() % 2 == 1 and len(ops) % 2 == 0:
-        ops = pairwise_swap(ops)
-
     if len(ops) > 0:
         reqs = torch.distributed.batch_isend_irecv(ops)
     else:

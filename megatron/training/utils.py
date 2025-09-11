@@ -504,7 +504,7 @@ def get_blend_and_blend_per_split(args):
 ########################
 ###      Seq1F1B     ###
 ########################
-class Seq1F1BDataIterator:
+class Seq1F1BDataIterator(RerunDataIterator):
     def __init__(self, data_iterator: RerunDataIterator, global_args):
         self.offset = -1
         self.original_data = self.token_slices = self.position_ids_slices = self.labels_slices = None
