@@ -6,11 +6,8 @@ from typing import Callable, ContextManager, Optional
 
 import torch
 
-from megatron.core.utils import experimental_api
 
-
-@dataclass
-@experimental_api
+@dataclass(kw_only=True)
 class ModelParallelConfig:
     """Base configuration for Megatron Core
 

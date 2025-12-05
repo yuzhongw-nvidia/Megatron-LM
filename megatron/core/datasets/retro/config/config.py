@@ -5,15 +5,13 @@
 from dataclasses import dataclass
 
 from megatron.core.transformer import TransformerConfig
-from megatron.core.utils import experimental_api
 
 from .bert_embedders import RetroBertEmbedders
 from .gpt_chunk_datasets import RetroGPTChunkDatasets
 from .tokenizers import RetroTokenizers
 
 
-@dataclass
-@experimental_api
+@dataclass(kw_only=True)
 class RetroPreprocessingConfig(TransformerConfig):
     # pylint: disable=line-too-long
     """Configuration object for Retro preprocessing.
