@@ -1105,6 +1105,7 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_q,
                             mscale=_yarn_get_concentration_factor_from_config(self.config),
                             cp_group=self.pg_collection.cp,
+                            multi_latent_attention=False,
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
@@ -1118,6 +1119,7 @@ class Attention(MegatronModule, ABC):
                         cu_seqlens=cu_seqlens_kv,
                         mscale=_yarn_get_concentration_factor_from_config(self.config),
                         cp_group=self.pg_collection.cp,
+                        multi_latent_attention=False,
                     )
             else:
                 query, key, value = apply_fused_qkv_rotary_pos_emb(

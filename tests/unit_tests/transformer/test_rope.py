@@ -136,8 +136,12 @@ class TestQKVRotaryEmbedding:
         (query_in, key_in, value_in) = torch.split(qkv, qkv_split_arg_list, dim=3)
 
         query_in = query_in.reshape(query_in.shape[0], query_in.shape[1], -1, self.kv_channels)
-        q_out_ref = apply_rotary_pos_emb(query_in, pos_embed, self.transformer_config)
-        k_out_ref = apply_rotary_pos_emb(key_in, pos_embed, self.transformer_config)
+        q_out_ref = apply_rotary_pos_emb(
+            query_in, pos_embed, self.transformer_config, multi_latent_attention=False
+        )
+        k_out_ref = apply_rotary_pos_emb(
+            key_in, pos_embed, self.transformer_config, multi_latent_attention=False
+        )
         q_out, k_out, _ = apply_fused_qkv_rotary_pos_emb(
             qkv, pos_embed, pos_embed, qkv_split_arg_list
         )

@@ -103,6 +103,9 @@ def _apply_rotary_pos_emb_bshd(
     Args:
         t (Tensor): Input tensor T is of shape [seq_length, ... , dim]
         freqs (Tensor): Rotary Positional embedding tensor freq is of shape [seq_length, ..., dim]
+        rotary_interleaved (bool): Whether to apply interleaving in the rotate half function.
+        multi_latent_attention (bool): Whether to apply MLA-style interleaving for RoPE.
+        mscale (float): The scaling factor for the RoPE.
 
     Returns:
         Tensor: The input tensor after applying RoPE
@@ -254,6 +257,7 @@ def apply_rotary_pos_emb(
     cu_seqlens: Optional[Tensor] = None,
     mscale: float = 1.0,
     cp_group: torch.distributed.ProcessGroup = None,
+    multi_latent_attention: bool = False,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
@@ -282,6 +286,12 @@ def apply_rotary_pos_emb(
                     "Using unfused implementation."
                 )
                 use_unfused = True
+            if multi_latent_attention:
+                warnings.warn(
+                    "apply_rope_fusion does not support MLA-style interleaving in RoPE."
+                    "Using unfused implementation."
+                )
+                use_unfused = True
             if not use_unfused:
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
@@ -296,7 +306,7 @@ def apply_rotary_pos_emb(
             t,
             freqs,
             rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=config.multi_latent_attention,
+            multi_latent_attention=multi_latent_attention,
             mscale=mscale,
         )
     else:
@@ -305,7 +315,7 @@ def apply_rotary_pos_emb(
             cu_seqlens,
             freqs,
             rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=config.multi_latent_attention,
+            multi_latent_attention=multi_latent_attention,
             mscale=mscale,
             cp_group=cp_group,
         )

@@ -808,8 +808,8 @@ class ParallelAttention(MegatronModule):
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
-            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb,self.config)
-            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb,self.config)
+            query_layer = apply_rotary_pos_emb(query_layer, q_pos_emb,self.config, multi_latent_attention=False)
+            key_layer = apply_rotary_pos_emb(key_layer, k_pos_emb,self.config, multi_latent_attention=False)
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect

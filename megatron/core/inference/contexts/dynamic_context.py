@@ -1056,6 +1056,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             cu_seqlens=cu_seqlens_q,
             cp_group=cp_group,
             mscale=mscale,
+            multi_latent_attention=config.multi_latent_attention,
         )
         return query
 
@@ -1090,11 +1091,21 @@ class DynamicInferenceContext(BaseInferenceContext):
                     f"paused_request_count={self.paused_request_count}"
                 )
             key = apply_rotary_pos_emb(
-                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group, mscale=mscale
+                t=key[:n],
+                freqs=key_emb[:n],
+                config=config,
+                cp_group=cp_group,
+                mscale=mscale,
+                multi_latent_attention=config.multi_latent_attention,
             )
         else:
             key[:n] = apply_rotary_pos_emb(
-                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group, mscale=mscale
+                t=key[:n],
+                freqs=key_emb[:n],
+                config=config,
+                cp_group=cp_group,
+                mscale=mscale,
+                multi_latent_attention=config.multi_latent_attention,
             )
         return key
 
