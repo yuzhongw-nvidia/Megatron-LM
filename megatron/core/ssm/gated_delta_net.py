@@ -45,7 +45,7 @@ try:
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
-except ImportError:
+except (ImportError, RuntimeError):
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
