@@ -371,7 +371,7 @@ class DSv4HybridAttention(Attention):
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
-        if self.config.rope_type == "rope":
+        if not self._dsv4_uses_yarn_rope:
             rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
         else:
             if self.config.apply_rope_fusion and _dsv4_use_fused_mla_rope():
@@ -577,7 +577,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.config.rope_type == "rope":
+        if not self._dsv4_uses_yarn_rope:
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
             if self.config.apply_rope_fusion and _dsv4_use_fused_mla_rope():
