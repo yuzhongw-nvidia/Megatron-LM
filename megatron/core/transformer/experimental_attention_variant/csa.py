@@ -121,6 +121,11 @@ def _dsv4_unscaled_rotary_cos_sin(
     return rotary_pos_emb.cos().to(dtype).contiguous(), rotary_pos_emb.sin().to(dtype).contiguous()
 
 
+def _dsv4_use_fused_mla_rope() -> bool:
+    """DSv4 reference uses adjacent complex-pair RoPE; keep this path unfused for parity."""
+    return False
+
+
 def _dsv4_fp8_fake_quant_inplace(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
     """Match DSv4 reference activation fake-quant/dequant for non-RoPE KV dims."""
     if x.size(-1) == 0:
@@ -198,7 +203,7 @@ def _apply_rope(
         rotary_pos_emb = rotary_pos_emb_module(total_seq_len, packed_seq=False)
         mscale = 1.0
     else:
-        if config.apply_rope_fusion:
+        if config.apply_rope_fusion and _dsv4_use_fused_mla_rope():
             rotary_pos_cos, rotary_pos_sin = _dsv4_unscaled_rotary_cos_sin(
                 rotary_pos_emb_module,
                 total_seq_len,
@@ -226,7 +231,7 @@ def _apply_rope(
     squeeze_head = x.dim() == 3
     if squeeze_head:
         x = x.unsqueeze(-2)
-    if config.apply_rope_fusion:
+    if config.apply_rope_fusion and _dsv4_use_fused_mla_rope():
         out = fused_mla_rope_inplace(
             x,
             rotary_pos_cos,

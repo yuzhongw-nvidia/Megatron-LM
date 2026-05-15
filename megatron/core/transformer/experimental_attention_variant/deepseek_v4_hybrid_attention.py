@@ -55,6 +55,11 @@ def _dsv4_unscaled_rotary_cos_sin(
     return rotary_pos_emb.cos().to(dtype).contiguous(), rotary_pos_emb.sin().to(dtype).contiguous()
 
 
+def _dsv4_use_fused_mla_rope() -> bool:
+    """DSv4 reference uses adjacent complex-pair RoPE; keep this path unfused for parity."""
+    return False
+
+
 def _dsv4_fp8_fake_quant_inplace(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
     """Match DSv4 reference activation fake-quant/dequant for non-RoPE KV dims."""
     if x.size(-1) == 0:
@@ -377,7 +382,7 @@ class DSv4HybridAttention(Attention):
         if self.config.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
         else:
-            if self.config.apply_rope_fusion:
+            if self.config.apply_rope_fusion and _dsv4_use_fused_mla_rope():
                 rotary_pos_cos, rotary_pos_sin = _dsv4_unscaled_rotary_cos_sin(
                     self.rotary_pos_emb,
                     rope_seqlen,
@@ -396,7 +401,7 @@ class DSv4HybridAttention(Attention):
                 # concentration factor (mscale) is not part of the DSv4 model contract;
                 # the model relies on Q/KV RMS-norm + unit-magnitude rotation.
                 mscale = 1.0
-        if self.config.apply_rope_fusion:
+        if self.config.apply_rope_fusion and _dsv4_use_fused_mla_rope():
             core_attn_out = fused_mla_rope_inplace(
                 core_attn_out,
                 rotary_pos_cos,
@@ -607,7 +612,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         if self.config.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
-            if self.config.apply_rope_fusion:
+            if self.config.apply_rope_fusion and _dsv4_use_fused_mla_rope():
                 rotary_pos_cos, rotary_pos_sin = _dsv4_unscaled_rotary_cos_sin(
                     self.rotary_pos_emb,
                     rotary_seq_len,
@@ -688,7 +693,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             if k_pos_emb is not None:
                 k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
-            if self.config.apply_rope_fusion:
+            if self.config.apply_rope_fusion and _dsv4_use_fused_mla_rope():
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
                 query = fused_mla_rope_inplace(
