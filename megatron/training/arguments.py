@@ -4534,7 +4534,19 @@ def _add_mla_args(parser):
         '--original-max-position-embeddings',
         type=int,
         default=4096,
-        help="Original maximum position embeddings for the original model, used by yarn.",
+        help="Original maximum position embeddings for YaRN rotary embeddings.",
+    )
+    group.add_argument(
+        '--beta-fast',
+        type=float,
+        default=32,
+        help="Fast beta value for YaRN rotary embeddings.",
+    )
+    group.add_argument(
+        '--beta-slow',
+        type=float,
+        default=1,
+        help="Slow beta value for YaRN rotary embeddings.",
     )
     group.add_argument(
         '--mscale', type=float, default=1.0, help="Mscale for YaRN RoPE in multi-latent attention."
