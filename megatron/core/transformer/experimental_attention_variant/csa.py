@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Union
@@ -24,6 +25,33 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+
+
+
+def _dsv4_deep_debug_csa_enabled(module) -> bool:
+    root = os.environ.get("DSV4_DEEP_DEBUG_DIR")
+    if not root:
+        return False
+    layer_number = getattr(module, "layer_number", None)
+    if layer_number is None:
+        return False
+    return int(os.environ.get("DSV4_DEEP_DEBUG_LAYER", "0")) == int(layer_number) - 1
+
+
+def _dsv4_deep_debug_csa_save(name: str, tensor: torch.Tensor) -> None:
+    root = os.environ.get("DSV4_DEEP_DEBUG_DIR")
+    if not root:
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+    with torch.no_grad():
+        value = tensor.detach().contiguous()
+        if torch.is_floating_point(value):
+            value = value.float()
+        os.makedirs(root, exist_ok=True)
+        torch.save(value.cpu(), os.path.join(root, f"megatron_{name}.pt"))
+
 
 # ---------------------------------------------------------------------------
 # Helper functions for index computation
@@ -83,6 +111,66 @@ def get_compress_topk_idxs(
 # ---------------------------------------------------------------------------
 
 
+def _dsv4_unscaled_rotary_cos_sin(
+    rotary_pos_emb_module, seq_len, dtype, packed_seq=False, cp_group=None
+):
+    """Return raw RoPE cos/sin without YaRN attention-factor scaling."""
+    rotary_pos_emb = rotary_pos_emb_module(seq_len, packed_seq=packed_seq, cp_group=cp_group)
+    if isinstance(rotary_pos_emb, tuple):
+        rotary_pos_emb = rotary_pos_emb[0]
+    return rotary_pos_emb.cos().to(dtype).contiguous(), rotary_pos_emb.sin().to(dtype).contiguous()
+
+
+def _dsv4_fp8_fake_quant_inplace(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
+    """Match DSv4 reference activation fake-quant/dequant for non-RoPE KV dims."""
+    if x.size(-1) == 0:
+        return x
+    if x.size(-1) % block_size != 0:
+        raise ValueError(f"DSv4 fake quant dim {x.size(-1)} is not divisible by {block_size}")
+    orig_shape = x.shape
+    values = x.contiguous().view(-1, x.size(-1) // block_size, block_size)
+    scale = values.float().abs().amax(dim=-1, keepdim=True).clamp(min=1e-4) / 448.0
+    quantized = (values.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    dequantized = quantized.float() * scale
+    x.copy_(dequantized.to(dtype=x.dtype).view(orig_shape))
+    return x
+
+
+def _dsv4_fp4_fake_quant_inplace(x: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """Match DSv4 reference FP4 activation fake-quant/dequant after Hadamard rotation."""
+    if x.size(-1) == 0:
+        return x
+    if x.size(-1) % block_size != 0:
+        raise ValueError(f"DSv4 FP4 fake quant dim {x.size(-1)} is not divisible by {block_size}")
+
+    orig_shape = x.shape
+    values = x.contiguous().view(-1, x.size(-1) // block_size, block_size)
+    values_f = values.float()
+
+    tiny = torch.tensor(6.0 * (2.0**-126), device=x.device, dtype=torch.float32)
+    scale = values_f.abs().amax(dim=-1, keepdim=True).clamp(min=tiny) / 6.0
+    scale = torch.pow(2.0, torch.ceil(torch.log2(scale)))
+
+    normalized = (values_f / scale).clamp(-6.0, 6.0)
+    sign = torch.sign(normalized)
+    magnitude = normalized.abs()
+
+    levels = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=x.device,
+        dtype=torch.float32,
+    )
+    boundaries = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+        device=x.device,
+        dtype=torch.float32,
+    )
+    quantized = levels[torch.bucketize(magnitude, boundaries)]
+    dequantized = sign * quantized * scale
+    x.copy_(dequantized.to(dtype=x.dtype).view(orig_shape))
+    return x
+
+
 def _apply_rope(
     x: torch.Tensor,
     nope_dim: int,
@@ -111,8 +199,12 @@ def _apply_rope(
         mscale = 1.0
     else:
         if config.apply_rope_fusion:
-            rotary_pos_cos, rotary_pos_sin = rotary_pos_emb_module.get_cached_cos_sin(
-                total_seq_len, dtype=x.dtype, packed_seq=False
+            rotary_pos_cos, rotary_pos_sin = _dsv4_unscaled_rotary_cos_sin(
+                rotary_pos_emb_module,
+                total_seq_len,
+                x.dtype,
+                packed_seq=False,
+                cp_group=cp_group,
             )
             rotary_pos_emb = None
             assert (
@@ -121,8 +213,8 @@ def _apply_rope(
         else:
             rotary_pos_emb, mscale = rotary_pos_emb_module(total_seq_len, packed_seq=False)
             # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
-            # concentration factor (mscale) is NOT part of the DSv4 model contract --
-            # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
+            # concentration factor (mscale) is not part of the DSv4 model contract;
+            # the model relies on Q/KV RMS-norm + unit-magnitude rotation.
             mscale = 1.0
     if rotary_pos_emb is not None and ratio > 1:
         rotary_pos_emb = rotary_pos_emb[:total_seq_len:ratio][:rotary_seq_len]
@@ -391,6 +483,9 @@ class Compressor(MegatronModule):
 
         if self.rotate:
             kv = rotate_activation(kv)
+            _dsv4_fp4_fake_quant_inplace(kv)
+        else:
+            _dsv4_fp8_fake_quant_inplace(kv[..., : self.head_dim - self.qk_pos_emb_head_dim])
 
         nvtx_range_pop("compressor")
         return kv  # [n_compressed, b, head_dim]
@@ -506,6 +601,7 @@ class CSAIndexer(MegatronModule):
             cp_group=self.pg_collection.cp,
         )
         q = rotate_activation(q)
+        _dsv4_fp4_fake_quant_inplace(q)
 
         # K path: own compressor
         k = self.compressor(x)  # [sq//ratio, b, index_head_dim]
@@ -759,12 +855,21 @@ class CompressedSparseAttention(MegatronModule):
                 topk_idxs = window_idxs
 
             topk_idxs = topk_idxs.int()
+            if _dsv4_deep_debug_csa_enabled(self):
+                _dsv4_deep_debug_csa_save(
+                    f"layer{self.layer_number - 1}_topk_idxs", topk_idxs
+                )
 
             # --- Step 5: Sparse attention ---
             nvtx_range_push("sparse_attn_kernel")
             output = unfused_compressed_sparse_attn(
                 query, kv_full, self.attn_sink.float(), topk_idxs, self.softmax_scale
             )
+            if _dsv4_deep_debug_csa_enabled(self):
+                _dsv4_deep_debug_csa_save(
+                    f"layer{self.layer_number - 1}_core_raw",
+                    output.view(sq, b, np, hn).permute(1, 0, 2, 3),
+                )
             nvtx_range_pop("sparse_attn_kernel")
 
         else:

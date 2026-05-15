@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+import os
+
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
@@ -41,6 +43,56 @@ else:
 def _q_rms_norm(q: torch.Tensor, eps: float) -> torch.Tensor:
     """Fused RMS normalization for query tensor (no learnable weight)."""
     return q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
+
+
+def _dsv4_unscaled_rotary_cos_sin(
+    rotary_pos_emb_module, seq_len, dtype, packed_seq=False, cp_group=None
+):
+    """Return raw RoPE cos/sin without YaRN attention-factor scaling."""
+    rotary_pos_emb = rotary_pos_emb_module(seq_len, packed_seq=packed_seq, cp_group=cp_group)
+    if isinstance(rotary_pos_emb, tuple):
+        rotary_pos_emb = rotary_pos_emb[0]
+    return rotary_pos_emb.cos().to(dtype).contiguous(), rotary_pos_emb.sin().to(dtype).contiguous()
+
+
+def _dsv4_fp8_fake_quant_inplace(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
+    """Match DSv4 reference activation fake-quant/dequant for non-RoPE KV dims."""
+    if x.size(-1) == 0:
+        return x
+    if x.size(-1) % block_size != 0:
+        raise ValueError(f"DSv4 fake quant dim {x.size(-1)} is not divisible by {block_size}")
+    orig_shape = x.shape
+    values = x.contiguous().view(-1, x.size(-1) // block_size, block_size)
+    scale = values.float().abs().amax(dim=-1, keepdim=True).clamp(min=1e-4) / 448.0
+    quantized = (values.float() / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    dequantized = quantized.float() * scale
+    x.copy_(dequantized.to(dtype=x.dtype).view(orig_shape))
+    return x
+
+
+def _dsv4_deep_debug_layer_enabled(module) -> bool:
+    root = os.environ.get("DSV4_DEEP_DEBUG_DIR")
+    if not root:
+        return False
+    layer_number = getattr(module, "layer_number", None)
+    if layer_number is None:
+        return False
+    return int(os.environ.get("DSV4_DEEP_DEBUG_LAYER", "0")) == int(layer_number) - 1
+
+
+def _dsv4_deep_debug_save(name: str, tensor: torch.Tensor) -> None:
+    root = os.environ.get("DSV4_DEEP_DEBUG_DIR")
+    if not root:
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+    with torch.no_grad():
+        value = tensor.detach().contiguous()
+        if torch.is_floating_point(value):
+            value = value.float()
+        os.makedirs(root, exist_ok=True)
+        torch.save(value.cpu(), os.path.join(root, f"megatron_{name}.pt"))
 
 
 @dataclass
@@ -303,6 +355,11 @@ class DSv4HybridAttention(Attention):
         pos_dim = self.config.qk_pos_emb_head_dim
         nope_dim = self.config.v_head_dim - pos_dim
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), n_heads, -1)
+        if _dsv4_deep_debug_layer_enabled(self):
+            _dsv4_deep_debug_save(
+                f"layer{self.layer_number - 1}_core_raw",
+                core_attn_out.permute(1, 0, 2, 3),
+            )
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if packed_seq:
             cu_seqlens_kv = (
@@ -321,8 +378,12 @@ class DSv4HybridAttention(Attention):
             rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
         else:
             if self.config.apply_rope_fusion:
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq
+                rotary_pos_cos, rotary_pos_sin = _dsv4_unscaled_rotary_cos_sin(
+                    self.rotary_pos_emb,
+                    rope_seqlen,
+                    hidden_states.dtype,
+                    packed_seq=packed_seq,
+                    cp_group=self.pg_collection.cp,
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -332,8 +393,8 @@ class DSv4HybridAttention(Attention):
             else:
                 rotary_pos_emb, mscale = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
                 # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
-                # concentration factor (mscale) is NOT part of the DSv4 model contract --
-                # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
+                # concentration factor (mscale) is not part of the DSv4 model contract;
+                # the model relies on Q/KV RMS-norm + unit-magnitude rotation.
                 mscale = 1.0
         if self.config.apply_rope_fusion:
             core_attn_out = fused_mla_rope_inplace(
@@ -364,17 +425,37 @@ class DSv4HybridAttention(Attention):
                 mla_output_remove_interleaving=True,
             )
             core_attn_out = torch.cat([content_part, rot_part], dim=-1)
+        if _dsv4_deep_debug_layer_enabled(self):
+            _dsv4_deep_debug_save(
+                f"layer{self.layer_number - 1}_core_inv_rope",
+                core_attn_out.permute(1, 0, 2, 3),
+            )
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
 
         # Grouped output
         core_attn_out = core_attn_out.view(
             core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1
         )
+        if _dsv4_deep_debug_layer_enabled(self):
+            _dsv4_deep_debug_save(
+                f"layer{self.layer_number - 1}_group_in",
+                core_attn_out.permute(1, 0, 2, 3),
+            )
         wo_a_weight = self.linear_o_group_proj.view(
             self.o_local_groups, self.config.o_lora_rank, -1
         )
         core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
+        if _dsv4_deep_debug_layer_enabled(self):
+            _dsv4_deep_debug_save(
+                f"layer{self.layer_number - 1}_wo_a_out",
+                core_attn_out.permute(1, 0, 2, 3),
+            )
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
+        if _dsv4_deep_debug_layer_enabled(self):
+            _dsv4_deep_debug_save(
+                f"layer{self.layer_number - 1}_wo_b_in",
+                core_attn_out.permute(1, 0, 2),
+            )
 
         # =================
         # Output. [sq, b, h]
@@ -383,6 +464,11 @@ class DSv4HybridAttention(Attention):
         with attn_proj_manager as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+        if _dsv4_deep_debug_layer_enabled(self):
+            _dsv4_deep_debug_save(
+                f"layer{self.layer_number - 1}_attn_out",
+                output.permute(1, 0, 2),
+            )
 
         return output, bias
 
@@ -522,8 +608,12 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
             if self.config.apply_rope_fusion:
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
+                rotary_pos_cos, rotary_pos_sin = _dsv4_unscaled_rotary_cos_sin(
+                    self.rotary_pos_emb,
+                    rotary_seq_len,
+                    hidden_states.dtype,
+                    packed_seq=packed_seq,
+                    cp_group=self.pg_collection.cp,
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -533,8 +623,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             else:
                 rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
                 # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
-                # concentration factor (mscale) is NOT part of the DSv4 model contract --
-                # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
+                # concentration factor (mscale) is not part of the DSv4 model contract;
+                # the model relies on Q/KV RMS-norm + unit-magnitude rotation.
                 mscale = 1.0
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -624,6 +714,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_size,
                     remove_interleaving=True,
                 )
+                _dsv4_fp8_fake_quant_inplace(kv[..., : self.config.qk_head_dim])
                 key = kv
                 value = kv
             else:
@@ -677,6 +768,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
                 # Single head: key = value = [num_tokens, 1, v_head_dim]
                 kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)
+                _dsv4_fp8_fake_quant_inplace(kv[..., : self.config.qk_head_dim])
                 key = kv
                 value = kv
 
@@ -695,6 +787,16 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         else:
             query, key, value = qkv_up_proj_and_rope_apply(
                 q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+            )
+
+        if _dsv4_deep_debug_layer_enabled(self):
+            _dsv4_deep_debug_save(
+                f"layer{self.layer_number - 1}_q_after_rope",
+                query.permute(1, 0, 2, 3),
+            )
+            _dsv4_deep_debug_save(
+                f"layer{self.layer_number - 1}_kv_after_rope_quant",
+                key.permute(1, 0, 2, 3),
             )
 
         return query, key, value, q_compressed, kv_compressed
