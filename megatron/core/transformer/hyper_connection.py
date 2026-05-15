@@ -18,11 +18,20 @@ if TYPE_CHECKING:
 
 @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
+    """DSv4-compatible Sinkhorn projection.
+
+    The DSv4 reference kernel applies a row softmax, adds ``eps`` to every element,
+    then column-normalizes.  Later iterations divide by ``sum + eps``.  This differs
+    subtly from a plain exp/row-normalize/column-normalize loop and affects the
+    residual stream before compressed attention layers.
+    """
     row_max = input_logits.max(dim=-1, keepdim=True).values
     M = torch.exp(input_logits - row_max)
-    for _ in range(num_iterations):
-        M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
-        M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
+    M = M / M.sum(dim=-1, keepdim=True) + eps
+    M = M / (M.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(num_iterations - 1):
+        M = M / (M.sum(dim=-1, keepdim=True) + eps)
+        M = M / (M.sum(dim=-2, keepdim=True) + eps)
     return M
 
 
@@ -62,7 +71,7 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
 @torch.compile
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
-    return (x * h_pre.unsqueeze(-1)).sum(dim=2)
+    return (x * h_pre.unsqueeze(-1)).sum(dim=2).to(dtype=x.dtype)
 
 
 @torch.compile
@@ -77,18 +86,16 @@ def native_h_post_bda(
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
-        return x_expanded + bias_expanded + mixed
-    return x_expanded + mixed
+        return (x_expanded + bias_expanded + mixed).to(dtype=x.dtype)
+    return (x_expanded + mixed).to(dtype=x.dtype)
 
 
 @torch.compile
 def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
     """Native fused projection + RMS normalization."""
-    proj = torch.matmul(x, weight.t())
-    norm = x.norm(dim=-1, keepdim=True)
-    K = x.shape[-1]
-    v = norm / math.sqrt(K) + eps
-    r = 1.0 / v
+    x_float = x.to(torch.float32)
+    proj = F.linear(x_float, weight.to(torch.float32))
+    r = torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + eps)
     return proj, r
 
 
