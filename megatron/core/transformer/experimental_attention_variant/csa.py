@@ -1,7 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import copy
-import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Union
@@ -28,37 +27,6 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 
 
-def _dsv4_deep_debug_csa_enabled(module) -> bool:
-    root = os.environ.get("DSV4_DEEP_DEBUG_DIR")
-    if not root:
-        return False
-    layer_number = getattr(module, "layer_number", None)
-    if layer_number is None:
-        return False
-    return int(os.environ.get("DSV4_DEEP_DEBUG_LAYER", "0")) == int(layer_number) - 1
-
-
-def _dsv4_deep_debug_csa_save(name: str, tensor: torch.Tensor) -> None:
-    root = os.environ.get("DSV4_DEEP_DEBUG_DIR")
-    if not root:
-        return
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        if torch.distributed.get_rank() != 0:
-            return
-    with torch.no_grad():
-        value = tensor.detach().contiguous()
-        if torch.is_floating_point(value):
-            value = value.float()
-        os.makedirs(root, exist_ok=True)
-        torch.save(value.cpu(), os.path.join(root, f"megatron_{name}.pt"))
-
-
-# ---------------------------------------------------------------------------
-# Helper functions for index computation
-# ---------------------------------------------------------------------------
-
-
-# TODO: the lru_cache may not work well with packed sequence
 @lru_cache(maxsize=8)
 def _get_window_topk_idxs_cached(window_size: int, seqlen: int, device_str: str) -> torch.Tensor:
     """Compute sliding-window indices for a single sequence (cached).
@@ -124,6 +92,20 @@ def _dsv4_unscaled_rotary_cos_sin(
 def _dsv4_use_fused_mla_rope() -> bool:
     """DSv4 reference uses adjacent complex-pair RoPE; keep this path unfused for parity."""
     return False
+
+
+def _dsv4_apply_adjacent_rope(x: torch.Tensor, rotary_pos_emb: torch.Tensor) -> torch.Tensor:
+    """Apply DS-inf style adjacent-pair complex RoPE to the whole last dimension."""
+    if isinstance(rotary_pos_emb, tuple):
+        rotary_pos_emb = rotary_pos_emb[0]
+    seq_len = x.size(0)
+    pos_dim = x.size(-1)
+    angles = rotary_pos_emb[:seq_len, ..., : pos_dim // 2].float()
+    angles = angles.reshape(seq_len, *([1] * (x.dim() - 2)), pos_dim // 2)
+    x_complex = torch.view_as_complex(x.float().contiguous().unflatten(-1, (-1, 2)))
+    freqs_cis = torch.polar(torch.ones_like(angles), angles)
+    out = torch.view_as_real(x_complex * freqs_cis).flatten(-2)
+    return out.to(dtype=x.dtype)
 
 
 def _dsv4_fp8_fake_quant_inplace(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
@@ -245,16 +227,7 @@ def _apply_rope(
         )
     else:
         x_nope, x_pe = torch.split(x, [nope_dim, pos_dim], dim=-1)
-        x_pe = apply_rotary_pos_emb(
-            x_pe,
-            rotary_pos_emb,
-            config=config,
-            cu_seqlens=None,
-            mscale=mscale,
-            cp_group=cp_group,
-            mla_rotary_interleaved=True,
-            mla_output_remove_interleaving=True,
-        )
+        x_pe = _dsv4_apply_adjacent_rope(x_pe, rotary_pos_emb)
         out = torch.cat([x_nope, x_pe], dim=-1)
     if squeeze_head:
         out = out.squeeze(-2)
@@ -860,21 +833,11 @@ class CompressedSparseAttention(MegatronModule):
                 topk_idxs = window_idxs
 
             topk_idxs = topk_idxs.int()
-            if _dsv4_deep_debug_csa_enabled(self):
-                _dsv4_deep_debug_csa_save(
-                    f"layer{self.layer_number - 1}_topk_idxs", topk_idxs
-                )
-
             # --- Step 5: Sparse attention ---
             nvtx_range_push("sparse_attn_kernel")
             output = unfused_compressed_sparse_attn(
                 query, kv_full, self.attn_sink.float(), topk_idxs, self.softmax_scale
             )
-            if _dsv4_deep_debug_csa_enabled(self):
-                _dsv4_deep_debug_csa_save(
-                    f"layer{self.layer_number - 1}_core_raw",
-                    output.view(sq, b, np, hn).permute(1, 0, 2, 3),
-                )
             nvtx_range_pop("sparse_attn_kernel")
 
         else:

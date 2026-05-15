@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
-import os
 
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
@@ -60,6 +59,24 @@ def _dsv4_use_fused_mla_rope() -> bool:
     return False
 
 
+def _dsv4_apply_adjacent_rope(
+    x: torch.Tensor, rotary_pos_emb: torch.Tensor, inverse: bool = False
+) -> torch.Tensor:
+    """Apply DS-inf style adjacent-pair complex RoPE to the whole last dimension."""
+    if isinstance(rotary_pos_emb, tuple):
+        rotary_pos_emb = rotary_pos_emb[0]
+    seq_len = x.size(0)
+    pos_dim = x.size(-1)
+    angles = rotary_pos_emb[:seq_len, ..., : pos_dim // 2].float()
+    angles = angles.reshape(seq_len, *([1] * (x.dim() - 2)), pos_dim // 2)
+    if inverse:
+        angles = -angles
+    x_complex = torch.view_as_complex(x.float().contiguous().unflatten(-1, (-1, 2)))
+    freqs_cis = torch.polar(torch.ones_like(angles), angles)
+    out = torch.view_as_real(x_complex * freqs_cis).flatten(-2)
+    return out.to(dtype=x.dtype)
+
+
 def _dsv4_fp8_fake_quant_inplace(x: torch.Tensor, block_size: int = 64) -> torch.Tensor:
     """Match DSv4 reference activation fake-quant/dequant for non-RoPE KV dims."""
     if x.size(-1) == 0:
@@ -73,31 +90,6 @@ def _dsv4_fp8_fake_quant_inplace(x: torch.Tensor, block_size: int = 64) -> torch
     dequantized = quantized.float() * scale
     x.copy_(dequantized.to(dtype=x.dtype).view(orig_shape))
     return x
-
-
-def _dsv4_deep_debug_layer_enabled(module) -> bool:
-    root = os.environ.get("DSV4_DEEP_DEBUG_DIR")
-    if not root:
-        return False
-    layer_number = getattr(module, "layer_number", None)
-    if layer_number is None:
-        return False
-    return int(os.environ.get("DSV4_DEEP_DEBUG_LAYER", "0")) == int(layer_number) - 1
-
-
-def _dsv4_deep_debug_save(name: str, tensor: torch.Tensor) -> None:
-    root = os.environ.get("DSV4_DEEP_DEBUG_DIR")
-    if not root:
-        return
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        if torch.distributed.get_rank() != 0:
-            return
-    with torch.no_grad():
-        value = tensor.detach().contiguous()
-        if torch.is_floating_point(value):
-            value = value.float()
-        os.makedirs(root, exist_ok=True)
-        torch.save(value.cpu(), os.path.join(root, f"megatron_{name}.pt"))
 
 
 @dataclass
@@ -360,11 +352,6 @@ class DSv4HybridAttention(Attention):
         pos_dim = self.config.qk_pos_emb_head_dim
         nope_dim = self.config.v_head_dim - pos_dim
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), n_heads, -1)
-        if _dsv4_deep_debug_layer_enabled(self):
-            _dsv4_deep_debug_save(
-                f"layer{self.layer_number - 1}_core_raw",
-                core_attn_out.permute(1, 0, 2, 3),
-            )
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if packed_seq:
             cu_seqlens_kv = (
@@ -418,50 +405,32 @@ class DSv4HybridAttention(Attention):
             content_part, rot_part = torch.split(
                 core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1
             )
-            rot_part = apply_rotary_pos_emb(
-                rot_part,
-                rotary_pos_emb,
-                self.config,
-                cu_seqlens=cu_seqlens_kv,
-                mscale=mscale,
-                cp_group=self.pg_collection.cp,
-                mla_rotary_interleaved=True,
-                inverse=True,
-                mla_output_remove_interleaving=True,
-            )
+            if cu_seqlens_kv is None:
+                rot_part = _dsv4_apply_adjacent_rope(rot_part, rotary_pos_emb, inverse=True)
+            else:
+                rot_part = apply_rotary_pos_emb(
+                    rot_part,
+                    rotary_pos_emb,
+                    self.config,
+                    cu_seqlens=cu_seqlens_kv,
+                    mscale=mscale,
+                    cp_group=self.pg_collection.cp,
+                    mla_rotary_interleaved=True,
+                    inverse=True,
+                    mla_output_remove_interleaving=True,
+                )
             core_attn_out = torch.cat([content_part, rot_part], dim=-1)
-        if _dsv4_deep_debug_layer_enabled(self):
-            _dsv4_deep_debug_save(
-                f"layer{self.layer_number - 1}_core_inv_rope",
-                core_attn_out.permute(1, 0, 2, 3),
-            )
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
 
         # Grouped output
         core_attn_out = core_attn_out.view(
             core_attn_out.size(0), core_attn_out.size(1), self.o_local_groups, -1
         )
-        if _dsv4_deep_debug_layer_enabled(self):
-            _dsv4_deep_debug_save(
-                f"layer{self.layer_number - 1}_group_in",
-                core_attn_out.permute(1, 0, 2, 3),
-            )
         wo_a_weight = self.linear_o_group_proj.view(
             self.o_local_groups, self.config.o_lora_rank, -1
         )
         core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
-        if _dsv4_deep_debug_layer_enabled(self):
-            _dsv4_deep_debug_save(
-                f"layer{self.layer_number - 1}_wo_a_out",
-                core_attn_out.permute(1, 0, 2, 3),
-            )
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
-        if _dsv4_deep_debug_layer_enabled(self):
-            _dsv4_deep_debug_save(
-                f"layer{self.layer_number - 1}_wo_b_in",
-                core_attn_out.permute(1, 0, 2),
-            )
-
         # =================
         # Output. [sq, b, h]
         # =================
@@ -469,12 +438,6 @@ class DSv4HybridAttention(Attention):
         with attn_proj_manager as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
-        if _dsv4_deep_debug_layer_enabled(self):
-            _dsv4_deep_debug_save(
-                f"layer{self.layer_number - 1}_attn_out",
-                output.permute(1, 0, 2),
-            )
-
         return output, bias
 
 
@@ -685,10 +648,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
             q = _q_rms_norm(q, self.config.layernorm_epsilon)
-
             kv, _ = self.linear_kv_proj(kv_compressed)
             kv = self.kv_layernorm(kv)
-
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             if k_pos_emb is not None:
                 k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
@@ -743,16 +704,19 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
                 # RoPE and query (shared for wkv and latent)
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_pos_emb = apply_rotary_pos_emb(
-                    q_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_q,
-                    mscale=mscale,
-                    cp_group=self.pg_collection.cp,
-                    mla_rotary_interleaved=True,
-                    mla_output_remove_interleaving=True,
-                )
+                if cu_seqlens_q is None:
+                    q_pos_emb = _dsv4_apply_adjacent_rope(q_pos_emb, rotary_pos_emb)
+                else:
+                    q_pos_emb = apply_rotary_pos_emb(
+                        q_pos_emb,
+                        rotary_pos_emb,
+                        config=self.config,
+                        cu_seqlens=cu_seqlens_q,
+                        mscale=mscale,
+                        cp_group=self.pg_collection.cp,
+                        mla_rotary_interleaved=True,
+                        mla_output_remove_interleaving=True,
+                    )
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
 
@@ -760,17 +724,19 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 kv_no_pe, k_pos_emb = torch.split(kv, [kv.size(-1) - pos_dim, pos_dim], dim=-1)
 
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-                k_pos_emb = apply_rotary_pos_emb(
-                    k_pos_emb,
-                    rotary_pos_emb,
-                    config=self.config,
-                    cu_seqlens=cu_seqlens_kv,
-                    mscale=mscale,
-                    cp_group=self.pg_collection.cp,
-                    mla_rotary_interleaved=True,
-                    mla_output_remove_interleaving=True,
-                )
-
+                if cu_seqlens_kv is None:
+                    k_pos_emb = _dsv4_apply_adjacent_rope(k_pos_emb, rotary_pos_emb)
+                else:
+                    k_pos_emb = apply_rotary_pos_emb(
+                        k_pos_emb,
+                        rotary_pos_emb,
+                        config=self.config,
+                        cu_seqlens=cu_seqlens_kv,
+                        mscale=mscale,
+                        cp_group=self.pg_collection.cp,
+                        mla_rotary_interleaved=True,
+                        mla_output_remove_interleaving=True,
+                    )
                 # Single head: key = value = [num_tokens, 1, v_head_dim]
                 kv = torch.cat([kv_no_pe, k_pos_emb], dim=-1).unsqueeze(-2)
                 _dsv4_fp8_fake_quant_inplace(kv[..., : self.config.qk_head_dim])
@@ -792,16 +758,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         else:
             query, key, value = qkv_up_proj_and_rope_apply(
                 q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
-            )
-
-        if _dsv4_deep_debug_layer_enabled(self):
-            _dsv4_deep_debug_save(
-                f"layer{self.layer_number - 1}_q_after_rope",
-                query.permute(1, 0, 2, 3),
-            )
-            _dsv4_deep_debug_save(
-                f"layer{self.layer_number - 1}_kv_after_rope_quant",
-                key.permute(1, 0, 2, 3),
             )
 
         return query, key, value, q_compressed, kv_compressed
