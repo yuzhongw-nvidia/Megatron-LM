@@ -3,6 +3,7 @@
 import inspect
 import os
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -485,3 +486,60 @@ def test_get_transformer_layer_spec_forwards_use_te_activation_func():
         assert (
             call_kwargs.get('use_te_activation_func') is True
         ), "use_te_activation_func must be forwarded from config"
+
+
+def test_gpt_builder_mtp_uses_experimental_attention_layer_specs():
+    """MTP should reuse experimental-aware decoder specs when an attention variant is enabled."""
+
+    from gpt_builders import gpt_builder
+
+    mock_args = MagicMock()
+    mock_args.yaml_cfg = None
+    mock_args.spec = None
+    mock_args.transformer_impl = "transformer_engine"
+    mock_args.experimental_attention_variant = "gated_delta_net"
+    mock_args.num_experts = 128
+    mock_args.mtp_num_layers = 1
+    mock_args.padded_vocab_size = 1024
+    mock_args.max_position_embeddings = 128
+    mock_args.fp16_lm_cross_entropy = False
+    mock_args.untie_embeddings_and_output_weights = False
+    mock_args.position_embedding_type = "rope"
+    mock_args.rotary_percent = 1.0
+    mock_args.rotary_base = 10000
+    mock_args.use_rope_scaling = False
+
+    mock_config = MagicMock()
+    mock_config.transformer_impl = "transformer_engine"
+
+    block_spec = SimpleNamespace(layer_specs=["local_decoder_layer"])
+    last_decoder_layer_spec = "last_experimental_decoder_layer"
+
+    with (
+        patch(
+            'gpt_builders.get_transformer_block_with_experimental_attention_variant_spec',
+            return_value=block_spec,
+        ) as mock_block_spec,
+        patch(
+            'gpt_builders.get_transformer_layer_with_experimental_attention_variant_spec',
+            return_value=["first_experimental_decoder_layer", last_decoder_layer_spec],
+        ) as mock_layer_specs,
+        patch(
+            'gpt_builders.get_gpt_decoder_layer_specs',
+            side_effect=AssertionError("default decoder specs must not be used"),
+        ) as mock_default_specs,
+        patch('gpt_builders.get_gpt_mtp_block_spec', return_value="mtp_block") as mock_mtp,
+        patch('gpt_builders.GPTModel', return_value="model"),
+    ):
+        model = gpt_builder(mock_args, pre_process=True, post_process=True, config=mock_config)
+
+    assert model == "model"
+    mock_block_spec.assert_called_once_with(config=mock_config, vp_stage=None)
+    mock_layer_specs.assert_called_once_with(config=mock_config)
+    mock_default_specs.assert_not_called()
+    mock_mtp.assert_called_once_with(
+        mock_config,
+        last_decoder_layer_spec,
+        use_transformer_engine=True,
+        vp_stage=None,
+    )
