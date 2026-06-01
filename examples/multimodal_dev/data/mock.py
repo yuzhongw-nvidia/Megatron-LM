@@ -179,14 +179,17 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         image_size=getattr(args, "image_size", 224),
     )
 
-    train_ds = MockQwen35VLDataset(
-        num_samples=train_val_test_num_samples[0], **kwargs,
-    )
-    val_ds = MockQwen35VLDataset(
-        num_samples=train_val_test_num_samples[1], **kwargs,
-    )
-    test_ds = MockQwen35VLDataset(
-        num_samples=train_val_test_num_samples[2], **kwargs,
-    )
+    # Return None for splits with 0 requested samples so the training loop
+    # skips building that data loader (the GPT mock path does the same). The
+    # MegatronPretraining sampler asserts total_samples > 0, so a 0-sample
+    # valid/test dataset would otherwise crash benchmark runs that skip eval.
+    def _maybe_make(num_samples):
+        if num_samples is None or num_samples <= 0:
+            return None
+        return MockQwen35VLDataset(num_samples=num_samples, **kwargs)
+
+    train_ds = _maybe_make(train_val_test_num_samples[0])
+    val_ds = _maybe_make(train_val_test_num_samples[1])
+    test_ds = _maybe_make(train_val_test_num_samples[2])
 
     return train_ds, val_ds, test_ds
