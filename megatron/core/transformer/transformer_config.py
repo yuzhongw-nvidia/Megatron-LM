@@ -275,6 +275,11 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
+    pre_gated_delta_rule_impl: Literal["unfused", "fused_streamed", "fused_mega"] = "unfused"
+    """GDN pre-gated-delta-rule front-end path: reference ("unfused") or the fused Triton
+    paths ("fused_streamed" / "fused_mega"). Valid only with
+    experimental_attention_variant='gated_delta_net'."""
+
     ####################
     # DSA
     ####################
