@@ -54,6 +54,7 @@ from torch import Tensor
 from megatron.core.fusions.fused_pre_gated_delta_rule import (
     _L2NORM_EPS,
     _causal_conv1d_bwd_function,
+    _cast_pre_gdr_param_grads,
     _is_power_of_two,
     _resolve_packed_seq_idx,
 )
@@ -830,8 +831,10 @@ def _mega_pre_gated_delta_rule_backward(
         (batch, seq_len, conv_dim), dtype=qkvzba.dtype, device=device
     ).permute(0, 2, 1)
     d_qkvzba = torch.empty_like(qkvzba)
-    d_A_log_fp32 = torch.zeros(num_value_heads, dtype=torch.float32, device=device)
-    d_dt_bias_fp32 = torch.zeros(num_value_heads, dtype=torch.float32, device=device)
+    d_param_grads = torch.empty((2, num_value_heads), dtype=torch.float32, device=device)
+    d_param_grads.zero_()
+    d_A_log_fp32 = d_param_grads[0]
+    d_dt_bias_fp32 = d_param_grads[1]
 
     R_qk = batch * 2 * num_key_heads
     R_v = batch * num_value_heads
@@ -916,9 +919,14 @@ def _mega_pre_gated_delta_rule_backward(
         True,  # activation (silu folded into conv bwd)
     )
 
-    d_weight = d_weight_fp32.view(*conv1d_weight.shape).to(conv1d_weight.dtype)
-    d_A_log = d_A_log_fp32.to(A_log.dtype)
-    d_dt_bias = d_dt_bias_fp32.to(dt_bias.dtype)
+    d_weight, d_A_log, d_dt_bias = _cast_pre_gdr_param_grads(
+        d_weight_fp32.view(*conv1d_weight.shape),
+        conv1d_weight,
+        d_A_log_fp32,
+        A_log,
+        d_dt_bias_fp32,
+        dt_bias,
+    )
     return d_qkvzba, d_weight, d_A_log, d_dt_bias
 
 

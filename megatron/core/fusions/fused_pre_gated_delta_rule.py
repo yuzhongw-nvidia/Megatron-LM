@@ -1473,6 +1473,83 @@ def _wait_for_streams(
         dst_stream.wait_stream(stream)
 
 
+@triton.jit
+def _cast_pre_gdr_param_grads_kernel(
+    d_weight_fp32_ptr,
+    d_A_log_fp32_ptr,
+    d_dt_bias_fp32_ptr,
+    d_weight_ptr,
+    d_A_log_ptr,
+    d_dt_bias_ptr,
+    n_weight: tl.constexpr,
+    n_A_log: tl.constexpr,
+    n_dt_bias: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Cast conv/A_log/dt_bias fp32 parameter grads in one launch."""
+
+    offs = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_A_start = n_weight
+    n_dt_start = n_weight + n_A_log
+    n_total = n_dt_start + n_dt_bias
+
+    weight_mask = offs < n_weight
+    A_log_mask = (offs >= n_A_start) & (offs < n_dt_start)
+    dt_bias_mask = (offs >= n_dt_start) & (offs < n_total)
+
+    weight_vals = tl.load(d_weight_fp32_ptr + offs, mask=weight_mask, other=0.0)
+    tl.store(d_weight_ptr + offs, weight_vals, mask=weight_mask)
+
+    A_log_offs = offs - n_A_start
+    A_log_safe_offs = tl.where(A_log_mask, A_log_offs, 0)
+    A_log_vals = tl.load(d_A_log_fp32_ptr + A_log_safe_offs, mask=A_log_mask, other=0.0)
+    tl.store(d_A_log_ptr + A_log_safe_offs, A_log_vals, mask=A_log_mask)
+
+    dt_bias_offs = offs - n_dt_start
+    dt_bias_safe_offs = tl.where(dt_bias_mask, dt_bias_offs, 0)
+    dt_bias_vals = tl.load(
+        d_dt_bias_fp32_ptr + dt_bias_safe_offs, mask=dt_bias_mask, other=0.0
+    )
+    tl.store(d_dt_bias_ptr + dt_bias_safe_offs, dt_bias_vals, mask=dt_bias_mask)
+
+
+def _cast_pre_gdr_param_grads(
+    d_weight_fp32: Tensor,
+    conv1d_weight: Tensor,
+    d_A_log_fp32: Tensor,
+    A_log: Tensor,
+    d_dt_bias_fp32: Tensor,
+    dt_bias: Tensor,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Return parameter gradients cast to their parameter dtypes in one kernel."""
+
+    d_weight = torch.empty_like(conv1d_weight)
+    d_A_log = torch.empty_like(A_log)
+    d_dt_bias = torch.empty_like(dt_bias)
+
+    n_weight = d_weight.numel()
+    n_A_log = d_A_log.numel()
+    n_dt_bias = d_dt_bias.numel()
+    total = n_weight + n_A_log + n_dt_bias
+    block_n = 1024
+    grid = (triton.cdiv(total, block_n),)
+    _cast_pre_gdr_param_grads_kernel[grid](
+        d_weight_fp32,
+        d_A_log_fp32,
+        d_dt_bias_fp32,
+        d_weight,
+        d_A_log,
+        d_dt_bias,
+        n_weight,
+        n_A_log,
+        n_dt_bias,
+        BLOCK_N=block_n,
+        num_warps=4,
+        num_stages=2,
+    )
+    return d_weight, d_A_log, d_dt_bias
+
+
 def _resolve_packed_seq_idx(
     cu_seqlens: Optional[Tensor],
     seq_idx: Optional[Tensor],
@@ -1970,10 +2047,15 @@ def _triton_pre_gated_delta_rule_backward(
         True,              # activation (silu)
     )
 
-    d_weight = d_weight_fp32.view(*conv1d_weight.shape).to(conv1d_weight.dtype)
     default_stream.wait_stream(g_beta_stream)
-    d_A_log = d_A_log_fp32.to(A_log.dtype)
-    d_dt_bias = d_dt_bias_fp32.to(dt_bias.dtype)
+    d_weight, d_A_log, d_dt_bias = _cast_pre_gdr_param_grads(
+        d_weight_fp32.view(*conv1d_weight.shape),
+        conv1d_weight,
+        d_A_log_fp32,
+        A_log,
+        d_dt_bias_fp32,
+        dt_bias,
+    )
     default_stream.wait_stream(z_stream)
 
     return d_qkvzba, d_weight, d_A_log, d_dt_bias
