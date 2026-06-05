@@ -77,6 +77,18 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
     sft_mock_dataset_config_json: Optional[str] = None
+
+    varlen_mock_dataset_config_json: Optional[str] = None
+    """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
+    used by the ``--use-varlen-dataset`` path; kept separate so the varlen path
+    does not implicitly inherit SFT-specific knobs."""
+
+    varlen_bshd_validation: bool = False
+    """When True, :class:`VarlenDataset.__getitem__` emits SBHD samples padded
+    to ``sequence_length`` (no ``cu_seqlens`` / ``original_seq_len`` /
+    ``padded_seq_len``), bypassing the packed-sequence path. Used to obtain a
+    BSHD reference run that mirrors the THD path's tokenization but skips all
+    packing — useful for THD numerical-correctness validation."""
     """This config provides the necessary information for the mock dataset."""
 
     def __post_init__(self) -> None:
@@ -88,6 +100,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
+
+        if self.varlen_bshd_validation:
+            assert not self.dynamic_context_parallel, (
+                "--varlen-bshd-validation is incompatible with "
+                "--dynamic-context-parallel (BSHD mode is not packed)."
+            )
 
         self.token_dtype_code = (
             None
