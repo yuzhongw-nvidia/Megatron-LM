@@ -15,6 +15,20 @@ from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 
 
+def _needs_identity_collate(args):
+    """Return whether this data path emits already-packed samples."""
+
+    varlen_thd = getattr(args, "use_varlen_dataset", False) and not getattr(
+        args, "varlen_bshd_validation", False
+    )
+    return (
+        args.dynamic_context_parallel
+        or getattr(args, "use_vanilla_collate_fn", False)
+        or varlen_thd
+        or args.sequence_packing_scheduler is not None
+    )
+
+
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
 
@@ -105,15 +119,11 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             DistributedSignalHandler(args.exit_signal).__enter__()
 
     maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
-    # Identity collate for VarlenDataset and packing-scheduler paths;
-    # they emit one variable-length dict per sample, not stack-able by
-    # the default collate.
-    if (
-        args.dynamic_context_parallel
-        or getattr(args, "use_vanilla_collate_fn", False)
-        or getattr(args, "use_varlen_dataset", False)
-        or args.sequence_packing_scheduler is not None
-    ):
+    # Identity collate for THD/packing-scheduler paths; they emit one
+    # variable-length dict per sample, not stack-able by the default collate.
+    # Varlen SBHD validation emits fixed-shape tensors and should use default
+    # collate so the microbatch is a dict of batched tensors.
+    if _needs_identity_collate(args):
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
