@@ -19,7 +19,7 @@ from megatron.core.datasets.data_schedule_utils import (
     next_hdp_group,
     reroute_samples_to_dcp_ranks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, pad_sequence_for_thd
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
@@ -502,8 +502,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
-        config: Model parallel config used for THD CUDA Graph padding. When None
-            or config.max_seqlen_per_dp_cp_rank is None, no padding is applied.
+        config: Model parallel config used for optional THD packed-sequence padding.
+            When None or config.pad_packed_seq_alignment is None, no padding is applied.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)
@@ -692,24 +692,25 @@ def get_batch_on_this_rank_for_sequence_packing(
         cp_group=cp_group,
     )
 
-    # Pad to static shapes for THD + CUDA Graph when requested.
+    # Pad the already-packed THD tensors at the end when requested. The
+    # cu_seqlens metadata remains unchanged so original sequence boundaries are
+    # preserved.
     padding_mask = None
-    if (
-        config is not None
-        and getattr(config, 'max_seqlen_per_dp_cp_rank', None) is not None
-        and packed_seq_params is not None
-    ):
-        from megatron.core.packed_seq_params import pad_thd_for_cuda_graph
+    pad_alignment = (
+        getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
+    )
+    if pad_alignment == 0:
+        pad_alignment = max_seqlen
 
+    if pad_alignment is not None and packed_seq_params is not None:
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
-            pad_thd_for_cuda_graph(
+            pad_sequence_for_thd(
                 tokens,
                 labels,
                 loss_mask,
                 position_ids,
                 packed_seq_params,
-                max_seqlen=config.max_seqlen_per_dp_cp_rank,
-                max_num_seqs=config.thd_max_num_seqs,
+                alignment=pad_alignment,
             )
         )
 

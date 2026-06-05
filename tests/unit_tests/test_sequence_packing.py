@@ -211,7 +211,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         )
 
         # Unpack the result. The helper now always returns a 7-tuple; the 7th
-        # value is `padding_mask` (None when THD CUDA Graph padding is not in use).
+        # value is `padding_mask` (None when THD padding is not enabled).
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
             result
         )

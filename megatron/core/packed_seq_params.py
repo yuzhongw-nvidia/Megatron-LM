@@ -100,41 +100,18 @@ def _pad_seq_tensor(t: Optional[Tensor], target_len: int) -> Optional[Tensor]:
     return F.pad(t, (0, target_len - actual_len), value=0)
 
 
-def _pad_cu_seqlens(cu_seqlens: Optional[Tensor], target_entries: int) -> Optional[Tensor]:
-    """Pad a cu_seqlens tensor to exactly ``target_entries`` entries.
-
-    Asserts the actual entry count does not exceed ``target_entries``: this is
-    the reviewer-flagged overflow case and corresponds to "too many packed
-    sequences in this microbatch for thd_max_num_seqs". Failing fast prevents
-    a silent CUDA-graph shape mismatch at replay.
-    """
-    if cu_seqlens is None:
-        return None
-    actual_entries = cu_seqlens.shape[0]
-    assert actual_entries <= target_entries, (
-        f"Actual num_seqs ({actual_entries - 1}) exceeds thd_max_num_seqs "
-        f"({target_entries - 1}). Increase --thd-max-num-seqs, decrease "
-        f"--max-seqlen-per-dp-cp-rank, or filter shorter samples upstream so "
-        f"the packing scheduler stops earlier."
-    )
-    if actual_entries == target_entries:
-        return cu_seqlens
-    pad_value = cu_seqlens[-1].item()
-    padded = torch.full(
-        (target_entries,), pad_value, dtype=cu_seqlens.dtype, device=cu_seqlens.device
-    )
-    padded[:actual_entries] = cu_seqlens
-    return padded
+def _round_up_to_alignment(value: int, alignment: int) -> int:
+    assert alignment > 0, f"Packed sequence padding alignment must be > 0, got {alignment}."
+    return ((value + alignment - 1) // alignment) * alignment
 
 
-def pad_thd_for_cuda_graph(
+def pad_sequence_for_thd(
     tokens: Optional[Tensor],
     labels: Optional[Tensor],
     loss_mask: Optional[Tensor],
     position_ids: Optional[Tensor],
     packed_seq_params: PackedSeqParams,
-    max_seqlen: int,
-    max_num_seqs: int,
+    alignment: int,
 ) -> Tuple[
     Optional[Tensor],
     Optional[Tensor],
@@ -143,16 +120,16 @@ def pad_thd_for_cuda_graph(
     PackedSeqParams,
     Optional[Tensor],
 ]:
-    """Pad THD batch data to fixed sizes for CUDA Graph compatibility.
+    """Pad packed THD tensors to an alignment without changing sequence metadata.
 
-    CUDA Graph requires static tensor shapes. This function pads:
-    - tokens, labels, loss_mask, position_ids along dim=-1 to max_seqlen
-    - cu_seqlens tensors to (max_num_seqs + 1) entries, filled with actual_T
-    - Generates padding_mask for MoE aux loss exclusion
+    This appends padding tokens to the token-like tensors after packing/CP slicing.
+    It intentionally keeps ``cu_seqlens`` unchanged so the original sequence
+    boundaries are preserved. The returned padding mask marks the appended tokens
+    for MoE auxiliary loss/routing paths.
 
     Returns:
         Padded (tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask)
-        padding_mask: [1, max_seqlen] bool tensor, True at padding positions.
+        padding_mask: [1, target_len] bool tensor, True at padding positions.
     """
 
     actual_T = None
@@ -179,48 +156,13 @@ def pad_thd_for_cuda_graph(
         else parallel_state.get_context_parallel_world_size()
     )
     cp_rank = parallel_state.get_context_parallel_rank() if cp_size > 1 else 0
-    max_seqlen_global = max_seqlen * cp_size
-
-    if actual_T is not None and packed_seq_params.cu_seqlens_q is not None:
-        _cu = packed_seq_params.cu_seqlens_q
-        _individual_lens = _cu[1:] - _cu[:-1]
-        _max_individual = int(_individual_lens.max().item()) if _individual_lens.numel() > 0 else 0
-        assert _max_individual <= max_seqlen_global, (
-            f"Individual request length ({_max_individual}) exceeds the global max sequence length "
-            f"({max_seqlen_global} = max_seqlen_per_dp_cp_rank {max_seqlen} * cp_size {cp_size}). "
-            f"Each request must fit within the CUDA Graph static buffer after CP partitioning. "
-            f"Increase --max-seqlen-per-dp-cp-rank or --seq-length, or filter out overlong "
-            f"requests."
-        )
-
-    tokens = _pad_seq_tensor(tokens, max_seqlen)
-    labels = _pad_seq_tensor(labels, max_seqlen)
-    loss_mask = _pad_seq_tensor(loss_mask, max_seqlen)
-    position_ids = _pad_seq_tensor(position_ids, max_seqlen)
-
-    target_cu_entries = max_num_seqs + 1
-    padded_params = PackedSeqParams(
-        qkv_format=packed_seq_params.qkv_format,
-        cu_seqlens_q=_pad_cu_seqlens(packed_seq_params.cu_seqlens_q, target_cu_entries),
-        cu_seqlens_kv=_pad_cu_seqlens(packed_seq_params.cu_seqlens_kv, target_cu_entries),
-        cu_seqlens_q_padded=_pad_cu_seqlens(
-            packed_seq_params.cu_seqlens_q_padded, target_cu_entries
-        ),
-        cu_seqlens_kv_padded=_pad_cu_seqlens(
-            packed_seq_params.cu_seqlens_kv_padded, target_cu_entries
-        ),
-        max_seqlen_q=max_seqlen_global,
-        max_seqlen_kv=max_seqlen_global,
-        local_cp_size=packed_seq_params.local_cp_size,
-        cp_group=packed_seq_params.cp_group,
-    )
 
     if cp_size > 1:
         from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 
         if actual_T_is_local:
             local_actual_T = int(actual_T)
-            local_max_seqlen = int(max_seqlen)
+            local_target_T = _round_up_to_alignment(local_actual_T, alignment)
         else:
             local_actual_T = int(
                 get_thd_partitioned_indices(
@@ -234,22 +176,28 @@ def pad_thd_for_cuda_graph(
                     cp_rank,
                 ).numel()
             )
-            local_max_seqlen = int(
-                get_thd_partitioned_indices(
-                    (
-                        padded_params.cu_seqlens_q_padded
-                        if padded_params.cu_seqlens_q_padded is not None
-                        else padded_params.cu_seqlens_q
-                    ),
-                    max_seqlen_global,
-                    cp_size,
-                    cp_rank,
-                ).numel()
-            )
-        padding_mask = (
-            torch.arange(local_max_seqlen, device=mask_device).unsqueeze(0) >= local_actual_T
-        )
+            local_target_T = _round_up_to_alignment(local_actual_T, alignment)
     else:
-        padding_mask = torch.arange(max_seqlen, device=mask_device).unsqueeze(0) >= actual_T
+        local_actual_T = int(actual_T)
+        local_target_T = _round_up_to_alignment(local_actual_T, alignment)
+
+    padded_params = PackedSeqParams(
+        qkv_format=packed_seq_params.qkv_format,
+        cu_seqlens_q=packed_seq_params.cu_seqlens_q,
+        cu_seqlens_kv=packed_seq_params.cu_seqlens_kv,
+        cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
+        cu_seqlens_kv_padded=packed_seq_params.cu_seqlens_kv_padded,
+        max_seqlen_q=packed_seq_params.max_seqlen_q,
+        max_seqlen_kv=packed_seq_params.max_seqlen_kv,
+        local_cp_size=packed_seq_params.local_cp_size,
+        cp_group=packed_seq_params.cp_group,
+        total_tokens=local_target_T if cp_size == 1 else None,
+    )
+
+    tokens = _pad_seq_tensor(tokens, local_target_T)
+    labels = _pad_seq_tensor(labels, local_target_T)
+    loss_mask = _pad_seq_tensor(loss_mask, local_target_T)
+    position_ids = _pad_seq_tensor(position_ids, local_target_T)
+    padding_mask = torch.arange(local_target_T, device=mask_device).unsqueeze(0) >= local_actual_T
 
     return tokens, labels, loss_mask, position_ids, padded_params, padding_mask

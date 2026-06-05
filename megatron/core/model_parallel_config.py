@@ -87,6 +87,23 @@ class ModelParallelConfig:
     default_dynamic_cp: Dynamic-CP scheduler for packed sequence balancing.
     """
 
+    pad_packed_seq_alignment: Optional[int] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--pad-packed-seq-alignment"],
+                "nargs": "?",
+                "const": 0,
+                "type": int,
+            }
+        },
+    )
+    """Pad THD packed sequence tensors after packing without changing cu_seqlens.
+    If set without a value, each packed tensor is padded to a multiple of the
+    batch's existing max sequence length. If set to an integer N, tensors are
+    padded to a multiple of N. Only applies to sequence-packing scheduler and
+    dynamic context parallel batches."""
+
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
@@ -461,6 +478,19 @@ class ModelParallelConfig:
                 raise ValueError(
                     f"min_dynamic_context_parallel_size must be >= 1, "
                     f"got {self.min_dynamic_context_parallel_size}"
+                )
+
+        if self.pad_packed_seq_alignment is not None:
+            if self.pad_packed_seq_alignment < 0:
+                raise ValueError(
+                    "pad_packed_seq_alignment must be >= 0. Use the flag without a value "
+                    "to align to the packed batch max sequence length, or pass a positive "
+                    "integer alignment."
+                )
+            if self.sequence_packing_scheduler is None and not self.dynamic_context_parallel:
+                raise ValueError(
+                    "pad_packed_seq_alignment requires sequence_packing_scheduler or "
+                    "dynamic_context_parallel."
                 )
 
         if self.sequence_parallel:

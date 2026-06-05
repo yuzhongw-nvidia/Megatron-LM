@@ -30,7 +30,7 @@ from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequ
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams, pad_thd_for_cuda_graph
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_on_this_rank
@@ -124,9 +124,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     config = core_transformer_config_from_args(args)
 
     if args.sequence_packing_scheduler is not None:
-        # `get_batch_on_this_rank_for_sequence_packing` applies THD + CUDA Graph
-        # padding internally when `config.max_seqlen_per_dp_cp_rank` is set, and
-        # returns a 7-tuple including `padding_mask` (None when no padding).
+        # `get_batch_on_this_rank_for_sequence_packing` owns optional THD padding
+        # and returns a 7-tuple including `padding_mask` (None when no padding).
         return get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
@@ -191,27 +190,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch, cu_seqlens, cu_seqlens_padded, max_seqlen
         )
 
-    # Pad THD batch for CUDA Graph compatibility when max_seqlen_per_dp_cp_rank is set.
     padding_mask = None
-    if config.max_seqlen_per_dp_cp_rank is not None and packed_seq_params is not None:
-        tokens = batch.get('tokens', None)
-        labels = batch.get('labels', None)
-        loss_mask = batch.get('loss_mask', None)
-        position_ids = batch.get('position_ids', None)
-        tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = \
-            pad_thd_for_cuda_graph(
-                tokens, labels, loss_mask, position_ids, packed_seq_params,
-                max_seqlen=config.max_seqlen_per_dp_cp_rank,
-                max_num_seqs=config.thd_max_num_seqs,
-            )
-        if 'tokens' in batch:
-            batch['tokens'] = tokens
-        if 'labels' in batch:
-            batch['labels'] = labels
-        if 'loss_mask' in batch:
-            batch['loss_mask'] = loss_mask
-        if 'position_ids' in batch:
-            batch['position_ids'] = position_ids
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (

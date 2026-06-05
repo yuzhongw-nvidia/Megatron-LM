@@ -1564,6 +1564,18 @@ def validate_args(args, defaults={}):
             f'must be >= single sequence max length ({args.seq_length})'
         )
 
+    if getattr(args, 'pad_packed_seq_alignment', None) is not None:
+        if args.pad_packed_seq_alignment < 0:
+            raise ValueError(
+                '--pad-packed-seq-alignment must be used without a value or with a '
+                'non-negative integer alignment.'
+            )
+        if args.sequence_packing_scheduler is None:
+            raise ValueError(
+                '--pad-packed-seq-alignment requires --sequence-packing-scheduler or '
+                '--dynamic-context-parallel.'
+            )
+
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if (
