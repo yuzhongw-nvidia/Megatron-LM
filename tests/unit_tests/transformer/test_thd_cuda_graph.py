@@ -260,6 +260,11 @@ _SFT_JSON = (
 
 _TRAIN_ITERS = 5
 
+
+def _outer_torchrun_rank():
+    return int(os.environ.get("RANK", "0"))
+
+
 _COMMON_ARGS = [
     "--seq-length",
     "2048",
@@ -500,6 +505,10 @@ def _extract_metrics(stdout):
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
+@pytest.mark.skipif(
+    _outer_torchrun_rank() != 0,
+    reason="nested torchrun E2E should run only on one outer pytest rank",
+)
 @pytest.mark.parametrize(
     "model_name,model_args,base_port",
     [("moonlight", _MOONLIGHT_ARGS, 29660), ("qwen3", _QWEN3_ARGS, 29662)],
