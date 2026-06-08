@@ -22,6 +22,7 @@ the per-iteration loss / grad_norm lines. They must be exactly equal.
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -451,7 +452,9 @@ def _run_pretrain(model_args, cuda_graph_args, master_port):
 
     cmd = (
         [
-            "torchrun",
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
             "--nproc_per_node",
             "8",
             "--nnodes",
