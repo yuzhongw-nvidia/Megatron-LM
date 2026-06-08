@@ -120,13 +120,12 @@ class TestPadSequenceForThd:
         )
         for t in (p_tok, p_lab, p_loss, p_pos):
             assert t.shape == (1, target_T)
-        for cu in (
-            p_params.cu_seqlens_q,
-            p_params.cu_seqlens_kv,
-            p_params.cu_seqlens_q_padded,
-            p_params.cu_seqlens_kv_padded,
-        ):
-            assert torch.equal(cu, orig_cu)
+        assert torch.equal(p_params.cu_seqlens_q, orig_cu)
+        assert torch.equal(p_params.cu_seqlens_kv, orig_cu)
+        assert torch.equal(p_params.cu_seqlens_q_padded[:-1], orig_cu[:-1])
+        assert torch.equal(p_params.cu_seqlens_kv_padded[:-1], orig_cu[:-1])
+        assert p_params.cu_seqlens_q_padded[-1].item() == target_T
+        assert p_params.cu_seqlens_kv_padded[-1].item() == target_T
         assert p_mask.shape == (1, target_T) and p_mask.dtype == torch.bool
         assert torch.equal(p_tok[0, :total_T], tokens[0])
         assert (p_tok[0, total_T:] == 0).all()
@@ -148,8 +147,8 @@ class TestPadSequenceForThd:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_cu_seqlens_unchanged(self):
-        """Padding appends tokens but preserves original sequence metadata."""
+    def test_cu_seqlens_preserved_and_padded_total_extended(self):
+        """Padding preserves cu_seqlens and extends cu_seqlens_padded[-1]."""
         seqlens, total_T = [50, 30], 80
         psp = _make_psp(seqlens)
         orig = psp.cu_seqlens_q.clone()
@@ -157,17 +156,41 @@ class TestPadSequenceForThd:
             torch.ones(1, total_T, device="cuda"), None, None, None, psp, 64
         )
         assert torch.equal(p.cu_seqlens_q, orig)
+        assert torch.equal(p.cu_seqlens_q_padded[:-1], orig[:-1])
+        assert p.cu_seqlens_q_padded[-1].item() == 128
+        assert p.max_seqlen_q == 78
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_padded_total_updates_last_sequence_length(self):
+        """Trailing padding is represented by cu_seqlens_padded[-1]."""
+        seqlens, total_T, alignment = [500, 500], 1000, 512
+        psp = _make_psp(seqlens)
+        _, _, _, _, p, mask = pad_sequence_for_thd(
+            torch.ones(1, total_T, device="cuda"), None, None, None, psp, alignment
+        )
+        assert torch.equal(
+            p.cu_seqlens_q, torch.tensor([0, 500, 1000], dtype=torch.int32, device="cuda")
+        )
+        assert torch.equal(
+            p.cu_seqlens_q_padded,
+            torch.tensor([0, 500, 1024], dtype=torch.int32, device="cuda"),
+        )
+        assert p.max_seqlen_q == 524
+        assert not mask[0, :1000].any()
+        assert mask[0, 1000:].all()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_none_inputs(self):
         """Non-pre_process PP: mask from cu_seqlens when all tensors None."""
         seqlens, total_T, alignment = [50, 30], 80, 64
-        _, _, _, _, _, mask = pad_sequence_for_thd(
+        _, _, _, _, p, mask = pad_sequence_for_thd(
             None, None, None, None, _make_psp(seqlens), alignment
         )
         assert mask.shape == (1, 128)
         assert not mask[0, :total_T].any() and mask[0, total_T:].all()
+        assert p.cu_seqlens_q_padded[-1].item() == 128
 
 
 # =============================================================================

@@ -105,6 +105,37 @@ def _round_up_to_alignment(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _cu_seqlens_with_padded_total(
+    cu_seqlens: Optional[Tensor], target_total_tokens: int
+) -> Optional[Tensor]:
+    if cu_seqlens is None:
+        return None
+    assert cu_seqlens.numel() > 0, "cu_seqlens must contain at least the zero offset."
+    current_total_tokens = int(cu_seqlens[-1].item())
+    assert current_total_tokens <= target_total_tokens, (
+        f"Packed cu_seqlens total ({current_total_tokens}) exceeds padded token total "
+        f"({target_total_tokens}). Increase --pad-packed-seq-alignment or reduce packed "
+        f"sequence length."
+    )
+    if current_total_tokens == target_total_tokens:
+        return cu_seqlens
+    padded = cu_seqlens.clone()
+    padded[-1] = target_total_tokens
+    return padded
+
+
+def _max_seqlen_with_padded_total(
+    cu_seqlens: Optional[Tensor], max_seqlen: Optional[int], target_total_tokens: int
+) -> Optional[int]:
+    if cu_seqlens is None:
+        return max(max_seqlen or 0, target_total_tokens)
+    if cu_seqlens.numel() <= 1:
+        return max_seqlen
+    last_seq_start = int(cu_seqlens[-2].item())
+    padded_last_seq_len = target_total_tokens - last_seq_start
+    return max(max_seqlen or 0, padded_last_seq_len)
+
+
 def pad_sequence_for_thd(
     tokens: Optional[Tensor],
     labels: Optional[Tensor],
@@ -120,12 +151,13 @@ def pad_sequence_for_thd(
     PackedSeqParams,
     Optional[Tensor],
 ]:
-    """Pad packed THD tensors to an alignment without changing sequence metadata.
+    """Pad packed THD tensors to an alignment.
 
-    This appends padding tokens to the token-like tensors after packing/CP slicing.
-    It intentionally keeps ``cu_seqlens`` unchanged so the original sequence
-    boundaries are preserved. The returned padding mask marks the appended tokens
-    for MoE auxiliary loss/routing paths.
+    This follows the original ``pad_thd_for_cuda_graph`` structure: determine
+    the current packed token count, pad token-like tensors along the sequence
+    dimension, return updated ``PackedSeqParams``, and create a padding mask.
+    The original ``cu_seqlens`` values are preserved, while
+    ``cu_seqlens_*_padded[-1]`` is extended to the padded token total.
 
     Returns:
         Padded (tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask)
@@ -139,7 +171,6 @@ def pad_sequence_for_thd(
             actual_T = candidate.shape[-1]
             mask_device = candidate.device
             break
-    actual_T_is_local = actual_T is not None
     if actual_T is None:
         assert packed_seq_params.cu_seqlens_q is not None, (
             "packed_seq_params.cu_seqlens_q must be available to derive padding_mask "
@@ -148,56 +179,61 @@ def pad_sequence_for_thd(
         actual_T = int(packed_seq_params.cu_seqlens_q[-1].item())
         mask_device = packed_seq_params.cu_seqlens_q.device
 
-    from megatron.core import parallel_state
-
-    cp_size = (
-        packed_seq_params.local_cp_size
-        if packed_seq_params.local_cp_size is not None
-        else parallel_state.get_context_parallel_world_size()
+    metadata_cu_seqlens = (
+        packed_seq_params.cu_seqlens_q_padded
+        if packed_seq_params.cu_seqlens_q_padded is not None
+        else packed_seq_params.cu_seqlens_q
     )
-    cp_rank = parallel_state.get_context_parallel_rank() if cp_size > 1 else 0
-
-    if cp_size > 1:
-        from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
-
-        if actual_T_is_local:
-            local_actual_T = int(actual_T)
-            local_target_T = _round_up_to_alignment(local_actual_T, alignment)
-        else:
-            local_actual_T = int(
-                get_thd_partitioned_indices(
-                    (
-                        packed_seq_params.cu_seqlens_q_padded
-                        if packed_seq_params.cu_seqlens_q_padded is not None
-                        else packed_seq_params.cu_seqlens_q
-                    ),
-                    int(actual_T),
-                    cp_size,
-                    cp_rank,
-                ).numel()
-            )
-            local_target_T = _round_up_to_alignment(local_actual_T, alignment)
-    else:
-        local_actual_T = int(actual_T)
-        local_target_T = _round_up_to_alignment(local_actual_T, alignment)
+    if metadata_cu_seqlens is not None:
+        actual_T = max(int(actual_T), int(metadata_cu_seqlens[-1].item()))
+    target_T = _round_up_to_alignment(int(actual_T), alignment)
 
     padded_params = PackedSeqParams(
         qkv_format=packed_seq_params.qkv_format,
         cu_seqlens_q=packed_seq_params.cu_seqlens_q,
         cu_seqlens_kv=packed_seq_params.cu_seqlens_kv,
-        cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
-        cu_seqlens_kv_padded=packed_seq_params.cu_seqlens_kv_padded,
-        max_seqlen_q=packed_seq_params.max_seqlen_q,
-        max_seqlen_kv=packed_seq_params.max_seqlen_kv,
+        cu_seqlens_q_padded=_cu_seqlens_with_padded_total(
+            (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q
+            ),
+            target_T,
+        ),
+        cu_seqlens_kv_padded=_cu_seqlens_with_padded_total(
+            (
+                packed_seq_params.cu_seqlens_kv_padded
+                if packed_seq_params.cu_seqlens_kv_padded is not None
+                else packed_seq_params.cu_seqlens_kv
+            ),
+            target_T,
+        ),
+        max_seqlen_q=_max_seqlen_with_padded_total(
+            (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q
+            ),
+            packed_seq_params.max_seqlen_q,
+            target_T,
+        ),
+        max_seqlen_kv=_max_seqlen_with_padded_total(
+            (
+                packed_seq_params.cu_seqlens_kv_padded
+                if packed_seq_params.cu_seqlens_kv_padded is not None
+                else packed_seq_params.cu_seqlens_kv
+            ),
+            packed_seq_params.max_seqlen_kv,
+            target_T,
+        ),
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
-        total_tokens=local_target_T if cp_size == 1 else None,
     )
 
-    tokens = _pad_seq_tensor(tokens, local_target_T)
-    labels = _pad_seq_tensor(labels, local_target_T)
-    loss_mask = _pad_seq_tensor(loss_mask, local_target_T)
-    position_ids = _pad_seq_tensor(position_ids, local_target_T)
-    padding_mask = torch.arange(local_target_T, device=mask_device).unsqueeze(0) >= local_actual_T
+    tokens = _pad_seq_tensor(tokens, target_T)
+    labels = _pad_seq_tensor(labels, target_T)
+    loss_mask = _pad_seq_tensor(loss_mask, target_T)
+    position_ids = _pad_seq_tensor(position_ids, target_T)
+    padding_mask = torch.arange(target_T, device=mask_device).unsqueeze(0) >= actual_T
 
     return tokens, labels, loss_mask, position_ids, padded_params, padding_mask

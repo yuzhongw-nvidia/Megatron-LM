@@ -543,7 +543,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Get a batch from data_iterator or create an emtpy batch.
     if is_tp_rank_0:
         assert data_iterator is not None
-        batch = next(data_iterator)
+        batch = dict(next(data_iterator))
         for key in batch_keys:
             assert key in batch, f"{key} is missing in current batch."
     else:
@@ -559,10 +559,71 @@ def get_batch_on_this_rank_for_sequence_packing(
             group_size=local_cp_size_val
         )
 
-    # Partition tokens, position_ids, labels, loss_mask for context parallel.
-    # Only TP rank 0 on stages that have data (first/last PP stage or MTP stage) needs this.
-    if is_tp_rank_0 and (is_first_or_last_stage or mtp_on_this_rank):
+    # Pad the complete packed THD layout before CP slicing. The helper preserves
+    # cu_seqlens and extends cu_seqlens_padded[-1] to cover the appended tail
+    # padding, then get_cp_slice_for_thd derives the CP-local tensors from this
+    # single global layout.
+    pad_alignment = (
+        getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
+    )
+    if pad_alignment == 0 and is_tp_rank_0:
+        max_seqlen_val = batch['max_seqlen']
+        pad_alignment = (
+            int(max_seqlen_val.item())
+            if isinstance(max_seqlen_val, torch.Tensor)
+            else max_seqlen_val
+        )
+
+    if is_tp_rank_0 and pad_alignment is not None:
+        max_seqlen_val = batch['max_seqlen']
+        max_seqlen_val = (
+            int(max_seqlen_val.item())
+            if isinstance(max_seqlen_val, torch.Tensor)
+            else max_seqlen_val
+        )
+        packed_seq_params_before_cp = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=batch['cu_seqlens'],
+            cu_seqlens_kv=batch['cu_seqlens'],
+            cu_seqlens_q_padded=batch['cu_seqlens_padded'],
+            cu_seqlens_kv_padded=batch['cu_seqlens_padded'],
+            max_seqlen_q=max_seqlen_val,
+            max_seqlen_kv=max_seqlen_val,
+        )
+        (
+            batch['tokens'],
+            batch['labels'],
+            batch['loss_mask'],
+            batch['position_ids'],
+            padded_params,
+            padding_mask,
+        ) = pad_sequence_for_thd(
+            batch.get('tokens'),
+            batch.get('labels'),
+            batch.get('loss_mask'),
+            batch.get('position_ids'),
+            packed_seq_params_before_cp,
+            alignment=pad_alignment * cp_group.size(),
+        )
+        batch['cu_seqlens_padded'] = padded_params.cu_seqlens_q_padded
+        if isinstance(batch['max_seqlen'], torch.Tensor):
+            batch['max_seqlen'] = torch.full_like(batch['max_seqlen'], padded_params.max_seqlen_q)
+        else:
+            batch['max_seqlen'] = padded_params.max_seqlen_q
+        batch['padding_mask'] = padding_mask.squeeze(0)
+
+    # Partition token-like tensors and padding_mask for context parallel.
+    if is_tp_rank_0:
         get_cp_slice_for_thd(batch, cp_group)
+
+    if is_tp_rank_0:
+        has_padding_mask_tensor = torch.tensor(
+            [int(batch.get('padding_mask') is not None)], dtype=torch.int32, device=dev
+        )
+    else:
+        has_padding_mask_tensor = torch.empty(1, dtype=torch.int32, device=dev)
+    broadcast_tensor(has_padding_mask_tensor, tp_src_rank, tp_group)
+    has_padding_mask = bool(has_padding_mask_tensor.item())
 
     # Broadcast cu_seqlens_size because we need it to create placeholder for cu_seqlens and
     # cu_seqlens_padded for non TP 0 ranks.
@@ -573,19 +634,23 @@ def get_batch_on_this_rank_for_sequence_packing(
     broadcast_tensor(cu_seqlen_size, tp_src_rank, tp_group)
     cu_seqlen_size = cu_seqlen_size.item()
 
-    # Broadcast total_tokens because we need it to create placeholder for tokens, position_ids,
-    # labels, loss_mask for non TP 0 ranks. Only first stage, last stage,
-    # and stage with mtp need this.
+    # Broadcast total_tokens because we need it to create placeholders for
+    # token-like tensors and, when THD padding is enabled, padding_mask.
 
-    if is_first_or_last_stage or mtp_on_this_rank:
+    needs_token_like_tensors = is_first_or_last_stage or mtp_on_this_rank
+    needs_total_tokens = needs_token_like_tensors or has_padding_mask
+
+    if needs_total_tokens:
         if is_tp_rank_0:
-            # Use whichever data field is available (first stage has tokens, last has labels).
-            # Avoid `tokens or labels`: PyTorch tensors raise on truthiness when they have
-            # more than one element ("Boolean value of Tensor ... is ambiguous").
-            _data_field = batch.get('tokens')
-            if _data_field is None:
-                _data_field = batch.get('labels')
-            total_tokens = torch.tensor(_data_field.size(0), dtype=torch.int32, device=dev)
+            if needs_token_like_tensors:
+                ref = batch.get('tokens') if batch.get('tokens') is not None else batch.get('labels')
+            else:
+                ref = batch.get('padding_mask')
+            assert ref is not None, (
+                "batch must have non-None 'tokens', 'labels', or 'padding_mask' to determine "
+                f"total_tokens (keys: {list(batch.keys())})"
+            )
+            total_tokens = torch.tensor(ref.size(0), dtype=torch.int32, device=dev)
         else:
             total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
         broadcast_tensor(total_tokens, tp_src_rank, tp_group)
@@ -620,6 +685,16 @@ def get_batch_on_this_rank_for_sequence_packing(
         # Non last stage rank doesn't need labels and loss_mask.
         batch['labels'] = None
         batch['loss_mask'] = None
+
+    # Step2.5: Prepare "padding_mask" when pre-CP THD padding created one.
+    if has_padding_mask:
+        if is_tp_rank_0:
+            assert batch['padding_mask'].dtype == torch.bool
+            batch['padding_mask'] = batch['padding_mask'].view(1, total_tokens)
+        else:
+            batch['padding_mask'] = torch.empty([1, total_tokens], dtype=torch.bool, device=dev)
+    else:
+        batch['padding_mask'] = None
 
     # Step3: Prepare "cu_seqlens", "cu_seqlens_padded", "max_seqlen" on all ranks.
     if is_tp_rank_0:
@@ -661,12 +736,14 @@ def get_batch_on_this_rank_for_sequence_packing(
     broadcast_tensor(batch['cu_seqlens_padded'], tp_src_rank, tp_group)
     broadcast_tensor(batch['max_seqlen'], tp_src_rank, tp_group)
     broadcast_tensor(batch['local_cp_size'], tp_src_rank, tp_group)
+    broadcast_tensor(batch['padding_mask'], tp_src_rank, tp_group)
 
     # Extract the data from batch after broadcasting.
     tokens = batch['tokens']
     position_ids = batch['position_ids']
     labels = batch['labels']
     loss_mask = batch['loss_mask']
+    padding_mask = batch['padding_mask']
     cu_seqlens = batch['cu_seqlens']
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
@@ -676,6 +753,10 @@ def get_batch_on_this_rank_for_sequence_packing(
         if dynamic_cp
         else None
     )
+    effective_cp_size = (
+        local_cp_size if dynamic_cp else parallel_state.get_context_parallel_world_size()
+    )
+    packed_total_tokens = total_tokens if has_padding_mask and effective_cp_size == 1 else None
 
     # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as cu_seqlens to
     # get the correct result.
@@ -690,29 +771,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=cp_group,
+        total_tokens=packed_total_tokens,
     )
-
-    # Pad the already-packed THD tensors at the end when requested. The
-    # cu_seqlens metadata remains unchanged so original sequence boundaries are
-    # preserved.
-    padding_mask = None
-    pad_alignment = (
-        getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
-    )
-    if pad_alignment == 0:
-        pad_alignment = max_seqlen
-
-    if pad_alignment is not None and packed_seq_params is not None:
-        tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
-            pad_sequence_for_thd(
-                tokens,
-                labels,
-                loss_mask,
-                position_ids,
-                packed_seq_params,
-                alignment=pad_alignment,
-            )
-        )
 
     # "attention_mask" is not valid for sequence packing, so set it to None.
     return tokens, labels, loss_mask, None, position_ids, packed_seq_params, padding_mask

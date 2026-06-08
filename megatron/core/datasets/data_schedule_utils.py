@@ -34,7 +34,7 @@ def get_cp_slice_for_thd(batch, cp_group):
     # batch['tokens'] is None on that stage. cu_seqlens_padded is always populated.
     total_tokens = int(cu_seqlens[-1].item())
     index = get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
-    for key in ['tokens', 'position_ids', 'labels', 'loss_mask']:
+    for key in ['tokens', 'position_ids', 'labels', 'loss_mask', 'padding_mask']:
         if key in batch and batch[key] is not None:
             batch[key] = batch[key].index_select(0, index)
 
