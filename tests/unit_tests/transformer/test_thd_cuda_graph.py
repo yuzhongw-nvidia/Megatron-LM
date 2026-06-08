@@ -233,6 +233,32 @@ class TestDecomposeReconstruct:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_aliased_padded_cu_seqlens_are_omitted(self):
+        """Avoid TE capture-time torch.equal when cu and padded cu are aliases."""
+        cu = _make_cu([100, 50, 30])
+        psp = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            cu_seqlens_q_padded=cu,
+            cu_seqlens_kv_padded=cu,
+            max_seqlen_q=100,
+            max_seqlen_kv=100,
+        )
+        layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        kw = {'packed_seq_params': psp}
+        TransformerLayer._decompose_packed_seq_params_to_kwargs(kw)
+        assert 'cu_seqlens_q_padded' not in kw
+        assert 'cu_seqlens_kv_padded' not in kw
+        layer._reconstruct_packed_seq_params_from_kwargs(kw)
+        r = kw['packed_seq_params']
+        assert torch.equal(r.cu_seqlens_q, cu)
+        assert torch.equal(r.cu_seqlens_kv, cu)
+        assert r.cu_seqlens_q_padded is None
+        assert r.cu_seqlens_kv_padded is None
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_noop_without_packed_seq_params(self):
         """No-ops on non-THD kwargs (SBHD path)."""
         layer = _build_layer(256, 4, 4, 1024, 128, 8)

@@ -1156,8 +1156,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return
         kwargs['cu_seqlens_q'] = packed_seq_params.cu_seqlens_q
         kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
-        kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
-        kwargs['cu_seqlens_kv_padded'] = packed_seq_params.cu_seqlens_kv_padded
+        if (
+            packed_seq_params.cu_seqlens_q_padded is not None
+            and packed_seq_params.cu_seqlens_q_padded is not packed_seq_params.cu_seqlens_q
+        ):
+            kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
+        if (
+            packed_seq_params.cu_seqlens_kv_padded is not None
+            and packed_seq_params.cu_seqlens_kv_padded is not packed_seq_params.cu_seqlens_kv
+        ):
+            kwargs['cu_seqlens_kv_padded'] = packed_seq_params.cu_seqlens_kv_padded
 
     def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
         """Reconstruct PackedSeqParams from individual tensor kwargs (CUDA graph path).
@@ -1174,8 +1182,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             qkv_format='thd',
             cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
             cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
-            cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
-            cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
+            cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded', None),
+            cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded', None),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
         )
