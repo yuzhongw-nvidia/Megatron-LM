@@ -279,8 +279,11 @@ except ImportError:
 
 _hybrid_ep_buffer = None
 
-# HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
-HYBRIDEP_TOKEN_ALIGNMENT = 64
+# HybridEP buffer construction validates max_num_of_tokens_per_rank against the
+# dispatch/combine chunk size used by the backend. The current GB200 recipe sets
+# NUM_OF_TOKENS_PER_CHUNK_* to 128, so manager-side padding must align to 128
+# before HybridEP initializes or specializes kernels.
+HYBRIDEP_TOKEN_ALIGNMENT = 128
 
 
 def init_hybrid_ep_buffer(
