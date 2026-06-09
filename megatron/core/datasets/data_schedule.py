@@ -543,7 +543,12 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Get a batch from data_iterator or create an emtpy batch.
     if is_tp_rank_0:
         assert data_iterator is not None
-        batch = next(data_iterator)
+        # Shallow-copy the dict so the in-place mutations below (setting
+        # 'tokens'/'labels'/'position_ids'/'loss_mask' to None on stages that
+        # don't need them) don't poison the underlying sample if the iterator
+        # returns the same dict reference on a subsequent call (e.g. RerunData
+        # replay, VPP cross-stage sharing).
+        batch = dict(next(data_iterator))
         for key in batch_keys:
             assert key in batch, f"{key} is missing in current batch."
     else:
@@ -597,10 +602,22 @@ def get_batch_on_this_rank_for_sequence_packing(
     # Step1: Prepare "tokens", "position_ids" for first stage and stage with mtp on all TP ranks.
     if is_first_stage or mtp_on_this_rank:
         if is_tp_rank_0:
-            assert batch['tokens'].dtype == torch.int64
-            assert batch['position_ids'].dtype == torch.int64
-            batch['tokens'] = batch['tokens'].view(1, total_tokens)
-            batch['position_ids'] = batch['position_ids'].view(1, total_tokens)
+            # When MTP is on the last PP stage and tokens weren't propagated by
+            # the data scheduler, allocate an empty placeholder so MTP's view()
+            # call doesn't crash. The downstream MTP/loss path may then need its
+            # own None guard, but at minimum we get past the get_batch call.
+            if batch.get('tokens') is not None:
+                assert batch['tokens'].dtype == torch.int64
+                batch['tokens'] = batch['tokens'].view(1, total_tokens)
+            else:
+                batch['tokens'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
+            if batch.get('position_ids') is not None:
+                assert batch['position_ids'].dtype == torch.int64
+                batch['position_ids'] = batch['position_ids'].view(1, total_tokens)
+            else:
+                batch['position_ids'] = torch.empty(
+                    [1, total_tokens], dtype=torch.int64, device=dev
+                )
         else:
             batch['tokens'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
             batch['position_ids'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
