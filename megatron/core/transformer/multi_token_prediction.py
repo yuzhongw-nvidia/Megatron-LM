@@ -344,6 +344,66 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     return rolled_tensor, rolled_tensor.sum()
 
 
+def _get_packed_sequence_mtp_loss_scale(
+    original_loss_mask: Tensor,
+    rolled_loss_mask: Tensor,
+    packed_seq_params: PackedSeqParams,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Tensor:
+    """Return per-token MTP loss scale factors for packed sequences.
+
+    With per-token loss enabled, MTP scales its rolled loss by
+    ``original_num_tokens / rolled_num_tokens`` before the final global token
+    normalization.  In SBHD validation with micro-batch-size 1 this ratio is
+    effectively per sequence.  THD can pack multiple sequences into one
+    microbatch, so using one aggregate ratio for the whole packed microbatch
+    changes the relative MTP weight between sequences.  Compute the ratio per
+    packed sequence to keep THD grouping equivalent to the SBHD reference.
+    """
+
+    cu_seqlens = (
+        packed_seq_params.cu_seqlens_q_padded
+        if getattr(packed_seq_params, 'cu_seqlens_q_padded', None) is not None
+        else packed_seq_params.cu_seqlens_q
+    )
+    assert cu_seqlens is not None, "Packed sequence parameters must provide cu_seqlens_q."
+
+    cp_size = cp_group.size() if cp_group is not None else 1
+    num_sequences = len(cu_seqlens) - 1
+    original_num_tokens = torch.zeros(
+        num_sequences, dtype=rolled_loss_mask.dtype, device=rolled_loss_mask.device
+    )
+    rolled_num_tokens = torch.zeros_like(original_num_tokens)
+    local_ranges = []
+
+    for i in range(num_sequences):
+        start_idx = int(cu_seqlens[i].item())
+        end_idx = int(cu_seqlens[i + 1].item())
+        if cp_size > 1:
+            start_idx //= cp_size
+            end_idx //= cp_size
+        local_ranges.append((start_idx, end_idx))
+        if end_idx <= start_idx:
+            continue
+
+        original_num_tokens[i] = original_loss_mask[..., start_idx:end_idx].sum()
+        rolled_num_tokens[i] = rolled_loss_mask[..., start_idx:end_idx].sum()
+
+    if cp_size > 1:
+        torch.distributed.all_reduce(original_num_tokens, group=cp_group)
+        torch.distributed.all_reduce(rolled_num_tokens, group=cp_group)
+
+    scale = torch.zeros_like(rolled_loss_mask)
+    seq_scales = original_num_tokens / torch.clamp(rolled_num_tokens, min=1)
+    for i, (start_idx, end_idx) in enumerate(local_ranges):
+        if end_idx <= start_idx:
+            continue
+        seq_scale = seq_scales[i]
+        scale[..., start_idx:end_idx] = seq_scale
+
+    return scale
+
+
 class MTPLossLoggingHelper:
     """Helper class for logging MTP losses."""
 
@@ -717,10 +777,11 @@ def process_mtp_loss(
                     output_layer, output_layer_state, args=(input_,), kwargs=kwargs
                 )
 
-    # Store the original number of tokens before rolling for proper normalization
-    # when calculate_per_token_loss is enabled. This ensures MTP gradients are
+    # Store the original loss mask before rolling for proper normalization when
+    # calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
-    original_num_tokens = loss_mask.sum()
+    original_loss_mask = loss_mask
+    original_num_tokens = original_loss_mask.sum()
 
     fuse_linear_cross_entropy = (
         config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
@@ -766,10 +827,14 @@ def process_mtp_loss(
             # per-token gradient weighting, we normalize by the rolled token count
             # and re-scale by the original token count.
             # Avoid division by zero
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
-            mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
-            )
+            if packed_seq_params is not None:
+                mtp_loss_scale_factor = _get_packed_sequence_mtp_loss_scale(
+                    original_loss_mask, loss_mask, packed_seq_params, cp_group
+                )
+            else:
+                num_tokens_safe = torch.clamp(num_tokens, min=1)
+                mtp_loss_scale_factor = original_num_tokens / num_tokens_safe
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss * mtp_loss_scale_factor
             hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
         else:
             safe_num_tokens = num_tokens.clamp(min=1)

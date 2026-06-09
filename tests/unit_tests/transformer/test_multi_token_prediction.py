@@ -27,6 +27,7 @@ from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    _get_packed_sequence_mtp_loss_scale,
     process_mtp_loss,
     roll_tensor,
 )
@@ -171,6 +172,36 @@ class TestMultiTokenPredictionLayer:
 
 
 class TestProcessMTPLoss:
+    def test_packed_per_token_loss_scale_matches_sequence_grouping(self):
+        """Packed MTP per-token scaling should be invariant to THD grouping."""
+
+        original_loss_mask = torch.tensor(
+            [[1, 1, 1, 1, 1, 1, 1, 0, 0, 0]], dtype=torch.float32
+        )
+        rolled_loss_mask = torch.tensor([[1, 1, 1, 1, 0, 1, 0, 0, 0, 0]], dtype=torch.float32)
+        mtp_loss = torch.tensor([[10, 10, 10, 10, 0, 1, 0, 0, 0, 0]], dtype=torch.float32)
+        cu_seqlens = torch.tensor([0, 5, 10], dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=5,
+            max_seqlen_kv=5,
+        )
+
+        packed_scale = _get_packed_sequence_mtp_loss_scale(
+            original_loss_mask, rolled_loss_mask, packed_seq_params
+        )
+        packed_total = torch.sum(mtp_loss * packed_scale)
+
+        sbhd_total = torch.tensor(40.0 * (5.0 / 4.0) + 1.0 * (2.0 / 1.0))
+        aggregate_total = torch.sum(mtp_loss) * (original_loss_mask.sum() / rolled_loss_mask.sum())
+
+        torch.testing.assert_close(packed_total, sbhd_total)
+        assert not torch.allclose(aggregate_total, sbhd_total)
+
     def test_isolated_loss_detaches_encoder_hidden_states(self):
         """MTP isolated loss should not update the main decoder hidden states."""
 
