@@ -17,7 +17,14 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    resolve_cp_group,
+    scatter_loss_masked_tokens,
+    select_loss_masked_tokens,
+    zero_hidden_states_for_padding_mask,
+    zero_padded_hidden_states,
+)
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
@@ -732,24 +739,56 @@ def process_mtp_loss(
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
-        if fuse_linear_cross_entropy:
-            mtp_loss = output_layer_for_mtp(
-                hidden_states_list[mtp_layer_number + 1],
-                weight=output_weight_for_mtp,
-                runtime_gather_output=runtime_gather_output,
-                output_cross_entropy_loss=True,
-                labels=mtp_labels,
+        mtp_hidden_states = zero_padded_hidden_states(
+            hidden_states_list[mtp_layer_number + 1], loss_mask
+        )
+        selected_loss_tokens = None
+        if config.pad_packed_seq_alignment is not None:
+            selected_loss_tokens = select_loss_masked_tokens(
+                mtp_hidden_states, mtp_labels, loss_mask
             )
+        if selected_loss_tokens is not None:
+            selected_hidden_states, selected_labels, valid_mask = selected_loss_tokens
+            if selected_hidden_states.shape[0] == 0:
+                mtp_loss = mtp_hidden_states.new_zeros(loss_mask.shape, dtype=torch.float32)
+            elif fuse_linear_cross_entropy:
+                selected_loss = output_layer_for_mtp(
+                    selected_hidden_states,
+                    weight=output_weight_for_mtp,
+                    runtime_gather_output=runtime_gather_output,
+                    output_cross_entropy_loss=True,
+                    labels=selected_labels,
+                )
+                mtp_loss = scatter_loss_masked_tokens(selected_loss, valid_mask, loss_mask.shape)
+            else:
+                mtp_logits, _ = output_layer_for_mtp(
+                    selected_hidden_states,
+                    weight=output_weight_for_mtp,
+                    runtime_gather_output=runtime_gather_output,
+                )
+                if scale_logits_fn is not None:
+                    mtp_logits = scale_logits_fn(mtp_logits)
+                selected_loss = compute_language_model_loss(selected_labels, mtp_logits)
+                mtp_loss = scatter_loss_masked_tokens(selected_loss, valid_mask, loss_mask.shape)
         else:
-            mtp_logits, _ = output_layer_for_mtp(
-                hidden_states_list[mtp_layer_number + 1],
-                weight=output_weight_for_mtp,
-                runtime_gather_output=runtime_gather_output,
-            )
-            if scale_logits_fn is not None:
-                mtp_logits = scale_logits_fn(mtp_logits)
-            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
-        mtp_loss = loss_mask * mtp_loss
+            if fuse_linear_cross_entropy:
+                mtp_loss = output_layer_for_mtp(
+                    mtp_hidden_states,
+                    weight=output_weight_for_mtp,
+                    runtime_gather_output=runtime_gather_output,
+                    output_cross_entropy_loss=True,
+                    labels=mtp_labels,
+                )
+            else:
+                mtp_logits, _ = output_layer_for_mtp(
+                    mtp_hidden_states,
+                    weight=output_weight_for_mtp,
+                    runtime_gather_output=runtime_gather_output,
+                )
+                if scale_logits_fn is not None:
+                    mtp_logits = scale_logits_fn(mtp_logits)
+                mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        mtp_loss = torch.where(loss_mask > 0, mtp_loss * loss_mask, torch.zeros_like(mtp_loss))
         if is_training:
             MTPLossLoggingHelper.save_loss_to_tracker(
                 torch.sum(mtp_loss),
@@ -1099,10 +1138,14 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[torch.Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
         """
+        hidden_states = zero_hidden_states_for_padding_mask(hidden_states, padding_mask)
+        decoder_input = zero_hidden_states_for_padding_mask(decoder_input, padding_mask)
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -1133,6 +1176,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         rotary_pos_emb=rotary_pos_emb,
                         inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
+                        padding_mask=padding_mask,
                     )
                 else:
                     # GPT path: single TransformerLayer
@@ -1148,8 +1192,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                         inference_params=inference_params,
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
+                        padding_mask=padding_mask,
                     )
 
+        hidden_states = zero_hidden_states_for_padding_mask(hidden_states, padding_mask)
         if not self.mhc_enabled:
             hidden_states = self._postprocess(hidden_states)
 
@@ -1238,6 +1284,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
     ):
         """Forward through ``_proj_and_transformer_layer`` with activation
         recomputation.
@@ -1284,6 +1331,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
             )
 
         # Decide the outer quantization context, matching
@@ -1375,6 +1423,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
             )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -1396,6 +1445,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
         embedding=None,
     ):
         """
@@ -1445,6 +1495,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
             )
         else:
             hidden_states = self._proj_and_transformer_layer(
@@ -1460,6 +1511,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
             )
 
         self.cp_group = _orig_cp_group
@@ -1722,6 +1774,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
         mhc_multistream: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Perform the forward pass through all of the MTP modules.
@@ -1765,6 +1818,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
                 embedding=embedding,
                 **(extra_block_kwargs or {}),
             )

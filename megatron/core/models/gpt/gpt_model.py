@@ -609,6 +609,7 @@ class GPTModel(LanguageModule):
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            padding_mask=padding_mask,
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
@@ -631,6 +632,7 @@ class GPTModel(LanguageModule):
         inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
+        padding_mask=None,
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
@@ -659,6 +661,7 @@ class GPTModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
         if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
+            hidden_states = zero_padded_hidden_states(hidden_states, loss_mask)
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -671,6 +674,7 @@ class GPTModel(LanguageModule):
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
                 embedding=self.embedding,
                 **(extra_block_kwargs or {}),
             )
