@@ -332,13 +332,13 @@ class GatedDeltaNet(MegatronModule):
             ), "Packed sequence does not support deterministic mode."
 
             # Resolve cu_seqlens with alignment padding handling.
-            cu_seqlens_q = self._resolve_cu_seqlens(
+            cu_seqlens_q, padding_start_q = self._resolve_cu_seqlens_with_padding_start(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
                 seq_len,
                 "cu_seqlens_q",
             )
-            cu_seqlens_kv = self._resolve_cu_seqlens(
+            cu_seqlens_kv, padding_start_kv = self._resolve_cu_seqlens_with_padding_start(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
                 seq_len,
@@ -348,6 +348,17 @@ class GatedDeltaNet(MegatronModule):
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )
+            assert padding_start_q == padding_start_kv, (
+                "Currently only support matching THD padding starts, "
+                f"but got {padding_start_q=} and {padding_start_kv=}"
+            )
+            padded_seq_len = seq_len
+            if padding_start_q is not None:
+                cu_seqlens_q = cu_seqlens_q[:-1].contiguous()
+                cu_seqlens_kv = cu_seqlens_kv[:-1].contiguous()
+                hidden_states = hidden_states[:padding_start_q]
+                seq_len = padding_start_q
+            padding_start = padding_start_q
             num_packed_seqs = cu_seqlens_q.shape[0] - 1
             assert num_packed_seqs > 0, (
                 "Number of packed sequences must be greater than 0, "
@@ -356,6 +367,8 @@ class GatedDeltaNet(MegatronModule):
         else:
             cu_seqlens_q = None
             cu_seqlens_kv = None
+            padding_start = None
+            padded_seq_len = seq_len
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
@@ -515,6 +528,9 @@ class GatedDeltaNet(MegatronModule):
         # From bshd back to sbhd format
         norm_out = norm_out.reshape(batch, seq_len, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
+        if padding_start is not None and padding_start < norm_out.shape[0]:
+            norm_out = norm_out.clone()
+            norm_out[padding_start:] = 0
 
         # CP all to all: HP to CP
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -531,6 +547,16 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
+        if padding_start is not None and out.shape[0] < padded_seq_len:
+            out = torch.cat(
+                (
+                    out,
+                    out.new_zeros(
+                        (padded_seq_len - out.shape[0], out.shape[1], out.shape[2])
+                    ),
+                ),
+                dim=0,
+            )
 
         return out, out_bias
 
@@ -595,21 +621,51 @@ class GatedDeltaNet(MegatronModule):
         return g, beta
 
     def _resolve_cu_seqlens(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name):
-        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
+        return self._resolve_cu_seqlens_with_padding_start(
+            cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name
+        )[0]
+
+    def _resolve_cu_seqlens_with_padding_start(
+        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name
+    ):
+        """Resolve cu_seqlens for packed sequence all-to-all.
+
+        ``pad_packed_seq_alignment`` can extend token-like tensors beyond the
+        real packed token count. Treat the extra tail as an isolated padding
+        segment so packed kernels cover the full hidden-state length without
+        mixing padding tokens into real sequences. The returned padding start
+        identifies that isolated tail so the module output can be zeroed before
+        downstream loss computation.
+        """
         if cu_seqlens_padded is not None:
             cu_seqlens = cu_seqlens_padded
         else:
             cu_seqlens = cu_seqlens_actual
 
         total_cu = cu_seqlens[-1].item()
-        if total_cu != total_seq_len:
+        if total_cu == total_seq_len:
+            return cu_seqlens, None
+
+        if total_cu > total_seq_len or cu_seqlens_padded is None:
             raise ValueError(
                 f"GDN: {name}[-1]={total_cu} does not match "
                 f"total_sequence_length={total_seq_len}. "
                 f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
             )
 
-        return cu_seqlens
+        keep_end = cu_seqlens.numel()
+        while (
+            keep_end > 1
+            and cu_seqlens[keep_end - 1].item() == cu_seqlens[keep_end - 2].item()
+        ):
+            keep_end -= 1
+
+        cu_seqlens = cu_seqlens[:keep_end]
+        if cu_seqlens[-1].item() == total_seq_len:
+            return cu_seqlens, None
+
+        padding_start = cu_seqlens[-1].item()
+        return torch.cat((cu_seqlens, cu_seqlens.new_tensor([total_seq_len]))), padding_start
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""

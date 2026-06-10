@@ -296,9 +296,9 @@ class TestGatedDeltaNet:
         )
         assert output_thd_no_padding.shape == output_thd_padded.shape
 
-        # C) padded mismatch branch: if *_padded[-1] mismatches total_sequence_length, should raise.
+        # C) padded overflow branch: if *_padded[-1] exceeds total_sequence_length, should raise.
         padded_mismatch_params = make_test_packed_seq_params_with_padding(
-            cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 126]
+            cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 130]
         )
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=padded_mismatch_params)
@@ -318,6 +318,9 @@ class TestGDNCuSeqlensResolve:
         class MockGDN:
             cp_size = 2
             _resolve_cu_seqlens = GatedDeltaNet._resolve_cu_seqlens
+            _resolve_cu_seqlens_with_padding_start = (
+                GatedDeltaNet._resolve_cu_seqlens_with_padding_start
+            )
 
         return MockGDN()
 
@@ -337,9 +340,35 @@ class TestGDNCuSeqlensResolve:
         with pytest.raises(ValueError, match="does not match"):
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q")
 
-    def test_raises_when_padded_mismatches_total(self, mock_gdn):
+    def test_appends_trailing_padding_when_padded_shorter_than_total(self, mock_gdn):
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         padded = torch.tensor([0, 504, 1004], dtype=torch.int32)
+        expected = torch.tensor([0, 504, 1004, 1008], dtype=torch.int32)
+        result = mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q")
+        assert torch.equal(result, expected)
+
+        result, padding_start = mock_gdn._resolve_cu_seqlens_with_padding_start(
+            padded, actual, 1008, "cu_seqlens_q"
+        )
+        assert torch.equal(result, expected)
+        assert padding_start == 1004
+
+    def test_trims_static_cu_seqlens_padding_before_appending_total(self, mock_gdn):
+        actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
+        padded = torch.tensor([0, 500, 1000, 1000, 1000], dtype=torch.int32)
+        expected = torch.tensor([0, 500, 1000, 1008], dtype=torch.int32)
+        result = mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q")
+        assert torch.equal(result, expected)
+
+        result, padding_start = mock_gdn._resolve_cu_seqlens_with_padding_start(
+            padded, actual, 1008, "cu_seqlens_q"
+        )
+        assert torch.equal(result, expected)
+        assert padding_start == 1000
+
+    def test_raises_when_padded_exceeds_total(self, mock_gdn):
+        actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
+        padded = torch.tensor([0, 504, 1012], dtype=torch.int32)
         with pytest.raises(ValueError, match="does not match"):
             mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q")
 
