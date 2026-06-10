@@ -31,6 +31,10 @@ from megatron.core.packed_seq_params import (
     PackedSeqParams,
     get_thd_padding_kwargs,
     pad_sequence_for_thd,
+    scatter_loss_masked_tokens,
+    select_loss_masked_tokens,
+    zero_hidden_states_for_padding_mask,
+    zero_padded_hidden_states,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -124,6 +128,50 @@ def test_cuda_graph_pad_to_max_resolves_static_cu_padding():
     assert alignment is None
     assert target_len == 8192
     assert max_num_seqs == 32
+
+
+@pytest.mark.internal
+def test_zero_padded_hidden_states_by_loss_mask():
+    hidden_states = torch.arange(8, dtype=torch.float32).view(4, 1, 2)
+    hidden_states[2:] = float("nan")
+    loss_mask = torch.tensor([[1, 1, 0, 0]], dtype=torch.float32)
+
+    sanitized = zero_padded_hidden_states(hidden_states, loss_mask)
+
+    assert torch.equal(sanitized[:2], hidden_states[:2])
+    assert torch.equal(sanitized[2:], torch.zeros_like(sanitized[2:]))
+
+
+@pytest.mark.internal
+def test_zero_hidden_states_for_padding_mask():
+    hidden_states = torch.arange(8, dtype=torch.float32).view(4, 1, 2)
+    hidden_states[2:] = float("nan")
+    padding_mask = torch.tensor([[False, False, True, True]])
+
+    sanitized = zero_hidden_states_for_padding_mask(hidden_states, padding_mask)
+
+    assert torch.equal(sanitized[:2], hidden_states[:2])
+    assert torch.equal(sanitized[2:], torch.zeros_like(sanitized[2:]))
+
+
+@pytest.mark.internal
+def test_select_and_scatter_loss_masked_tokens():
+    hidden_states = torch.arange(8, dtype=torch.float32).view(4, 1, 2)
+    labels = torch.tensor([[11, -100, 13, 0]], dtype=torch.int64)
+    loss_mask = torch.tensor([[1, 0, 1, 0]], dtype=torch.float32)
+
+    selected_hidden, selected_labels, valid_mask = select_loss_masked_tokens(
+        hidden_states, labels, loss_mask
+    )
+
+    assert torch.equal(selected_hidden[:, 0], hidden_states[[0, 2], 0])
+    assert torch.equal(selected_labels, torch.tensor([[11, 13]], dtype=torch.int64))
+    assert torch.equal(valid_mask, torch.tensor([True, False, True, False]))
+
+    selected_losses = torch.tensor([[1.5, 2.5]], dtype=torch.float32)
+    losses = scatter_loss_masked_tokens(selected_losses, valid_mask, labels.shape)
+
+    assert torch.equal(losses, torch.tensor([[1.5, 0.0, 2.5, 0.0]]))
 
 
 class TestPadSequenceForThd:

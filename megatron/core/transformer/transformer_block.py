@@ -18,7 +18,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, zero_hidden_states_for_padding_mask
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import CheckpointManager
@@ -523,6 +523,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         inner_quantization_context = nullcontext()
 
                     with inner_quantization_context:
+                        hidden_states = zero_hidden_states_for_padding_mask(
+                            hidden_states, padding_mask
+                        )
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -534,6 +537,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
                             input_ids=input_ids,
+                        )
+                        hidden_states = zero_hidden_states_for_padding_mask(
+                            hidden_states, padding_mask
                         )
                 return hidden_states, context
 
@@ -910,6 +916,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         )
 
                     with self.offload_context, inner_quantization_context:
+                        hidden_states = zero_hidden_states_for_padding_mask(
+                            hidden_states, padding_mask
+                        )
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -926,6 +935,9 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             padding_mask=padding_mask,
                             mhc_recompute_manager=mhc_manager,
                             input_ids=input_ids,
+                        )
+                        hidden_states = zero_hidden_states_for_padding_mask(
+                            hidden_states, padding_mask
                         )
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
@@ -967,6 +979,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # Final layer norm.
         if self.final_layernorm is not None:
             hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
+            hidden_states = zero_hidden_states_for_padding_mask(hidden_states, padding_mask)
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.

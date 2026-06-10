@@ -100,6 +100,125 @@ def _pad_seq_tensor(t: Optional[Tensor], target_len: int) -> Optional[Tensor]:
     return F.pad(t, (0, target_len - actual_len), value=0)
 
 
+def zero_padded_hidden_states(hidden_states: Tensor, loss_mask: Optional[Tensor]) -> Tensor:
+    """Zero hidden states for tokens excluded by ``loss_mask``.
+
+    Packed THD padding can create token slots that should never contribute to
+    loss. Sanitizing hidden states before the output projection prevents invalid
+    padding-only activations from producing NaN logits that survive until the
+    loss-mask multiply.
+    """
+    if hidden_states is None or loss_mask is None:
+        return hidden_states
+    if hidden_states.dim() != 3:
+        return hidden_states
+    if loss_mask.dim() == 1:
+        loss_mask = loss_mask.unsqueeze(0)
+    if loss_mask.dim() != 2:
+        return hidden_states
+
+    if (
+        loss_mask.shape[0] == hidden_states.shape[1]
+        and loss_mask.shape[1] == hidden_states.shape[0]
+    ):
+        valid_mask = loss_mask.transpose(0, 1) > 0
+    elif (
+        loss_mask.shape[0] == hidden_states.shape[0]
+        and loss_mask.shape[1] == hidden_states.shape[1]
+    ):
+        valid_mask = loss_mask > 0
+    else:
+        return hidden_states
+
+    return hidden_states.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
+
+
+def zero_hidden_states_for_padding_mask(
+    hidden_states: Tensor, padding_mask: Optional[Tensor]
+) -> Tensor:
+    """Zero hidden states for padding positions.
+
+    ``padding_mask`` follows the model convention: True means padding and False
+    means valid. The helper accepts either [batch, sequence] or
+    [sequence, batch] masks for [sequence, batch, hidden] activations.
+    """
+    if hidden_states is None or padding_mask is None:
+        return hidden_states
+    if hidden_states.dim() != 3:
+        return hidden_states
+    if padding_mask.dim() == 1:
+        padding_mask = padding_mask.unsqueeze(0)
+    if padding_mask.dim() != 2:
+        return hidden_states
+
+    if (
+        padding_mask.shape[0] == hidden_states.shape[1]
+        and padding_mask.shape[1] == hidden_states.shape[0]
+    ):
+        mask = padding_mask.transpose(0, 1).bool()
+    elif (
+        padding_mask.shape[0] == hidden_states.shape[0]
+        and padding_mask.shape[1] == hidden_states.shape[1]
+    ):
+        mask = padding_mask.bool()
+    else:
+        return hidden_states
+
+    return hidden_states.masked_fill(mask.unsqueeze(-1), 0.0)
+
+
+def select_loss_masked_tokens(
+    hidden_states: Tensor, labels: Optional[Tensor], loss_mask: Optional[Tensor]
+) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+    """Select only tokens that contribute to loss.
+
+    Output projection and cross entropy kernels can still produce non-finite
+    backward values for masked tokens if their labels or logits are invalid,
+    even when the later scalar loss masking zeros their contribution. This
+    helper builds a compact ``[num_valid, 1, hidden]`` view for the valid loss
+    tokens and the matching ``[1, num_valid]`` labels so callers can avoid
+    running the output head on masked prompt/padding positions entirely.
+
+    Returns ``None`` when shapes are unsupported.
+    Otherwise returns ``(selected_hidden_states, selected_labels, valid_mask)``,
+    where ``valid_mask`` is a flattened boolean mask over ``labels``.
+    """
+    if hidden_states is None or labels is None or loss_mask is None:
+        return None
+    if hidden_states.dim() != 3 or labels.dim() != 2:
+        return None
+    if loss_mask.dim() == 1:
+        loss_mask = loss_mask.unsqueeze(0)
+    if loss_mask.dim() != 2:
+        return None
+
+    if loss_mask.shape == labels.shape:
+        valid_mask = loss_mask > 0
+    elif loss_mask.shape[0] == labels.shape[1] and loss_mask.shape[1] == labels.shape[0]:
+        valid_mask = loss_mask.transpose(0, 1) > 0
+    else:
+        return None
+
+    if hidden_states.shape[0] != labels.shape[1] or hidden_states.shape[1] != labels.shape[0]:
+        return None
+    flat_valid_mask = valid_mask.reshape(-1)
+    flat_hidden_states = hidden_states.transpose(0, 1).contiguous().view(
+        labels.numel(), hidden_states.shape[-1]
+    )
+    selected_hidden_states = flat_hidden_states[flat_valid_mask].unsqueeze(1).contiguous()
+    selected_labels = labels.contiguous().view(-1)[flat_valid_mask].unsqueeze(0).contiguous()
+    return selected_hidden_states, selected_labels, flat_valid_mask
+
+
+def scatter_loss_masked_tokens(
+    selected_losses: Tensor, valid_mask: Tensor, output_shape: torch.Size
+) -> Tensor:
+    """Scatter compact valid-token losses back to the original ``[batch, seq]`` shape."""
+    losses = selected_losses.new_zeros(output_shape)
+    losses.view(-1)[valid_mask] = selected_losses.contiguous().view(-1)
+    return losses
+
+
 def _pad_cu_seqlens(cu_seqlens: Optional[Tensor], target_entries: int) -> Optional[Tensor]:
     """Pad a cu_seqlens tensor to exactly ``target_entries`` entries.
 
