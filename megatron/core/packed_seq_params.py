@@ -131,6 +131,39 @@ def _round_up_to_alignment(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def get_thd_padding_kwargs(
+    pad_packed_seq_alignment: int,
+    max_seqlen: int,
+    max_seqlen_per_dp_cp_rank: Optional[int],
+    thd_max_num_seqs: Optional[int],
+    cuda_graph_static: bool,
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Resolve ``pad_sequence_for_thd`` kwargs from the training config.
+
+    ``--pad-packed-seq-alignment`` has two eager-training forms:
+
+    - a positive value pads token-like tensors to a multiple of that value;
+    - no value is parsed as ``0`` and pads token-like tensors to
+      ``max_seqlen_per_dp_cp_rank`` when available.
+
+    Padding cu_seqlens to ``thd_max_num_seqs + 1`` is a CUDA Graph static-input
+    requirement. Eager pad-to-max should preserve sequence metadata so kernels
+    continue to see the real packed sequence boundaries.
+    """
+    if cuda_graph_static:
+        assert max_seqlen_per_dp_cp_rank is not None, (
+            "THD CUDA Graph padding requires max_seqlen_per_dp_cp_rank."
+        )
+        return None, int(max_seqlen_per_dp_cp_rank), thd_max_num_seqs
+
+    if pad_packed_seq_alignment == 0:
+        if max_seqlen_per_dp_cp_rank is not None:
+            return None, int(max_seqlen_per_dp_cp_rank), None
+        return int(max_seqlen), None, None
+
+    return int(pad_packed_seq_alignment), None, None
+
+
 def _resolve_thd_padding_lengths(
     tokens: Optional[Tensor],
     labels: Optional[Tensor],

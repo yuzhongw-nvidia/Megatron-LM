@@ -29,6 +29,7 @@ import torch
 
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
+    get_thd_padding_kwargs,
     pad_sequence_for_thd,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -95,6 +96,36 @@ def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
 # =============================================================================
 
 
+@pytest.mark.internal
+def test_eager_pad_to_max_resolves_without_static_cu_padding():
+    alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+        pad_packed_seq_alignment=0,
+        max_seqlen=80,
+        max_seqlen_per_dp_cp_rank=8192,
+        thd_max_num_seqs=32,
+        cuda_graph_static=False,
+    )
+
+    assert alignment is None
+    assert target_len == 8192
+    assert max_num_seqs is None
+
+
+@pytest.mark.internal
+def test_cuda_graph_pad_to_max_resolves_static_cu_padding():
+    alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+        pad_packed_seq_alignment=0,
+        max_seqlen=80,
+        max_seqlen_per_dp_cp_rank=8192,
+        thd_max_num_seqs=32,
+        cuda_graph_static=True,
+    )
+
+    assert alignment is None
+    assert target_len == 8192
+    assert max_num_seqs == 32
+
+
 class TestPadSequenceForThd:
 
     def setup_method(self):
@@ -143,9 +174,47 @@ class TestPadSequenceForThd:
             p_params.cu_seqlens_kv_padded,
         ):
             assert cu.shape[0] == max_num_seqs + 1
+        assert p_params.max_seqlen_q == max_seqlen
+        assert p_params.max_seqlen_kv == max_seqlen
         assert p_mask.shape == (1, max_seqlen) and p_mask.dtype == torch.bool
         assert torch.equal(p_tok[0, :total_T], tokens[0])
         assert (p_tok[0, total_T:] == 0).all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_eager_pad_to_max_preserves_packed_metadata(self):
+        """Eager pad-to-max pads token tensors but keeps real THD metadata."""
+        seqlens, total_T, target_len = [50, 30], 80, 8192
+        psp = _make_psp(seqlens)
+        orig_cu = psp.cu_seqlens_q.clone()
+        alignment, pad_target_len, max_num_seqs = get_thd_padding_kwargs(
+            pad_packed_seq_alignment=0,
+            max_seqlen=max(seqlens),
+            max_seqlen_per_dp_cp_rank=target_len,
+            thd_max_num_seqs=32,
+            cuda_graph_static=False,
+        )
+
+        p_tok, _, _, _, p_params, p_mask = pad_sequence_for_thd(
+            torch.ones(1, total_T, device="cuda"),
+            None,
+            None,
+            None,
+            psp,
+            alignment=alignment,
+            target_len=pad_target_len,
+            max_num_seqs=max_num_seqs,
+        )
+
+        assert p_tok.shape == (1, target_len)
+        assert torch.equal(p_params.cu_seqlens_q, orig_cu)
+        assert p_params.cu_seqlens_q.shape == orig_cu.shape
+        assert p_params.max_seqlen_q == max(seqlens)
+        assert p_params.max_seqlen_kv == max(seqlens)
+        assert p_params.total_tokens == target_len
+        assert p_mask.shape == (1, target_len)
+        assert not p_mask[0, :total_T].any()
+        assert p_mask[0, total_T:].all()
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
