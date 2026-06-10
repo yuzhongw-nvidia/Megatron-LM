@@ -1123,6 +1123,54 @@ class Attention(MegatronModule, ABC):
             not inference_context.is_static_batching()
             and inference_context.use_flashinfer_fused_rope
         )
+        padding_start = None
+        padded_seq_len = None
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+
+            def _trim_trailing_cu_repeats(cu_seqlens: Optional[Tensor]) -> Optional[Tensor]:
+                if cu_seqlens is None:
+                    return None
+                keep_end = cu_seqlens.numel()
+                while (
+                    keep_end > 1
+                    and cu_seqlens[keep_end - 1].item() == cu_seqlens[keep_end - 2].item()
+                ):
+                    keep_end -= 1
+                if keep_end == cu_seqlens.numel():
+                    return cu_seqlens
+                return cu_seqlens[:keep_end].contiguous()
+
+            padded_seq_len = hidden_states.shape[0]
+            cu_seqlens_q = (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None
+                else packed_seq_params.cu_seqlens_q
+            )
+            if cu_seqlens_q is not None:
+                trimmed_cu_seqlens_q = _trim_trailing_cu_repeats(cu_seqlens_q)
+                actual_seq_len = int(trimmed_cu_seqlens_q[-1].item())
+                if actual_seq_len > padded_seq_len:
+                    raise ValueError(
+                        f"Attention THD cu_seqlens[-1] ({actual_seq_len}) exceeds "
+                        f"hidden_states sequence length ({padded_seq_len})."
+                    )
+                if actual_seq_len < padded_seq_len:
+                    padding_start = actual_seq_len
+                    hidden_states = hidden_states[:padding_start]
+                if padding_start is not None or trimmed_cu_seqlens_q is not cu_seqlens_q:
+                    packed_seq_params = PackedSeqParams(
+                        qkv_format=packed_seq_params.qkv_format,
+                        cu_seqlens_q=_trim_trailing_cu_repeats(packed_seq_params.cu_seqlens_q),
+                        cu_seqlens_kv=_trim_trailing_cu_repeats(packed_seq_params.cu_seqlens_kv),
+                        cu_seqlens_q_padded=trimmed_cu_seqlens_q,
+                        cu_seqlens_kv_padded=_trim_trailing_cu_repeats(
+                            packed_seq_params.cu_seqlens_kv_padded
+                        ),
+                        max_seqlen_q=packed_seq_params.max_seqlen_q,
+                        max_seqlen_kv=packed_seq_params.max_seqlen_kv,
+                        local_cp_size=packed_seq_params.local_cp_size,
+                        cp_group=packed_seq_params.cp_group,
+                    )
         if is_using_flash_decode or is_using_flashinfer_rope:
             # flash decode and flash-infer fused rope use rotary_pos_cos and rotary_pos_sin
             rotary_pos_emb = None
@@ -1422,6 +1470,16 @@ class Attention(MegatronModule, ABC):
         with attn_proj_manager as core_attn_out:
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
+        if padding_start is not None and output.shape[0] < padded_seq_len:
+            output = torch.cat(
+                (
+                    output,
+                    output.new_zeros(
+                        (padded_seq_len - output.shape[0], output.shape[1], output.shape[2])
+                    ),
+                ),
+                dim=0,
+            )
         nvtx_range_pop(suffix="linear_proj")
 
         self.pg_collection.cp = _orig_cp_group
