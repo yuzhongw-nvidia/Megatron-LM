@@ -168,7 +168,8 @@ def loss_func(
     else:
         losses = output_tensor.view(-1).float()
         loss_mask = loss_mask.view(-1).float()
-        loss = torch.sum(losses * loss_mask)
+        masked_losses = torch.where(loss_mask > 0, losses * loss_mask, torch.zeros_like(losses))
+        loss = torch.sum(masked_losses)
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}

@@ -17,7 +17,13 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     RotaryEmbedding,
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    resolve_cp_group,
+    scatter_loss_masked_tokens,
+    select_loss_masked_tokens,
+    zero_padded_hidden_states,
+)
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -697,6 +703,8 @@ class GPTModel(LanguageModule):
                 )
         sequence_parallel_override = False
 
+        hidden_states = zero_padded_hidden_states(hidden_states, loss_mask)
+
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
@@ -750,6 +758,29 @@ class GPTModel(LanguageModule):
         if labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
+
+        selected_loss_tokens = None
+        if self.config.pad_packed_seq_alignment is not None:
+            selected_loss_tokens = select_loss_masked_tokens(hidden_states, labels, loss_mask)
+        if selected_loss_tokens is not None:
+            selected_hidden_states, selected_labels, valid_mask = selected_loss_tokens
+            if selected_hidden_states.shape[0] == 0:
+                return hidden_states.new_zeros(labels.shape, dtype=torch.float32)
+            output_layer_kwargs = dict(
+                input_=selected_hidden_states,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+            )
+            if self.fuse_linear_cross_entropy:
+                selected_loss = self.output_layer(
+                    output_cross_entropy_loss=self.fuse_linear_cross_entropy,
+                    labels=selected_labels,
+                    **output_layer_kwargs,
+                )
+            else:
+                logits, _ = self.output_layer(**output_layer_kwargs)
+                selected_loss = self.compute_language_model_loss(selected_labels, logits)
+            return scatter_loss_masked_tokens(selected_loss, valid_mask, labels.shape)
 
         output_layer_kwargs = dict(
             input_=hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
