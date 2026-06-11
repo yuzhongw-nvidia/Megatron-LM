@@ -591,6 +591,7 @@ class GPTModel(LanguageModule):
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
             mhc_multistream=mhc_multistream,
+            padding_mask=padding_mask,
         )
 
     def _postprocess(
@@ -613,6 +614,7 @@ class GPTModel(LanguageModule):
         extra_block_kwargs=None,
         inference_context=None,
         mhc_multistream=None,
+        padding_mask=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -650,6 +652,7 @@ class GPTModel(LanguageModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=self.embedding,
+                padding_mask=padding_mask,
                 **(extra_block_kwargs or {}),
             )
 

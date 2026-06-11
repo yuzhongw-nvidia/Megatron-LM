@@ -1099,6 +1099,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
@@ -1133,6 +1134,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         rotary_pos_emb=rotary_pos_emb,
                         inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
+                        padding_mask=padding_mask,
                     )
                 else:
                     # GPT path: single TransformerLayer
@@ -1148,6 +1150,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         inference_params=inference_params,
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
+                        padding_mask=padding_mask,
                     )
 
         if not self.mhc_enabled:
@@ -1238,6 +1241,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: Optional[InferenceParams] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
     ):
         """Forward through ``_proj_and_transformer_layer`` with activation
         recomputation.
@@ -1270,6 +1274,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_cos,
             rotary_pos_sin,
             sequence_len_offset,
+            padding_mask,
         ):
             return self._proj_and_transformer_layer(
                 hidden_states=hidden_states,
@@ -1284,6 +1289,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
             )
 
         # Decide the outer quantization context, matching
@@ -1327,6 +1333,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     rotary_pos_cos,
                     rotary_pos_sin,
                     sequence_len_offset,
+                    padding_mask,
                 )
             else:
                 # tensor_parallel.checkpoint stashes args via autograd's
@@ -1346,6 +1353,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     rotary_pos_cos,
                     rotary_pos_sin,
                     sequence_len_offset,
+                    padding_mask,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -1375,6 +1383,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
             )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -1397,6 +1406,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
+        padding_mask: Optional[Tensor] = None,
     ):
         """
         Execute the forward pass through the Multi-Token Prediction (MTP) layer.
@@ -1415,6 +1425,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_sin (Tensor, optional): Sine component of rotary positional embeddings.
             sequence_len_offset (Tensor, optional): Offset for sequence length, if applicable.
             embedding (Callable): The embedding module from gpt model to compute the decoder input.
+            padding_mask (Tensor, optional): Padding mask for MoE routing.
 
         Returns:
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
@@ -1445,6 +1456,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
             )
         else:
             hidden_states = self._proj_and_transformer_layer(
@@ -1460,6 +1472,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 inference_params=inference_params,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
             )
 
         self.cp_group = _orig_cp_group
@@ -1722,6 +1735,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
         mhc_multistream: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Perform the forward pass through all of the MTP modules.
@@ -1734,6 +1748,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 multi-stream decoder output [s, b, n*h] used as input to MTP depths.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
+            padding_mask (Tensor, optional): Padding mask for MoE routing.
 
         Returns:
             (Tensor): The mtp loss tensor of shape [b, s].
@@ -1766,6 +1781,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
+                padding_mask=padding_mask,
                 **(extra_block_kwargs or {}),
             )
 
