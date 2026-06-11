@@ -1436,6 +1436,12 @@ class TransformerConfig(ModelParallelConfig):
             ), f"linear_attention_freq must be set for linear attention."
 
             if self.experimental_attention_variant == "gated_delta_net":
+                if self.pad_packed_seq_alignment is not None:
+                    assert self.pad_packed_seq_by_appending_dummy_seq, (
+                        "gated_delta_net with pad_packed_seq_alignment requires "
+                        "pad_packed_seq_by_appending_dummy_seq."
+                    )
+
                 # Check required parameters
                 assert (
                     self.linear_conv_kernel_dim is not None
@@ -2994,10 +3000,10 @@ class TransformerConfig(ModelParallelConfig):
                 "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
             )
             assert (
-                self.pad_packed_seq_alignment == 0
+                self.pad_packed_seq_alignment == "max"
                 or self.pad_packed_seq_alignment == self.max_seqlen_per_dp_cp_rank
             ), (
-                "THD CUDA Graph requires --pad-packed-seq-alignment without a value "
+                "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
                 "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
             )
