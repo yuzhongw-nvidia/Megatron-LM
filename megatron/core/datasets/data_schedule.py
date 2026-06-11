@@ -19,7 +19,11 @@ from megatron.core.datasets.data_schedule_utils import (
     next_hdp_group,
     reroute_samples_to_dcp_ranks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams, pad_sequence_for_thd
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+)
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
@@ -688,6 +692,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=cp_group,
+        pad_between_seqs=False,
     )
 
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
@@ -697,18 +702,13 @@ def get_batch_on_this_rank_for_sequence_packing(
         getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
     )
     if pad_alignment is not None and packed_seq_params is not None:
-        cuda_graph_static = getattr(config, 'cuda_graph_impl', 'none') != 'none'
-        static_target = (
-            pad_alignment == 0 and getattr(config, 'max_seqlen_per_dp_cp_rank', None) is not None
+        alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+            pad_alignment,
+            max_seqlen,
+            getattr(config, 'max_seqlen_per_dp_cp_rank', None),
+            getattr(config, 'thd_max_num_seqs', None),
+            getattr(config, 'cuda_graph_impl', 'none') != 'none',
         )
-        if cuda_graph_static or static_target:
-            target_len = config.max_seqlen_per_dp_cp_rank
-            max_num_seqs = config.thd_max_num_seqs
-            alignment = None
-        else:
-            target_len = None
-            max_num_seqs = None
-            alignment = max_seqlen if pad_alignment == 0 else pad_alignment
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
             pad_sequence_for_thd(
                 tokens,
@@ -719,6 +719,9 @@ def get_batch_on_this_rank_for_sequence_packing(
                 alignment=alignment,
                 target_len=target_len,
                 max_num_seqs=max_num_seqs,
+                pad_by_appending_dummy_seq=getattr(
+                    config, 'pad_packed_seq_by_appending_dummy_seq', True
+                ),
             )
         )
 
