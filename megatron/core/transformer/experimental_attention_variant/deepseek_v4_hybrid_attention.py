@@ -337,7 +337,11 @@ class DSv4HybridAttention(Attention):
             # cached cos/sin so the fused kernel matches the unfused
             # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+                rope_seqlen,
+                dtype=hidden_states.dtype,
+                packed_seq=packed_seq,
+                mscale=mscale,
+                cp_partition_layout=self.config.cp_partition_layout,
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -345,9 +349,17 @@ class DSv4HybridAttention(Attention):
                 fused_mla_rope_inplace is not None
             ), "Fused MLA RoPE apply is not imported successfully"
         elif self._dsv4_uses_yarn_rope:
-            rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+            rotary_pos_emb, _ = self.rotary_pos_emb(
+                rope_seqlen,
+                packed_seq=packed_seq,
+                cp_partition_layout=self.config.cp_partition_layout,
+            )
         else:
-            rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rope_seqlen,
+                packed_seq=packed_seq,
+                cp_partition_layout=self.config.cp_partition_layout,
+            )
         if self.config.apply_rope_fusion:
             core_attn_out = fused_mla_rope_inplace(
                 core_attn_out,
@@ -542,7 +554,11 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # cached cos/sin so the fused kernel matches the unfused
             # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+                rotary_seq_len,
+                dtype=hidden_states.dtype,
+                packed_seq=packed_seq,
+                mscale=mscale,
+                cp_partition_layout=self.config.cp_partition_layout,
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -550,9 +566,17 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 fused_mla_rope_inplace is not None
             ), "Fused MLA RoPE apply is not imported successfully"
         elif self._dsv4_uses_yarn_rope:
-            rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb, _ = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq,
+                cp_partition_layout=self.config.cp_partition_layout,
+            )
         else:
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq,
+                cp_partition_layout=self.config.cp_partition_layout,
+            )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:

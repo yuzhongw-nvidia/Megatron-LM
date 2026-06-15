@@ -340,7 +340,9 @@ class BertModel(LanguageModule):
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.encoder, encoder_input, self.config
             )
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len, cp_partition_layout=self.config.cp_partition_layout
+            )
 
         # Run encoder.
         hidden_states = self.encoder(

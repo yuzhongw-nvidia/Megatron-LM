@@ -450,7 +450,10 @@ def get_batch(data_iterator):
 
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(
-        batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+        batch,
+        is_hybrid_cp=False,
+        cp_group=get_context_parallel_group(),
+        cp_partition_layout=args.cp_partition_layout,
     )
 
     return batch
