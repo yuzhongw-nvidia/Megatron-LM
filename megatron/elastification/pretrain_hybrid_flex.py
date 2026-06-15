@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import mpu, parallel_state
+from megatron.core.context_parallel_layout import get_thd_cp_rank_partition_indices
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
@@ -63,18 +64,6 @@ except ImportError:
     has_nvidia_modelopt = False
 print_rank_0("has_nvidia_modelopt is {}".format(has_nvidia_modelopt))
 import numpy as np
-
-try:
-    # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
-
-    # Alias the PyTorch wrapper so we can call tex.* APIs
-    import transformer_engine_torch as tex
-except ImportError:
-    # TE isn’t installed or the torch wrapper is missing
-    tex = None
-
-from megatron.core.utils import is_te_min_version
 
 _global_choice_counter = 0
 _logged_params_norm = False
@@ -210,13 +199,13 @@ def get_batch(data_iterator):
 
         cp_size = get_context_parallel_world_size()
         if cp_size > 1:  # slice batch along sequence dimension for context parallelism
-            assert tex is not None and is_te_min_version("1.10.0"), (
-                "Please update Transformer Engine to >= 1.10 to use "
-                "Context Parallel with THD format data"
-            )
             cp_rank = get_context_parallel_rank()
-            index = tex.thd_get_partitioned_indices(
-                cu_seqlens, batch['tokens'].size(1), cp_size, cp_rank
+            index = get_thd_cp_rank_partition_indices(
+                cu_seqlens,
+                batch['tokens'].size(1),
+                cp_size,
+                cp_rank,
+                get_args().cp_partition_layout,
             )
             for key, data in batch.items():
                 if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:

@@ -234,6 +234,7 @@ def forward_step(data_iterator, model: HybridModel):
         model (HybridModel): The Hybrid Model
     """
     timers = get_timers()
+    args = get_args()
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
@@ -275,6 +276,7 @@ def forward_step(data_iterator, model: HybridModel):
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
             total_tokens=int(cu_seqlens_for_params[-1].item()),
+            cp_partition_layout=args.cp_partition_layout,
         )
 
     timers('batch-generator').stop()

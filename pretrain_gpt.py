@@ -110,9 +110,8 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             Mamba returns an ``empty_batch`` dict with ``cu_seqlens`` and
             ``max_seqlen`` set.
           - CP with packed sequences: GPT delegates to
-            ``get_thd_batch_on_this_cp_rank`` (MCore utility); Mamba
-            implements the ``tex.thd_get_partitioned_indices`` CP slicing
-            inline and does not call that helper.
+            ``get_thd_batch_on_this_cp_rank`` (MCore utility), which applies
+            the configured ``cp_partition_layout`` to THD token indexing.
           - MTP: GPT passes ``mtp_on_this_rank`` to ``get_batch_on_this_tp_rank``
             and uses it to gate the early-return; Mamba has no MTP support.
           - ``max_seqlen`` conversion: Mamba converts to a Python int scalar
@@ -175,6 +174,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 max_seqlen_q=int(max_seqlen[0].item()),
                 max_seqlen_kv=int(max_seqlen[0].item()),
                 qkv_format='thd',
+                cp_partition_layout=args.cp_partition_layout,
             ),
         )
 
@@ -186,7 +186,11 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         packed_seq_params = None
     else:  # Packed THD format
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
-            batch, cu_seqlens, cu_seqlens_padded, max_seqlen
+            batch,
+            cu_seqlens,
+            cu_seqlens_padded,
+            max_seqlen,
+            cp_partition_layout=args.cp_partition_layout,
         )
 
     return (*batch.values(), packed_seq_params)

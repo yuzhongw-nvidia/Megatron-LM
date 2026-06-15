@@ -14,6 +14,7 @@ import torch  # type: ignore[import-not-found]
 from torch.distributed import ProcessGroup  # type: ignore[import-not-found]
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import get_thd_cp_rank_partition_indices
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
@@ -21,16 +22,7 @@ from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_pg_rank,
     get_pg_size,
-    is_te_min_version,
 )
-
-try:
-    import transformer_engine_torch as tex  # type: ignore
-
-    _HAVE_TEX = True
-except ModuleNotFoundError:  # pragma: no cover
-    tex = None  # type: ignore
-    _HAVE_TEX = False
 
 
 @dataclass(frozen=True)
@@ -47,6 +39,7 @@ class PartitionConfig:
     tp_comm_overlap: bool
     max_seq_len: int
     kv_format: str = "sbhd"  # "sbhd" | "thd"
+    cp_partition_layout: str = "zigzag"
     cp_group: Optional[ProcessGroup] = None
     tp_group: Optional[ProcessGroup] = None
 
@@ -83,6 +76,7 @@ class PartitionConfig:
             tp_comm_overlap=mp.tp_comm_overlap,
             max_seq_len=max_seq_len,
             kv_format=kv_format,
+            cp_partition_layout=getattr(mp, "cp_partition_layout", "zigzag"),
             cp_group=cp_group,
             tp_group=tp_group,
         )
@@ -235,18 +229,23 @@ class PartitionAdapter:
             batch["attention_mask"] = attention_mask
 
         if packed_seq_params is None or getattr(packed_seq_params, 'qkv_format', 'sbhd') == 'sbhd':
-            batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=self.cfg.cp_group)
-        else:
-            assert _HAVE_TEX and is_te_min_version("1.10.0"), (
-                "Please update Transformer Engine to >= 1.10 "
-                "to use Context Parallel with THD format data"
+            batch = get_batch_on_this_cp_rank(
+                batch,
+                is_hybrid_cp=False,
+                cp_group=self.cfg.cp_group,
+                cp_partition_layout=self.cfg.cp_partition_layout,
             )
+        else:
             assert self.cfg.cp_group is not None
             cp_size = get_pg_size(self.cfg.cp_group)
             cp_rank = get_pg_rank(self.cfg.cp_group)
             for key, data in batch.items():
-                index = tex.thd_get_partitioned_indices(
-                    packed_seq_params.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank
+                index = get_thd_cp_rank_partition_indices(
+                    packed_seq_params.cu_seqlens_q_padded,
+                    data.size(1),
+                    cp_size,
+                    cp_rank,
+                    self.cfg.cp_partition_layout,
                 )
                 batch[key] = data.index_select(1, index)
 

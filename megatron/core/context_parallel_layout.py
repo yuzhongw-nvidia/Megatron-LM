@@ -38,6 +38,71 @@ def get_cp_rank_partition_indices(
     return torch.tensor(indices, dtype=torch.int64, device=device)
 
 
+def get_thd_cp_rank_partition_indices(
+    cu_seqlens: torch.Tensor,
+    total_tokens: int,
+    cp_size: int,
+    cp_rank: int,
+    cp_partition_layout: str,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Return packed-THD token indices owned by one CP rank.
+
+    ``cu_seqlens`` describes the padded packed sequence spans in the global
+    packed token buffer. Each span is split into ``2 * cp_size`` chunks, then
+    the same layout rule as SBHD is applied per packed sequence:
+
+    * ``zigzag``: rank ``r`` owns chunks ``[r, 2 * cp_size - r - 1]``.
+    * ``contiguous``: rank ``r`` owns chunks ``[2 * r, 2 * r + 1]``.
+
+    The returned indices can be used directly with ``index_select`` along the
+    packed token dimension.
+    """
+    cp_partition_layout = validate_cp_partition_layout(cp_partition_layout)
+    if device is None:
+        device = cu_seqlens.device
+    total_tokens = int(total_tokens)
+
+    if cp_size == 1:
+        return torch.arange(total_tokens, dtype=torch.int64, device=device)
+
+    if cu_seqlens.dim() == 2:
+        assert cu_seqlens.shape[0] == 1, (
+            f"THD cu_seqlens with a batch dimension must have shape [1, n], "
+            f"got {tuple(cu_seqlens.shape)}."
+        )
+        cu_seqlens = cu_seqlens[0]
+    assert cu_seqlens.dim() == 1, f"THD cu_seqlens must be 1-D, got {cu_seqlens.dim()}-D."
+    assert int(cu_seqlens[-1].item()) == total_tokens, (
+        f"THD total_tokens ({total_tokens}) must match cu_seqlens[-1] "
+        f"({int(cu_seqlens[-1].item())})."
+    )
+
+    chunk_indices = get_cp_rank_partition_indices(
+        cp_size, cp_rank, cp_partition_layout, device=cu_seqlens.device
+    ).tolist()
+    cu_seqlens_list = cu_seqlens.tolist()
+    index_parts: List[torch.Tensor] = []
+    for start, end in zip(cu_seqlens_list[:-1], cu_seqlens_list[1:]):
+        seq_len = int(end - start)
+        assert seq_len % (2 * cp_size) == 0, (
+            f"THD packed sequence length ({seq_len}) must be divisible by "
+            f"2 * cp_size ({2 * cp_size}) for {cp_partition_layout!r} CP layout."
+        )
+        chunk_len = seq_len // (2 * cp_size)
+        for chunk_idx in chunk_indices:
+            chunk_start = int(start) + int(chunk_idx) * chunk_len
+            index_parts.append(
+                torch.arange(
+                    chunk_start, chunk_start + chunk_len, dtype=torch.int64, device=device
+                )
+            )
+
+    if not index_parts:
+        return torch.empty(0, dtype=torch.int64, device=device)
+    return torch.cat(index_parts, dim=0)
+
+
 def zigzag_to_contiguous_chunks(
     x: torch.Tensor, cp_group: torch.distributed.ProcessGroup, seq_dim: int = 0
 ) -> torch.Tensor:

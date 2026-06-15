@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.context_parallel_layout import get_thd_cp_rank_partition_indices
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
@@ -877,15 +878,12 @@ class LLaVAModel(MegatronModule):
                     cp_partition_layout=self.config.cp_partition_layout,
                 )
             else:
-                assert HAVE_TEX and is_te_min_version(
-                    "1.10.0"
-                ), "Please update Transformer Engine to >= 1.10 to use \
-                    Context Parallel with THD format data"
-                index = tex.thd_get_partitioned_indices(
+                index = get_thd_cp_rank_partition_indices(
                     packed_seq_params.cu_seqlens_q_padded,
                     batch[next(iter(batch))].size(1),
                     self.cp_group.size(),
                     self.cp_group.rank(),
+                    self.config.cp_partition_layout,
                 )
                 for key, data in batch.items():
                     batch[key] = data.index_select(1, index)

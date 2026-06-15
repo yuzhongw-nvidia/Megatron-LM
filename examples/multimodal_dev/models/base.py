@@ -18,6 +18,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.context_parallel_layout import get_thd_cp_rank_partition_indices
 from megatron.core.models.gpt import GPTModel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -68,15 +69,13 @@ _NO_CP_GROUP = _NoCPGroup()
 # Gradients are correct; only the *logged* value drifts.
 
 
-def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
-    """Per-rank token index for THD + CP via TE's
-    ``thd_get_partitioned_indices``.  Cast to int64 so the result can be
-    used directly with ``index_select`` regardless of TE's return dtype.
-    """
-    from transformer_engine.pytorch import cpp_extensions as tex
-
-    idx = tex.thd_get_partitioned_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank)
-    return idx.long()
+def _thd_cp_partition_index(
+    cu_seqlens_padded, total_tokens, cp_size, cp_rank, cp_partition_layout="zigzag"
+):
+    """Per-rank token index for THD + CP using the configured CP layout."""
+    return get_thd_cp_rank_partition_indices(
+        cu_seqlens_padded, total_tokens, cp_size, cp_rank, cp_partition_layout
+    )
 
 
 class MultimodalModel(MegatronModule):
@@ -206,13 +205,13 @@ class MultimodalModel(MegatronModule):
     ):
         """Apply CP split to model-forward inputs.
 
-        BSHD path zigzag-splits each tensor along its seq dim.  THD path
-        partitions per-sample via ``tex.thd_get_partitioned_indices`` so
-        chunks line up with ``cu_seqlens_q_padded`` boundaries.
+        BSHD path splits each tensor along its seq dim according to the
+        configured CP layout. THD path partitions per-sample with the same
+        layout semantics so chunks line up with ``cu_seqlens_q_padded``
+        boundaries.
         ``position_ids`` and ``attention_mask`` are NOT split in THD —
-        MRoPE returns full freqs and TE attention's
-        ``_apply_rotary_pos_emb_thd`` does the per-sample CP zigzag
-        itself via ``_get_thd_freqs_on_this_cp_rank``.
+        MRoPE returns full freqs and TE attention applies RoPE from THD
+        metadata.
         """
         cp_size = parallel_state.get_context_parallel_world_size()
         if cp_size <= 1:
@@ -223,11 +222,16 @@ class MultimodalModel(MegatronModule):
         cp_rank = parallel_state.get_context_parallel_rank()
 
         if packed_seq_params is not None:
+            packed_seq_params.cp_partition_layout = self.config.cp_partition_layout
             total_tokens = (
                 decoder_input.shape[0] if decoder_input is not None else input_ids.shape[1]
             )
             idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded, total_tokens, cp_size, cp_rank
+                packed_seq_params.cu_seqlens_q_padded,
+                total_tokens,
+                cp_size,
+                cp_rank,
+                self.config.cp_partition_layout,
             )
             if decoder_input is not None:
                 decoder_input = decoder_input.index_select(0, idx)
@@ -275,7 +279,11 @@ class MultimodalModel(MegatronModule):
         cp_rank = parallel_state.get_context_parallel_rank()
         if packed_seq_params is not None:
             idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded, loss_mask.shape[1], cp_size, cp_rank
+                packed_seq_params.cu_seqlens_q_padded,
+                loss_mask.shape[1],
+                cp_size,
+                cp_rank,
+                getattr(packed_seq_params, "cp_partition_layout", "zigzag"),
             )
             return loss_mask.index_select(1, idx)
         return _cp_split_tensor(loss_mask, seq_dim=1, cp_size=cp_size, cp_rank=cp_rank)
