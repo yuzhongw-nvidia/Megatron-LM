@@ -17,7 +17,11 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+from megatron.core.ssm.gated_delta_net import (
+    GatedDeltaNet,
+    tensor_a2a_cp2hp,
+    tensor_a2a_hp2cp,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import unwrap_model
@@ -43,6 +47,72 @@ try:
     HAVE_FLA = True
 except ImportError:
     HAVE_FLA = False
+
+
+@pytest.mark.parametrize("linear_cp_comm_type", ["all_gather", "a2a"])
+def test_gated_delta_net_cp_rejects_zigzag_layout(linear_cp_comm_type):
+    with pytest.raises(AssertionError, match="cp_partition_layout='contiguous'"):
+        TransformerConfig(
+            hidden_size=128,
+            num_layers=1,
+            num_attention_heads=8,
+            context_parallel_size=2,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1],
+            linear_cp_comm_type=linear_cp_comm_type,
+            cp_partition_layout="zigzag",
+        )
+
+
+class _FakeCPGroup:
+    def size(self):
+        return 2
+
+
+def test_gated_delta_net_a2a_helpers_can_skip_attention_load_balancing():
+    tensor = torch.arange(8, dtype=torch.float32).reshape(2, 1, 4)
+    cp_group = _FakeCPGroup()
+
+    with (
+        mock.patch(
+            "megatron.core.ssm.gated_delta_net._all_to_all_cp2hp",
+            side_effect=lambda x, _: x,
+        ),
+        mock.patch(
+            "megatron.core.ssm.gated_delta_net._undo_attention_load_balancing",
+            side_effect=AssertionError("unexpected undo attention load balancing"),
+        ),
+    ):
+        output = tensor_a2a_cp2hp(
+            tensor,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=cp_group,
+            split_sections=[2, 2],
+            undo_attention_load_balancing=False,
+        )
+
+    assert torch.equal(output, tensor)
+
+    with (
+        mock.patch(
+            "megatron.core.ssm.gated_delta_net._all_to_all_hp2cp",
+            side_effect=lambda x, _: x,
+        ),
+        mock.patch(
+            "megatron.core.ssm.gated_delta_net._redo_attention_load_balancing",
+            side_effect=AssertionError("unexpected redo attention load balancing"),
+        ),
+    ):
+        output = tensor_a2a_hp2cp(
+            tensor,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=cp_group,
+            redo_attention_load_balancing=False,
+        )
+
+    assert torch.equal(output, tensor)
 
 
 @pytest.mark.parametrize(
@@ -117,6 +187,7 @@ class TestGatedDeltaNet:
             experimental_attention_variant="gated_delta_net",
             linear_attention_freq=[1],
             linear_cp_comm_type=self.cp_comm_type,
+            cp_partition_layout="contiguous",
             transformer_impl="transformer_engine",
         )
         gdn_submodules = get_experimental_attention_variant_module_spec(
@@ -467,9 +538,12 @@ def test_parallel_gated_delta_net_correctness(
         num_attention_heads=8,
         activation_func=F.silu,
         bf16=True,
+        tensor_model_parallel_size=tp,
+        context_parallel_size=cp,
         experimental_attention_variant="gated_delta_net",
         linear_attention_freq=[1],
         linear_cp_comm_type=cp_comm_type,
+        cp_partition_layout="contiguous",
         transformer_impl="transformer_engine",
     )
 

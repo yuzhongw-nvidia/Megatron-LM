@@ -1487,6 +1487,10 @@ class TransformerConfig(ModelParallelConfig):
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
             if self.context_parallel_size > 1:
+                assert self.cp_partition_layout == "contiguous", (
+                    "GatedDeltaNet with context_parallel_size > 1 requires "
+                    "cp_partition_layout='contiguous'. GDN does not support zigzag CP layout."
+                )
                 assert self.linear_cp_comm_type in ("a2a", "all_gather"), (
                     f"linear_cp_comm_type must be one of 'a2a' or 'all_gather', "
                     f"got {self.linear_cp_comm_type!r}."
