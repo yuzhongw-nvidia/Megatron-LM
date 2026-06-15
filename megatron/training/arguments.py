@@ -2591,6 +2591,7 @@ def _add_network_size_args(parser):
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
+        "cp_partition_layout",
         "cuda_graph_modules",
         "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
         # no CLI argument exists for these
@@ -4052,6 +4053,16 @@ def _add_distributed_args(parser):
         'all layers will share the same communication type. Users can also '
         'specify separated types for each layer like '
         '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p',
+    )
+    group.add_argument(
+        '--cp-partition-layout',
+        type=str,
+        default='zigzag',
+        choices=['zigzag', 'contiguous'],
+        help='Sequence partition layout for context parallel SBHD batches. '
+        'zigzag keeps the legacy causal full-attention load-balanced layout. '
+        'contiguous assigns adjacent chunks to each CP rank; P2P full-attention '
+        'layers temporarily swap to zigzag at the layer boundary.',
     )
     group.add_argument(
         '--fake-process-group',

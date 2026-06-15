@@ -180,7 +180,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+        batch = get_batch_on_this_cp_rank(
+            batch, cp_partition_layout=args.cp_partition_layout
+        )  # The implementation of this function is in MCore
         packed_seq_params = None
     else:  # Packed THD format
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(

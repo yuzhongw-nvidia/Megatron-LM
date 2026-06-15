@@ -985,6 +985,16 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
+    cp_partition_layout: str = "zigzag"
+    """Sequence partition layout used when slicing SBHD batches across CP ranks.
+    Can be "zigzag" or "contiguous":
+    "zigzag": Legacy load-balanced layout for causal full attention with P2P CP. Rank r owns
+    sequence chunks [r, 2 * cp_size - r - 1].
+    "contiguous": Rank r owns sequence chunks [2 * r, 2 * r + 1]. Hybrid models can use this
+    to keep linear-attention layers in contiguous time layout and only swap layout around
+    full-attention P2P layers.
+    """
+
     linear_cp_comm_type: Optional[str] = "all_gather"
     """Inter-gpu communication type for context parallelism in linear-attention layers
     (e.g. Gated Delta Net). Independent of `cp_comm_type`, which only controls standard attention.
@@ -992,8 +1002,7 @@ class TransformerConfig(ModelParallelConfig):
     "a2a": Scatter heads across the CP group (Ulysses-style); each rank runs the linear-attention
     kernel on the full sequence for a shard of heads. Correct but memory-heavy.
     "all_gather": Keep the sequence sharded across CP ranks and use CP-aware linear kernels
-    (chunk_gated_delta_rule + causal_conv1d with a CP context). Cheaper memory footprint; requires
-    a chunk-level reshuffle when the input is in Megatron's zigzag load-balanced layout.
+    (chunk_gated_delta_rule + causal_conv1d with a CP context). Cheaper memory footprint.
     """
 
     ##################
@@ -2897,6 +2906,11 @@ class TransformerConfig(ModelParallelConfig):
                 'ep_overlap_early_attn_memory_release'
             )
 
+        if self.context_parallel_size > 1:
+            assert self.cp_partition_layout in ("zigzag", "contiguous"), (
+                f"cp_partition_layout must be one of 'zigzag' or 'contiguous', "
+                f"got {self.cp_partition_layout!r}."
+            )
         if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (

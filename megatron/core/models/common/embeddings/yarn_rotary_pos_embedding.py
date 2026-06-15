@@ -164,6 +164,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         offset: int = 0,
         packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        cp_partition_layout: str = "zigzag",
     ) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
@@ -173,6 +174,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             packed_seq (bool, optional): Whether to use packed sequence. Defaults to False.
             cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
                 Defaults to None.
+            cp_partition_layout (str): CP sequence layout. Defaults to ``zigzag``.
 
         Returns:
             Tensor: Embeddings after applying Yarn RoPE.
@@ -183,19 +185,33 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group, cp_partition_layout)
         return emb, _mscale
 
     def _set_cos_sin_cache(
-        self, seq_len, offset, dtype, packed_seq=False, cp_group=None, mscale=None
+        self,
+        seq_len,
+        offset,
+        dtype,
+        packed_seq=False,
+        cp_group=None,
+        mscale=None,
+        cp_partition_layout="zigzag",
     ):
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
         self.packed_seq_cached = packed_seq
         self.mscale_cached = mscale
+        self.cp_partition_layout_cached = cp_partition_layout
 
-        emb, _mscale = self.forward(seq_len, offset, packed_seq=packed_seq, cp_group=cp_group)
+        emb, _mscale = self.forward(
+            seq_len,
+            offset,
+            packed_seq=packed_seq,
+            cp_group=cp_group,
+            cp_partition_layout=cp_partition_layout,
+        )
         if mscale is not None:
             _mscale = mscale
         self.register_buffer(
@@ -213,6 +229,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         packed_seq=False,
         cp_group=None,
         mscale=None,
+        cp_partition_layout="zigzag",
     ):
         """Get cached cos and sin values.
 
@@ -232,8 +249,11 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             or dtype != self.dtype_cached
             or packed_seq != self.packed_seq_cached
             or mscale != getattr(self, "mscale_cached", None)
+            or cp_partition_layout != getattr(self, "cp_partition_layout_cached", "zigzag")
         ):
-            self._set_cos_sin_cache(seq_len, offset, dtype, packed_seq, cp_group, mscale)
+            self._set_cos_sin_cache(
+                seq_len, offset, dtype, packed_seq, cp_group, mscale, cp_partition_layout
+            )
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
 

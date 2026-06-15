@@ -398,6 +398,7 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    cp_partition_layout=self.config.cp_partition_layout,
                 )
         elif self.position_embedding_type == 'yarn' and not self.config.multi_latent_attention:
             if not InferenceMode.is_active() or not self.config.flash_decode:
@@ -409,6 +410,7 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    cp_partition_layout=self.config.cp_partition_layout,
                 )
             else:
                 raise NotImplementedError(
@@ -421,6 +423,7 @@ class GPTModel(LanguageModule):
                     position_ids,
                     self.mrope_section,
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    cp_partition_layout=self.config.cp_partition_layout,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE

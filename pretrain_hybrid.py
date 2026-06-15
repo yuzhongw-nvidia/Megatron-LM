@@ -154,6 +154,7 @@ def get_batch(data_iterator, vp_stage=None):
         is_hybrid_cp=is_dynamic_cp,
         cp_group=get_context_parallel_group(),
         hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
+        cp_partition_layout=args.cp_partition_layout,
     )
 
     # Return values in a fixed order so callers can unpack them even when

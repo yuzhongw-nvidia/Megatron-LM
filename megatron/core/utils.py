@@ -42,6 +42,10 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel_layout import (
+    get_cp_rank_partition_indices,
+    validate_cp_partition_layout,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -2319,16 +2323,17 @@ def get_sft_batch_on_this_cp_rank(
 
 
 def get_pretrain_batch_on_this_cp_rank(
-    batch: dict[str, torch.Tensor], cp_group: torch.distributed.ProcessGroup
+    batch: dict[str, torch.Tensor],
+    cp_group: torch.distributed.ProcessGroup,
+    cp_partition_layout: str = "zigzag",
 ):
-    """Partition a pretraining batch across context-parallel ranks with load-balanced chunking.
+    """Partition a pretraining batch across context-parallel ranks.
 
-    With causal masking, each token only attends to its prior tokens. Simply splitting
-    the sequence into CP chunks can result in severe load imbalance, as chunks at the
-    end of the sequence have bigger workloads than earlier ones. To address this, the
-    sequence is split into ``2 * cp_size`` chunks and assigned in a zigzag pattern:
-    for CP=2 the 4 chunks are assigned as (chunk_0, chunk_3) -> GPU 0 and
-    (chunk_1, chunk_2) -> GPU 1, balancing the workload across the CP group.
+    The sequence is split into ``2 * cp_size`` chunks. In the legacy ``zigzag``
+    layout, rank ``r`` receives chunks ``[r, 2 * cp_size - r - 1]`` to balance
+    causal full-attention work across the CP group. In the ``contiguous`` layout,
+    rank ``r`` receives chunks ``[2 * r, 2 * r + 1]`` so linear-attention layers
+    can consume contiguous time chunks directly.
 
     All tensor-valued entries in the batch are partitioned along their sequence
     dimension (``seq_dim=1`` by default, ``seq_dim=2`` for 'attention_mask').
@@ -2339,12 +2344,15 @@ def get_pretrain_batch_on_this_cp_rank(
             ``[micro_batch_size, seq_length, ...]``.
         cp_group (torch.distributed.ProcessGroup): The context-parallel process
             group.
+        cp_partition_layout (str): CP sequence layout, either ``zigzag`` or
+            ``contiguous``.
 
     Returns:
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
-        sliced to this CP rank's zigzag partition.
+        sliced to this CP rank's partition.
     """
 
+    cp_partition_layout = validate_cp_partition_layout(cp_partition_layout)
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
 
@@ -2369,9 +2377,9 @@ def get_pretrain_batch_on_this_cp_rank(
                 val.shape[seq_dim] // (2 * cp_size),
                 *val.shape[(seq_dim + 1) :],
             )
-            index = torch.zeros(2, dtype=torch.int64, device=val.device)
-            index[0].fill_(cp_rank)
-            index[1].fill_(2 * cp_size - cp_rank - 1)
+            index = get_cp_rank_partition_indices(
+                cp_size, cp_rank, cp_partition_layout, device=val.device
+            )
             val = val.index_select(seq_dim, index)
             val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
             batch[key] = val
@@ -2384,6 +2392,7 @@ def get_batch_on_this_cp_rank(
     is_hybrid_cp: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
+    cp_partition_layout: str = "zigzag",
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
@@ -2396,8 +2405,8 @@ def get_batch_on_this_cp_rank(
         True, creates a local hybrid CP group (via ``hybrid_cp_group_func``)
         and delegates to ``get_pretrain_batch_on_this_cp_rank`` with that group.
       - **Pretraining**: When ``cu_seqlens`` is None, delegates to
-        ``get_pretrain_batch_on_this_cp_rank`` with zigzag load-balanced
-        chunking.
+        ``get_pretrain_batch_on_this_cp_rank`` with the requested CP partition
+        layout.
 
     Args:
         batch (Dict[str, Any]): Input batch tensors. Must contain a
@@ -2408,11 +2417,15 @@ def get_batch_on_this_cp_rank(
         hybrid_cp_group_func (Optional[Callable[[int], torch.distributed.ProcessGroup]]):
             Factory function that returns a hybrid CP process group for a given
             ``group_size``. Required when ``is_hybrid_cp`` is True.
+        cp_partition_layout (str): CP sequence layout for SBHD/pretraining
+            partitioning, either ``zigzag`` or ``contiguous``.
 
     Returns:
         Dict[str, Any]: The batch with sequence-dimension tensors partitioned
         to this CP rank.
     """
+
+    cp_partition_layout = validate_cp_partition_layout(cp_partition_layout)
 
     if cp_group is None:
         # Backward-compatible fallback for callers that pass only ``batch``
@@ -2427,12 +2440,18 @@ def get_batch_on_this_cp_rank(
             ), "local_cp_size is required for hybrid context parallel"
             if batch['local_cp_size'].item() > 1:
                 hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
-                batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=hybrid_cp_group)
+                batch = get_pretrain_batch_on_this_cp_rank(
+                    batch,
+                    cp_group=hybrid_cp_group,
+                    cp_partition_layout=cp_partition_layout,
+                )
                 batch["hybrid_cp_group"] = hybrid_cp_group
         else:
             batch = get_sft_batch_on_this_cp_rank(batch, cp_group=cp_group)
     else:  # NOTE(asolergi-nv): Pretrain case
-        batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=cp_group)
+        batch = get_pretrain_batch_on_this_cp_rank(
+            batch, cp_group=cp_group, cp_partition_layout=cp_partition_layout
+        )
     return batch
 
 

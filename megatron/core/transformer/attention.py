@@ -313,6 +313,7 @@ class Attention(MegatronModule, ABC):
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+        self.cp_comm_type = cp_comm_type
         self.batch_invariant_mode = config.batch_invariant_mode
 
         assert self.config.kv_channels is not None
@@ -1141,7 +1142,14 @@ class Attention(MegatronModule, ABC):
         # Per-layer theta: override the model-level RoPE with this layer's own embedding.
         if self.rotary_pos_emb is not None and rotary_pos_emb is not None:
             seq_len = rotary_pos_emb.shape[0]
-            rotary_pos_emb = self.rotary_pos_emb(seq_len)
+            cp_partition_layout = (
+                "zigzag"
+                if self.cp_comm_type in ("p2p", "a2a+p2p")
+                else self.config.cp_partition_layout
+            )
+            rotary_pos_emb = self.rotary_pos_emb(
+                seq_len, cp_partition_layout=cp_partition_layout
+            )
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 

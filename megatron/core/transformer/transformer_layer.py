@@ -16,6 +16,10 @@ import torch.distributed
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.context_parallel_layout import (
+    contiguous_to_zigzag_chunks,
+    zigzag_to_contiguous_chunks,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
@@ -367,14 +371,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
 
         attention_optional_kwargs = {}
+        self_attention_cp_comm_type = None
         if config.context_parallel_size > 1 and config.cp_comm_type is not None:
             if isinstance(config.cp_comm_type, list):
                 # layer_number is 1-indexed, so we need to subtract 1 to get the correct index
-                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[
-                    self.layer_number - 1
-                ]
+                self_attention_cp_comm_type = config.cp_comm_type[self.layer_number - 1]
             else:
-                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type
+                self_attention_cp_comm_type = config.cp_comm_type
+            attention_optional_kwargs["cp_comm_type"] = self_attention_cp_comm_type
+        self.self_attention_cp_comm_type = self_attention_cp_comm_type
 
         attention_optional_kwargs["pg_collection"] = pg_collection
         if pp_layer_offset is not None:
@@ -589,6 +594,48 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
+    def _needs_contiguous_to_zigzag_attention_layout(
+        self, packed_seq_params: Optional[PackedSeqParams]
+    ):
+        """Whether this full-attention layer needs a temporary P2P CP layout swap."""
+        return (
+            self.config.context_parallel_size > 1
+            and self.config.cp_partition_layout == "contiguous"
+            and packed_seq_params is None
+            and hasattr(self.self_attention, "core_attention")
+            and self.self_attention_cp_comm_type in ("p2p", "a2a+p2p")
+        )
+
+    def _contiguous_to_zigzag_for_attention(
+        self,
+        input_layernorm_output: Tensor,
+        attention_mask: Optional[Tensor],
+        rotary_pos_emb: Optional[Tensor],
+    ):
+        """Convert SBHD tensors to the P2P full-attention layout at a layer boundary."""
+        cp_group = self.pg_collection.cp
+        input_layernorm_output = contiguous_to_zigzag_chunks(
+            input_layernorm_output, cp_group=cp_group, seq_dim=0
+        )
+        if attention_mask is not None:
+            attention_mask_seq_dim = 2 if attention_mask.dim() > 2 else 0
+            attention_mask = contiguous_to_zigzag_chunks(
+                attention_mask, cp_group=cp_group, seq_dim=attention_mask_seq_dim
+            )
+        if rotary_pos_emb is not None:
+            rotary_pos_emb = contiguous_to_zigzag_chunks(
+                rotary_pos_emb, cp_group=cp_group, seq_dim=0
+            )
+        return input_layernorm_output, attention_mask, rotary_pos_emb
+
+    def _zigzag_to_contiguous_from_attention(self, attention_output_with_bias):
+        """Convert full-attention output back to the configured contiguous CP layout."""
+        attention_output, attention_bias = attention_output_with_bias
+        attention_output = zigzag_to_contiguous_chunks(
+            attention_output, cp_group=self.pg_collection.cp, seq_dim=0
+        )
+        return attention_output, attention_bias
+
     def _forward_attention(
         self,
         hidden_states: Tensor,
@@ -670,6 +717,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if using_fused_tp_inference_kernel:
             self._set_proj_residual(residual)
 
+        swap_attention_cp_layout = self._needs_contiguous_to_zigzag_attention_layout(
+            packed_seq_params
+        )
+        if swap_attention_cp_layout:
+            nvtx_range_push(suffix="contiguous_to_zigzag_attention")
+            input_layernorm_output, attention_mask, rotary_pos_emb = (
+                self._contiguous_to_zigzag_for_attention(
+                    input_layernorm_output, attention_mask, rotary_pos_emb
+                )
+            )
+            nvtx_range_pop(suffix="contiguous_to_zigzag_attention")
+
         # Self attention.
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
@@ -685,6 +744,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
+
+        if swap_attention_cp_layout:
+            nvtx_range_push(suffix="zigzag_to_contiguous_attention")
+            attention_output_with_bias = self._zigzag_to_contiguous_from_attention(
+                attention_output_with_bias
+            )
+            nvtx_range_pop(suffix="zigzag_to_contiguous_attention")
 
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute

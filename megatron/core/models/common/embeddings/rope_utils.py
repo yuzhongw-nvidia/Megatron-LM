@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel_layout import get_cp_rank_partition_indices
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,10 @@ __all__ = [
 
 
 def get_pos_emb_on_this_cp_rank(
-    pos_emb: Tensor, seq_dim: int, cp_group: torch.distributed.ProcessGroup
+    pos_emb: Tensor,
+    seq_dim: int,
+    cp_group: torch.distributed.ProcessGroup,
+    cp_partition_layout: str = "zigzag",
 ) -> Tensor:
     """Get the position embedding on the current context parallel rank.
 
@@ -54,14 +58,16 @@ def get_pos_emb_on_this_cp_rank(
         pos_emb (Tensor): Positional embedding tensor
         seq_dim (int): Sequence dimension
         cp_group (torch.distributed.ProcessGroup): The context parallel group
+        cp_partition_layout (str): CP sequence layout, either ``zigzag`` or
+            ``contiguous``.
     """
     if cp_group is None:
         raise ValueError("cp_group must be provided to get positional embedding per CP rank")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    cp_idx = torch.tensor(
-        [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
-    ).cuda(non_blocking=True)
+    cp_idx = get_cp_rank_partition_indices(
+        cp_size, cp_rank, cp_partition_layout, device=pos_emb.device
+    )
     pos_emb = pos_emb.view(
         *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
     )

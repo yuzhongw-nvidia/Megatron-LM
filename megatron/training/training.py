@@ -2260,7 +2260,9 @@ def dummy_train_step(data_iterator):
         for _ in range(num_microbatches):
             # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
             batch = get_batch_on_this_tp_rank(data_iterator)
-            batch = get_batch_on_this_cp_rank(batch)
+            batch = get_batch_on_this_cp_rank(
+                batch, cp_partition_layout=get_args().cp_partition_layout
+            )
 
 
 def train_step(
