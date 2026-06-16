@@ -7,6 +7,7 @@
 
 import logging
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -456,44 +457,39 @@ class GatedDeltaNet(MegatronModule):
             nvtx_range_pop(suffix="zigzag_to_contiguous")
 
         # CP All to All: CP to HP
-        if (
-            packed_seq_params is not None
-            and packed_seq_params.qkv_format == 'thd'
-            and cp_size_a2a > 1
-        ):
-            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // cp_size_a2a, dim=0)
-            outputs = []
-            for qkvzba_i in unpacked_qkvzba:
-                qkvzba_i = tensor_a2a_cp2hp(
-                    qkvzba_i,
-                    seq_dim=0,
-                    head_dim=-1,
-                    cp_group=cp_group_a2a,
-                    split_sections=[
-                        self.qk_dim_local_tp,
-                        self.qk_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.num_value_heads // self.tp_size,
-                        self.num_value_heads // self.tp_size,
-                    ],
+        qkvzba_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+            self.v_dim_local_tp,
+            self.num_value_heads // self.tp_size,
+            self.num_value_heads // self.tp_size,
+        ]
+        if cp_size_a2a > 1:
+            head_perm = _build_head_perm_for_split_sections(
+                tuple(qkvzba_split_sections), cp_size_a2a, qkvzba.device
+            )
+            qkvzba = qkvzba.index_select(-1, head_perm)
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            qkvzba = tensor_a2a_cp2hp(
+                qkvzba,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=cp_group_a2a,
+                undo_attention_load_balancing=False,
+            )
+            if cp_size_a2a > 1:
+                thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
+                    cu_seqlens_q, cp_size_a2a, seq_len_post_a2a
                 )
-                outputs.append(qkvzba_i)
-            qkvzba = torch.cat(outputs, dim=0)
+                qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
         else:
             qkvzba = tensor_a2a_cp2hp(
                 qkvzba,
                 seq_dim=0,
                 head_dim=-1,
                 cp_group=cp_group_a2a,
-                split_sections=[
-                    self.qk_dim_local_tp,
-                    self.qk_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.num_value_heads // self.tp_size,
-                    self.num_value_heads // self.tp_size,
-                ],
+                split_sections=None if cp_size_a2a > 1 else qkvzba_split_sections,
             )
 
         # Transpose: s b x --> b s x
@@ -659,19 +655,16 @@ class GatedDeltaNet(MegatronModule):
             nvtx_range_pop(suffix="contiguous_to_zigzag")
 
         # CP all to all: HP to CP
-        if (
-            packed_seq_params is not None
-            and packed_seq_params.qkv_format == 'thd'
-            and cp_size_a2a > 1
-        ):
-            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
-            outputs = []
-            for norm_out_i in unpacked_norm_out:
-                norm_out_i = tensor_a2a_hp2cp(
-                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=cp_group_a2a
-                )
-                outputs.append(norm_out_i)
-            norm_out = torch.cat(outputs, dim=0)
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            if cp_size_a2a > 1:
+                norm_out = norm_out.index_select(0, thd_cp_a2a_inv)
+            norm_out = tensor_a2a_hp2cp(
+                norm_out,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=cp_group_a2a,
+                redo_attention_load_balancing=False,
+            )
         else:
             norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group_a2a)
 
@@ -871,18 +864,6 @@ class GatedDeltaNet(MegatronModule):
         self.out_proj.backward_dw()
 
 
-def _unpack_sequence(x, cu_seqlens, dim=1):
-    unpacked_x = []
-    cu_seqlens_list = cu_seqlens.tolist()
-    num_seqs = len(cu_seqlens_list) - 1
-    for i in range(num_seqs):
-        idx_start = cu_seqlens_list[i]
-        idx_end = cu_seqlens_list[i + 1]
-        chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
-        unpacked_x.append(x[tuple(chunked_index)])
-    return unpacked_x
-
-
 ####################
 # Sharded state dict utilities
 ####################
@@ -949,6 +930,68 @@ def _split_tensor_factory(
 ####################
 # Context parallel utilities
 ####################
+def _build_thd_cp_a2a_perm(
+    cu_seqlens: torch.Tensor, cp_size: int, t_global: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build THD sequence permutations for fused GDN CP<->HP A2A."""
+    cu = cu_seqlens.to(dtype=torch.long)
+    t_local = t_global // cp_size
+
+    positions = torch.arange(t_global, device=cu.device)
+    seq_idx = torch.bucketize(positions, cu[1:], right=True)
+    seq_lens = torch.diff(cu)
+    halves = seq_lens // (2 * cp_size)
+    local_starts = cu[:-1] // cp_size
+    global_starts = cu[:-1]
+
+    half_i = halves[seq_idx]
+    pos_in_seq = positions - global_starts[seq_idx]
+
+    natural_chunk = pos_in_seq // half_i
+    offset = pos_in_seq - natural_chunk * half_i
+
+    # Invert the ordering produced by `_undo_attention_load_balancing`:
+    #   natural_chunk < cp:   load_balanced = 2 * natural_chunk
+    #   natural_chunk >= cp:  load_balanced = 4*cp - 2*natural_chunk - 1
+    lb_chunk = torch.where(
+        natural_chunk < cp_size, 2 * natural_chunk, 4 * cp_size - 2 * natural_chunk - 1
+    )
+
+    # In the per-sequence load-balanced layout each rank owns load-balanced
+    # chunks (2r) and (2r+1), in that order, of every sequence.
+    rank = lb_chunk // 2
+    half_within_rank = lb_chunk - 2 * rank
+    k = half_within_rank * half_i + offset
+
+    idx = rank * t_local + local_starts[seq_idx] + k
+
+    inv = torch.empty_like(idx)
+    inv[idx] = positions
+
+    return idx, inv
+
+
+@lru_cache(maxsize=8)
+def _build_head_perm_for_split_sections(
+    split_sections: tuple[int, ...], cp_size: int, device: torch.device
+) -> torch.Tensor:
+    """Pre-permute split head sections so one fused GDN A2A matches per-section A2A."""
+    assert all(
+        s % cp_size == 0 for s in split_sections
+    ), f"split_sections {split_sections} must be divisible by cp_size {cp_size} for GDN"
+    offset = 0
+    parts = []
+    for split_size in split_sections:
+        parts.append(
+            torch.arange(
+                offset, offset + split_size, device=device, dtype=torch.long
+            ).view(cp_size, -1)
+        )
+        offset += split_size
+
+    return torch.cat(parts, dim=-1).view(-1)
+
+
 def get_parameter_local_cp_a2a(
     param: torch.Tensor,
     dim: int,
