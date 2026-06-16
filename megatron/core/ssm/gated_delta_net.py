@@ -456,41 +456,25 @@ class GatedDeltaNet(MegatronModule):
                 )
             nvtx_range_pop(suffix="zigzag_to_contiguous")
 
-        # CP All to All: CP to HP
-        qkvzba_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-            self.v_dim_local_tp,
-            self.num_value_heads // self.tp_size,
-            self.num_value_heads // self.tp_size,
-        ]
-        if cp_size_a2a > 1:
-            head_perm = _build_head_perm_for_split_sections(
-                tuple(qkvzba_split_sections), cp_size_a2a, qkvzba.device
-            )
-            qkvzba = qkvzba.index_select(-1, head_perm)
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=cp_group_a2a,
-                undo_attention_load_balancing=False,
-            )
-            if cp_size_a2a > 1:
-                thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
-                    cu_seqlens_q, cp_size_a2a, seq_len_post_a2a
-                )
-                qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
-        else:
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=cp_group_a2a,
-                split_sections=None if cp_size_a2a > 1 else qkvzba_split_sections,
-            )
+        a2a_cp_layout = _GDNA2ACPLayoutHandler(
+            cp_group=cp_group_a2a,
+            cp_size=cp_size_a2a,
+            split_sections=[
+                self.qk_dim_local_tp,
+                self.qk_dim_local_tp,
+                self.v_dim_local_tp,
+                self.v_dim_local_tp,
+                self.num_value_heads // self.tp_size,
+                self.num_value_heads // self.tp_size,
+            ],
+            packed_thd=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+            cu_seqlens=cu_seqlens_q,
+            total_seq_len=seq_len_post_a2a,
+        )
+
+        # Enter GDN A2A CP's head-parallel layout. The handler owns split-section
+        # packing and packed-THD sequence permutations.
+        qkvzba = a2a_cp_layout.cp_to_hp(qkvzba)
 
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
@@ -654,19 +638,8 @@ class GatedDeltaNet(MegatronModule):
                 )
             nvtx_range_pop(suffix="contiguous_to_zigzag")
 
-        # CP all to all: HP to CP
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            if cp_size_a2a > 1:
-                norm_out = norm_out.index_select(0, thd_cp_a2a_inv)
-            norm_out = tensor_a2a_hp2cp(
-                norm_out,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=cp_group_a2a,
-                redo_attention_load_balancing=False,
-            )
-        else:
-            norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=cp_group_a2a)
+        # Leave GDN A2A CP's head-parallel layout and restore the input rank layout.
+        norm_out = a2a_cp_layout.hp_to_cp(norm_out)
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
@@ -990,6 +963,75 @@ def _build_head_perm_for_split_sections(
         offset += split_size
 
     return torch.cat(parts, dim=-1).view(-1)
+
+
+class _GDNA2ACPLayoutHandler:
+    """Wrap GDN A2A CP layout transforms around the FLA compute core."""
+
+    def __init__(
+        self,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+        cp_size: int,
+        split_sections: List[int],
+        packed_thd: bool,
+        cu_seqlens: Optional[torch.Tensor],
+        total_seq_len: int,
+    ) -> None:
+        self.cp_group = cp_group
+        self.cp_size = cp_size
+        self.split_sections = split_sections
+        self.packed_thd = packed_thd
+        self.cu_seqlens = cu_seqlens
+        self.total_seq_len = total_seq_len
+        self._thd_cp_a2a_inv: Optional[torch.Tensor] = None
+
+    def cp_to_hp(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Convert from CP sequence-parallel layout to GDN head-parallel layout."""
+        if self.cp_size > 1:
+            head_perm = _build_head_perm_for_split_sections(
+                tuple(self.split_sections), self.cp_size, tensor.device
+            )
+            tensor = tensor.index_select(-1, head_perm)
+
+        if self.packed_thd:
+            tensor = tensor_a2a_cp2hp(
+                tensor,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=self.cp_group,
+                undo_attention_load_balancing=False,
+            )
+            if self.cp_size > 1:
+                assert self.cu_seqlens is not None
+                thd_cp_a2a_idx, self._thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
+                    self.cu_seqlens, self.cp_size, self.total_seq_len
+                )
+                tensor = tensor.index_select(0, thd_cp_a2a_idx)
+            return tensor
+
+        return tensor_a2a_cp2hp(
+            tensor,
+            seq_dim=0,
+            head_dim=-1,
+            cp_group=self.cp_group,
+            split_sections=None if self.cp_size > 1 else self.split_sections,
+        )
+
+    def hp_to_cp(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Convert from GDN head-parallel layout back to CP sequence layout."""
+        if self.packed_thd:
+            if self.cp_size > 1:
+                assert self._thd_cp_a2a_inv is not None
+                tensor = tensor.index_select(0, self._thd_cp_a2a_inv)
+            return tensor_a2a_hp2cp(
+                tensor,
+                seq_dim=0,
+                head_dim=-1,
+                cp_group=self.cp_group,
+                redo_attention_load_balancing=False,
+            )
+
+        return tensor_a2a_hp2cp(tensor, seq_dim=0, head_dim=-1, cp_group=self.cp_group)
 
 
 def get_parameter_local_cp_a2a(
