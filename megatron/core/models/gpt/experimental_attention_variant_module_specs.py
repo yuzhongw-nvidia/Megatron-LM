@@ -2,6 +2,10 @@
 
 from typing import List, Optional
 
+from megatron.core.context_parallel_layout import (
+    DEFAULT_CP_SEQUENCE_LAYOUT,
+    ContextParallelLayout,
+)
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNetSubmodules
@@ -410,6 +414,75 @@ def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -
     """Check if the experimental attention variant is a linear attention variant."""
     linear_attention_variants = ["gated_delta_net"]
     return experimental_attention_variant in linear_attention_variants
+
+
+def get_experimental_attention_variant_layer_cp_sequence_layout_pattern(
+    config: TransformerConfig,
+) -> List[Optional[ContextParallelLayout]]:
+    """Return per-layer CP sequence layout requirements for experimental GPT specs."""
+    if config.experimental_attention_variant is None:
+        return [DEFAULT_CP_SEQUENCE_LAYOUT] * config.num_layers
+
+    experimental_attention_pattern = [0] * config.num_layers
+    if is_linear_attention_variant(config.experimental_attention_variant):
+        experimental_attention_pattern = get_linear_attention_pattern(config=config)
+    else:
+        experimental_attention_pattern = [1] * config.num_layers
+
+    experimental_layout = _get_experimental_attention_variant_cp_sequence_layout(config)
+    return [
+        experimental_layout if uses_experimental_attention else ContextParallelLayout.ZIGZAG
+        for uses_experimental_attention in experimental_attention_pattern
+    ]
+
+
+def get_experimental_attention_variant_stage_input_cp_sequence_layout(
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+) -> ContextParallelLayout:
+    """Return the CP sequence layout expected at one experimental GPT stage input."""
+    layer_layouts = get_experimental_attention_variant_layer_cp_sequence_layout_pattern(config)
+
+    if config.pipeline_model_parallel_layout is not None:
+        stage_layer_offset = config.pipeline_model_parallel_layout.get_layer_offset(
+            layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
+        )
+    elif config.pipeline_model_parallel_size == 1 and pp_rank is None:
+        stage_layer_offset = 0
+    else:
+        stage_layer_offset = get_transformer_layer_offset(
+            config, vp_stage=vp_stage, pp_rank=pp_rank
+        )
+
+    current_layout = None
+    for required_layout in layer_layouts[:stage_layer_offset]:
+        if required_layout is not None:
+            current_layout = required_layout
+
+    if current_layout is None:
+        for required_layout in layer_layouts[stage_layer_offset:]:
+            if required_layout is not None:
+                current_layout = required_layout
+                break
+
+    return current_layout or DEFAULT_CP_SEQUENCE_LAYOUT
+
+
+def _get_experimental_attention_variant_cp_sequence_layout(
+    config: TransformerConfig,
+) -> ContextParallelLayout:
+    """Return the CP sequence layout required by the experimental attention variant."""
+    if config.experimental_attention_variant == "gated_delta_net":
+        mode = getattr(config, "linear_cp_mode", "chunkwise")
+        if mode == "chunkwise":
+            return ContextParallelLayout.CONTIGUOUS
+        if mode == "headwise":
+            return ContextParallelLayout.ZIGZAG
+        raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
+    if config.experimental_attention_variant in {"dsa", "dsv4_hybrid"}:
+        return ContextParallelLayout.ZIGZAG
+    raise ValueError(
+        f"Invalid experimental attention variant: {config.experimental_attention_variant}"
+    )
 
 
 def get_moe_layer_pattern(config: TransformerConfig) -> List[int]:

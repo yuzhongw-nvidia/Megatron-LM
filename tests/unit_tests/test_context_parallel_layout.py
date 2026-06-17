@@ -1,13 +1,37 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from megatron.core.context_parallel_layout import get_thd_context_parallel_rank_indices
+from megatron.core.context_parallel_layout import (
+    ContextParallelLayout,
+    get_context_parallel_layout_chunk_indices,
+    get_required_cp_sequence_layout_for_layer,
+    get_thd_context_parallel_rank_indices,
+)
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_experimental_attention_variant_stage_input_cp_sequence_layout,
+)
+
+
+class _PipelineLayout:
+
+    def __init__(self, offset):
+        self.offset = offset
+
+    def get_layer_offset(self, **_kwargs):
+        return self.offset
 
 
 def _token_ranges(*spans):
     return [token for start, end in spans for token in range(start, end)]
+
+
+def test_context_parallel_layout_chunk_indices():
+    assert get_context_parallel_layout_chunk_indices(4, 2, "zigzag").tolist() == [2, 5]
+    assert get_context_parallel_layout_chunk_indices(4, 2, "contiguous").tolist() == [4, 5]
 
 
 def test_thd_context_parallel_rank_indices_match_per_sequence_chunk_order():
@@ -66,3 +90,46 @@ def test_thd_context_parallel_rank_indices_reject_decreasing_boundaries():
 def test_thd_context_parallel_rank_indices_reject_unknown_layout():
     with pytest.raises(ValueError, match="Unsupported"):
         get_thd_context_parallel_rank_indices(torch.tensor([0, 16]), 2, 0, "interleaved")
+
+
+def test_required_layout_rejects_unknown_layer_type():
+    with pytest.raises(ValueError, match="Cannot determine CP sequence layout"):
+        get_required_cp_sequence_layout_for_layer(object(), SimpleNamespace(cp_comm_type=None))
+
+
+def test_gated_delta_net_chunkwise_layout_plan_follows_linear_attention_pattern():
+    config = SimpleNamespace(
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=2,
+        linear_cp_mode="chunkwise",
+        num_layers=4,
+        pipeline_model_parallel_layout=None,
+        pipeline_model_parallel_size=1,
+    )
+
+    assert (
+        get_experimental_attention_variant_stage_input_cp_sequence_layout(config)
+        == ContextParallelLayout.CONTIGUOUS
+    )
+
+    config.pipeline_model_parallel_layout = _PipelineLayout(offset=2)
+    assert (
+        get_experimental_attention_variant_stage_input_cp_sequence_layout(config)
+        == ContextParallelLayout.ZIGZAG
+    )
+
+
+def test_gated_delta_net_headwise_layout_plan_preserves_zigzag():
+    config = SimpleNamespace(
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=[1, 0],
+        linear_cp_mode="headwise",
+        num_layers=2,
+        pipeline_model_parallel_layout=None,
+        pipeline_model_parallel_size=1,
+    )
+
+    assert (
+        get_experimental_attention_variant_stage_input_cp_sequence_layout(config)
+        == ContextParallelLayout.ZIGZAG
+    )

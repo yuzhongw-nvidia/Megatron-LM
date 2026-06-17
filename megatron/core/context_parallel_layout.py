@@ -1,12 +1,114 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Context parallel tensor layout helpers."""
+"""Context parallel sequence layout helpers."""
 
-from typing import List, Optional, Tuple
+from enum import Enum
+from typing import Any, List, Optional, Tuple
 
 import torch
 
-from megatron.core.tensor_parallel import all_to_all
+
+class ContextParallelLayout(str, Enum):
+    """Sequence layout used by tensors sharded across a context-parallel group."""
+
+    ZIGZAG = "zigzag"
+    CONTIGUOUS = "contiguous"
+
+
+DEFAULT_CP_SEQUENCE_LAYOUT = ContextParallelLayout.ZIGZAG
+
+
+def normalize_cp_sequence_layout(layout: Optional[str | ContextParallelLayout]):
+    """Return a canonical CP sequence layout enum, preserving ``None`` requirements."""
+    if layout is None:
+        return None
+    if isinstance(layout, ContextParallelLayout):
+        return layout
+    try:
+        return ContextParallelLayout(layout)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported context-parallel layout {layout!r}.") from exc
+
+
+def get_context_parallel_layout_chunk_indices(
+    cp_size: int, cp_rank: int, layout: str | ContextParallelLayout
+) -> torch.Tensor:
+    """Return the two global chunk indices owned by this CP rank in ``layout``."""
+    layout = normalize_cp_sequence_layout(layout)
+    if layout is None:
+        raise ValueError("A concrete context-parallel layout is required.")
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}.")
+
+    if layout == ContextParallelLayout.ZIGZAG:
+        return torch.tensor([cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.long)
+    if layout == ContextParallelLayout.CONTIGUOUS:
+        return torch.tensor([2 * cp_rank, 2 * cp_rank + 1], dtype=torch.long)
+    raise ValueError(f"Unsupported context-parallel layout {layout!r}.")
+
+
+################################################################################
+# Layer-to-CP-sequence-layout mapping
+################################################################################
+#
+# ``None`` is a meaningful result here: it means the module is token-layout
+# agnostic and preserves whichever CP sequence layout it receives.  It must not
+# be used as the fallback for an unrecognized module type; unknown types should
+# fail loudly so new layer implementations add an explicit layout policy.
+
+
+def get_required_cp_sequence_layout_for_layer(
+    layer: Any, config: Any, *, cp_comm_type: Optional[str] = None
+) -> Optional[ContextParallelLayout]:
+    """Return the CP sequence layout required by a layer or attention-like module.
+
+    The helper intentionally uses light duck-typing instead of importing concrete
+    modules, because several of those modules already import this file.
+    """
+    if cp_comm_type is None:
+        cp_comm_type = getattr(config, "cp_comm_type", None)
+
+    if layer is None:
+        raise ValueError("Cannot determine CP sequence layout for None.")
+
+    module_name = layer.__class__.__name__
+    if hasattr(layer, "self_attention"):
+        return get_required_cp_sequence_layout_for_layer(
+            layer.self_attention, getattr(layer, "config", config), cp_comm_type=cp_comm_type
+        )
+    if module_name in {"IdentityOp", "IdentityFuncOp"}:
+        return None
+    if module_name == "GatedDeltaNet":
+        mode = getattr(config, "linear_cp_mode", "chunkwise")
+        if mode == "chunkwise":
+            return ContextParallelLayout.CONTIGUOUS
+        if mode == "headwise":
+            # GDN headwise CP still relies on the existing attention load-balanced
+            # all-to-all helpers, which encode zigzag layout semantics.
+            return ContextParallelLayout.ZIGZAG
+        return ContextParallelLayout.CONTIGUOUS
+
+    # Preserve current standard-attention behavior.  Ring/P2P needs zigzag for
+    # causal load balancing, and TE A2A currently still expects zigzag input.
+    # ``cp_comm_type`` is deliberately part of this policy surface so TE A2A can
+    # switch to contiguous here once the backend stops requiring zigzag.
+    del cp_comm_type
+    if module_name in {
+        "SelfAttention",
+        "CrossAttention",
+        "MultiLatentAttention",
+        "MLASelfAttention",
+        "FusedMLASelfAttention",
+        "AbsorbedMLASelfAttention",
+        "DSv4HybridAttention",
+        "DSv4HybridSelfAttention",
+    }:
+        return ContextParallelLayout.ZIGZAG
+    raise ValueError(
+        f"Cannot determine CP sequence layout for layer/module type {module_name!r}."
+    )
 
 
 def get_thd_context_parallel_rank_indices(
@@ -24,8 +126,9 @@ def get_thd_context_parallel_rank_indices(
     ``"zigzag"`` follows Megatron's per-sequence load-balanced chunk order; ``"contiguous"``
     partitions the flattened packed THD buffer into rank-contiguous spans.
     """
-    if layout not in ("zigzag", "contiguous"):
-        raise ValueError(f"Unsupported context-parallel layout {layout!r}.")
+    layout = normalize_cp_sequence_layout(layout)
+    if layout is None:
+        raise ValueError("A concrete context-parallel layout is required.")
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
     if not 0 <= cp_rank < cp_size:
@@ -115,6 +218,133 @@ def contiguous_to_zigzag_chunks(
     return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=False)
 
 
+def convert_cp_sequence_layout(
+    x: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    source_layout: str | ContextParallelLayout,
+    target_layout: str | ContextParallelLayout,
+    seq_dim: int = 0,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    sequence_parallel: bool = False,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Convert a sequence tensor between CP zigzag and contiguous layouts.
+
+    With sequence parallel enabled, the baseline path gathers the full CP-local
+    sequence on each TP rank, performs the CP layout conversion, then scatters
+    back to the original SP sharding.  ``tp_cp_group`` is accepted for the
+    future direct TPxCP all-to-all implementation.
+    """
+    del tp_cp_group
+
+    source_layout = normalize_cp_sequence_layout(source_layout)
+    target_layout = normalize_cp_sequence_layout(target_layout)
+    if source_layout is None or target_layout is None:
+        raise ValueError("source_layout and target_layout must be concrete layouts.")
+    if source_layout == target_layout:
+        return x
+
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if cp_size == 1:
+        return x
+
+    if sequence_parallel and tp_group is not None and tp_group.size() > 1:
+        from megatron.core.tensor_parallel.mappings import (
+            gather_from_sequence_parallel_region,
+            scatter_to_sequence_parallel_region,
+        )
+
+        moved = x.movedim(seq_dim, 0) if seq_dim != 0 else x
+        gathered = gather_from_sequence_parallel_region(moved, group=tp_group)
+        converted = _convert_cp_sequence_layout_full_sequence(
+            gathered,
+            cp_group,
+            source_layout=source_layout,
+            target_layout=target_layout,
+            seq_dim=0,
+            cu_seqlens=cu_seqlens,
+        )
+        scattered = scatter_to_sequence_parallel_region(converted, group=tp_group)
+        return scattered.movedim(0, seq_dim).contiguous() if seq_dim != 0 else scattered
+
+    return _convert_cp_sequence_layout_full_sequence(
+        x,
+        cp_group,
+        source_layout=source_layout,
+        target_layout=target_layout,
+        seq_dim=seq_dim,
+        cu_seqlens=cu_seqlens,
+    )
+
+
+def get_packed_seq_params_cp_layout_cu_seqlens(
+    packed_seq_params: Optional[Any],
+) -> Optional[torch.Tensor]:
+    """Return THD cumulative sequence lengths used for CP layout conversion."""
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        return None
+    return (
+        packed_seq_params.cu_seqlens_q_padded
+        if packed_seq_params.cu_seqlens_q_padded is not None
+        else packed_seq_params.cu_seqlens_q
+    )
+
+
+def convert_hidden_states_cp_sequence_layout(
+    hidden_states: Optional[torch.Tensor],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    source_layout: str | ContextParallelLayout,
+    target_layout: str | ContextParallelLayout,
+    packed_seq_params: Optional[Any] = None,
+    sequence_parallel: bool = False,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Optional[torch.Tensor]:
+    """Convert model hidden states between CP sequence layouts."""
+    if hidden_states is None:
+        return None
+    dynamic_cp_group = (
+        getattr(packed_seq_params, "cp_group", None) if packed_seq_params is not None else None
+    )
+    return convert_cp_sequence_layout(
+        hidden_states,
+        dynamic_cp_group if dynamic_cp_group is not None else cp_group,
+        source_layout=source_layout,
+        target_layout=target_layout,
+        seq_dim=0,
+        cu_seqlens=get_packed_seq_params_cp_layout_cu_seqlens(packed_seq_params),
+        sequence_parallel=sequence_parallel,
+        tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
+    )
+
+
+def _convert_cp_sequence_layout_full_sequence(
+    x: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    source_layout: ContextParallelLayout,
+    target_layout: ContextParallelLayout,
+    seq_dim: int,
+    cu_seqlens: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Convert a tensor whose sequence dim contains the full CP-local sequence."""
+    if (
+        source_layout == ContextParallelLayout.ZIGZAG
+        and target_layout == ContextParallelLayout.CONTIGUOUS
+    ):
+        return zigzag_to_contiguous_chunks(x, cp_group, seq_dim=seq_dim, cu_seqlens=cu_seqlens)
+    if (
+        source_layout == ContextParallelLayout.CONTIGUOUS
+        and target_layout == ContextParallelLayout.ZIGZAG
+    ):
+        return contiguous_to_zigzag_chunks(x, cp_group, seq_dim=seq_dim, cu_seqlens=cu_seqlens)
+    raise ValueError(f"Unsupported CP layout conversion {source_layout!r} -> {target_layout!r}.")
+
+
 def _zigzag_contiguous_thd_swap(
     x: torch.Tensor,
     cp_group: Optional[torch.distributed.ProcessGroup],
@@ -133,6 +363,7 @@ def _zigzag_contiguous_thd_swap(
     if cp_size == 1:
         return x
     cp_rank = cp_group.rank()
+    from megatron.core.tensor_parallel.mappings import all_to_all
 
     if seq_dim != 0:
         x = x.movedim(seq_dim, 0)
@@ -231,6 +462,7 @@ def _zigzag_contiguous_chunk_swap(
     if cp_size == 1:
         return x
     cp_rank = cp_group.rank()
+    from megatron.core.tensor_parallel.mappings import all_to_all
 
     # Work with seq_dim at position 0.
     if seq_dim != 0:

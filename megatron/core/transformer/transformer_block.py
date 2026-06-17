@@ -10,6 +10,13 @@ import torch.nn as nn
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.context_parallel_layout import (
+    DEFAULT_CP_SEQUENCE_LAYOUT,
+    ContextParallelLayout,
+    convert_cp_sequence_layout,
+    get_required_cp_sequence_layout_for_layer,
+    normalize_cp_sequence_layout,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -19,7 +26,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import CheckpointManager
@@ -283,6 +290,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_process: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        cp_stage_entry_layout: Optional[str | ContextParallelLayout] = None,
     ):
         super().__init__(config=config)
 
@@ -299,6 +307,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.vp_stage = vp_stage
+        self._cp_stage_entry_layout_override = normalize_cp_sequence_layout(cp_stage_entry_layout)
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -334,6 +343,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.num_residual_streams = config.num_residual_streams
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+        self._build_cp_sequence_layout_plan()
 
     def _build_layers(self):
         # Transformer layers.
@@ -462,6 +472,153 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
 
+    def _build_cp_sequence_layout_plan(self) -> None:
+        """Build the immutable CP sequence layout plan for this block."""
+        current_layout = self._cp_stage_entry_layout_override
+        self.cp_stage_entry_layout = current_layout
+        self.cp_layout_plan: List[Optional[ContextParallelLayout]] = []
+        for layer in self.layers:
+            layer_config = getattr(layer, "config", self.config)
+            required_layout = get_required_cp_sequence_layout_for_layer(layer, layer_config)
+            self.cp_layout_plan.append(required_layout)
+            if self.cp_stage_entry_layout is None and required_layout is not None:
+                self.cp_stage_entry_layout = required_layout
+                current_layout = required_layout
+            if required_layout is not None:
+                current_layout = required_layout
+        if self.cp_stage_entry_layout is None:
+            self.cp_stage_entry_layout = DEFAULT_CP_SEQUENCE_LAYOUT
+        self.cp_stage_exit_layout = current_layout or self.cp_stage_entry_layout
+
+    def get_input_cp_sequence_layout(self) -> ContextParallelLayout:
+        """Return the CP sequence layout expected at this block's stage input."""
+        return self.cp_stage_entry_layout
+
+    def get_stage_exit_cp_sequence_layout(self) -> ContextParallelLayout:
+        """Return the CP sequence layout produced after this block's local layers."""
+        return self.cp_stage_exit_layout
+
+    def get_cp_sequence_layout_before_local_index(self, local_index: int) -> ContextParallelLayout:
+        """Return the CP layout immediately before a local layer index."""
+        current_layout = self.cp_stage_entry_layout
+        for required_layout in self.cp_layout_plan[:local_index]:
+            if required_layout is not None:
+                current_layout = required_layout
+        return current_layout
+
+    @staticmethod
+    def _get_cp_layout_cu_seqlens(
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Optional[Tensor]:
+        if packed_seq_params is None or packed_seq_params.qkv_format != 'thd':
+            return None
+        return (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+
+    def _convert_rotary_cp_sequence_layout(
+        self,
+        rotary_pos_emb,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+        source_layout: ContextParallelLayout,
+        target_layout: ContextParallelLayout,
+    ):
+        if rotary_pos_emb is None:
+            return None
+        if isinstance(rotary_pos_emb, tuple):
+            return tuple(
+                self._convert_rotary_cp_sequence_layout(
+                    rotary_part, cp_group, source_layout, target_layout
+                )
+                for rotary_part in rotary_pos_emb
+            )
+        if isinstance(rotary_pos_emb, list):
+            return [
+                self._convert_rotary_cp_sequence_layout(
+                    rotary_part, cp_group, source_layout, target_layout
+                )
+                for rotary_part in rotary_pos_emb
+            ]
+        if not torch.is_tensor(rotary_pos_emb):
+            return rotary_pos_emb
+        return convert_cp_sequence_layout(
+            rotary_pos_emb,
+            cp_group,
+            source_layout=source_layout,
+            target_layout=target_layout,
+            seq_dim=0,
+        )
+
+    def _convert_cp_sequence_layout_for_layer(
+        self,
+        *,
+        local_index: int,
+        current_layout: ContextParallelLayout,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor],
+        rotary_pos_emb,
+        attention_bias: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+        input_ids: Optional[Tensor],
+    ):
+        """Convert per-token tensors to the layout required by one local layer."""
+        required_layout = self.cp_layout_plan[local_index]
+        if required_layout is None or required_layout == current_layout:
+            return hidden_states, rotary_pos_emb, padding_mask, input_ids, current_layout
+
+        if attention_mask is not None:
+            raise NotImplementedError(
+                "Changing CP sequence layout with an explicit attention_mask is not supported yet."
+            )
+        if attention_bias is not None:
+            raise NotImplementedError(
+                "Changing CP sequence layout with attention_bias is not supported yet."
+            )
+
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        cu_seqlens = self._get_cp_layout_cu_seqlens(packed_seq_params)
+        hidden_states = convert_cp_sequence_layout(
+            hidden_states,
+            cp_group,
+            source_layout=current_layout,
+            target_layout=required_layout,
+            seq_dim=0,
+            cu_seqlens=cu_seqlens,
+            sequence_parallel=self.config.sequence_parallel,
+            tp_group=self.pg_collection.tp,
+            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+        )
+        if packed_seq_params is None:
+            rotary_pos_emb = self._convert_rotary_cp_sequence_layout(
+                rotary_pos_emb, cp_group, current_layout, required_layout
+            )
+        if padding_mask is not None:
+            padding_mask = convert_cp_sequence_layout(
+                padding_mask,
+                cp_group,
+                source_layout=current_layout,
+                target_layout=required_layout,
+                seq_dim=1,
+                cu_seqlens=cu_seqlens,
+                sequence_parallel=self.config.sequence_parallel,
+                tp_group=self.pg_collection.tp,
+                tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+            )
+        if input_ids is not None:
+            input_ids = convert_cp_sequence_layout(
+                input_ids,
+                cp_group,
+                source_layout=current_layout,
+                target_layout=required_layout,
+                seq_dim=1,
+                cu_seqlens=cu_seqlens,
+            )
+
+        return hidden_states, rotary_pos_emb, padding_mask, input_ids, required_layout
+
     def _checkpointed_forward(
         self,
         hidden_states: Tensor,
@@ -504,8 +661,27 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 rotary_pos_emb,
                 padding_mask=None,
             ):
+                current_layout = self.get_cp_sequence_layout_before_local_index(start)
+                local_input_ids = input_ids
                 for index in range(start, end):
                     layer = self._get_layer(index)
+                    (
+                        hidden_states,
+                        rotary_pos_emb,
+                        padding_mask,
+                        local_input_ids,
+                        current_layout,
+                    ) = self._convert_cp_sequence_layout_for_layer(
+                        local_index=index,
+                        current_layout=current_layout,
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                        padding_mask=padding_mask,
+                        input_ids=local_input_ids,
+                    )
 
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
@@ -534,7 +710,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
-                            input_ids=input_ids,
+                            input_ids=local_input_ids,
                         )
                 return hidden_states, context
 
@@ -864,6 +1040,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
 
         with rng_context, outer_quantization_context:
+            current_layout = self.cp_stage_entry_layout
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
                 checkpointed_result = self._checkpointed_forward(
@@ -889,6 +1066,24 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     hidden_states = checkpointed_result
             else:
                 for l_no, layer in enumerate(self.layers):
+                    (
+                        hidden_states,
+                        rotary_pos_emb,
+                        padding_mask,
+                        input_ids,
+                        current_layout,
+                    ) = self._convert_cp_sequence_layout_for_layer(
+                        local_index=l_no,
+                        current_layout=current_layout,
+                        hidden_states=hidden_states,
+                        attention_mask=attention_mask,
+                        rotary_pos_emb=rotary_pos_emb,
+                        attention_bias=attention_bias,
+                        packed_seq_params=packed_seq_params,
+                        padding_mask=padding_mask,
+                        input_ids=input_ids,
+                    )
+
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
                         if self.config.fp8:

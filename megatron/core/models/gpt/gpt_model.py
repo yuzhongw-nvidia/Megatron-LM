@@ -8,6 +8,10 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.context_parallel_layout import (
+    ContextParallelLayout,
+    convert_hidden_states_cp_sequence_layout,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
 from megatron.core.fp8_utils import is_mxfp8_output_proj_active
@@ -111,6 +115,7 @@ class GPTModel(LanguageModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        cp_stage_entry_layout: Optional[str | ContextParallelLayout] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -227,6 +232,7 @@ class GPTModel(LanguageModule):
             post_process=self.post_process,
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
+            cp_stage_entry_layout=cp_stage_entry_layout,
         )
 
         if self.mtp_process:
@@ -308,6 +314,14 @@ class GPTModel(LanguageModule):
 
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
+
+    def get_input_cp_sequence_layout(self) -> ContextParallelLayout:
+        """Return the CP sequence layout used for this model chunk's batch tensors."""
+        return self.decoder.get_input_cp_sequence_layout()
+
+    def get_output_cp_sequence_layout(self) -> ContextParallelLayout:
+        """Return the CP sequence layout produced by this model chunk's decoder."""
+        return self.decoder.get_stage_exit_cp_sequence_layout()
 
     def _preprocess(
         self,
