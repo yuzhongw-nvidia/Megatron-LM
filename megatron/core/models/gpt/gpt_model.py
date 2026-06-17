@@ -685,6 +685,41 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
+
+        needs_batch_layout = self.post_process or (
+            mtp_in_postprocess and not (in_inference_mode or is_spec_decode)
+        )
+        if needs_batch_layout:
+            target_layout = self.get_input_cp_sequence_layout()
+            current_layout = self.get_output_cp_sequence_layout()
+            if self.config.mtp_num_layers and target_layout != ContextParallelLayout.ZIGZAG:
+                mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+                if mtp_cp_group is not None and mtp_cp_group.size() > 1:
+                    raise NotImplementedError(
+                        "MTP with CP currently assumes zigzag sequence layout."
+                    )
+            hidden_states = convert_hidden_states_cp_sequence_layout(
+                hidden_states,
+                self.pg_collection.cp,
+                source_layout=current_layout,
+                target_layout=target_layout,
+                packed_seq_params=packed_seq_params,
+                sequence_parallel=self.config.sequence_parallel,
+                tp_group=self.pg_collection.tp,
+                tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+            )
+            if mhc_multistream is not None:
+                mhc_multistream = convert_hidden_states_cp_sequence_layout(
+                    mhc_multistream,
+                    self.pg_collection.cp,
+                    source_layout=current_layout,
+                    target_layout=target_layout,
+                    packed_seq_params=packed_seq_params,
+                    sequence_parallel=self.config.sequence_parallel,
+                    tp_group=self.pg_collection.tp,
+                    tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+                )
+
         if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,
