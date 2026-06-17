@@ -25,6 +25,10 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
+from megatron.core.context_parallel_layout import (
+    DEFAULT_CP_SEQUENCE_LAYOUT,
+    normalize_cp_sequence_layout,
+)
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -75,7 +79,11 @@ except ImportError:
 stimer = StragglerDetector()
 
 
-def get_batch(data_iterator, vp_stage: Optional[int] = None):
+def get_batch(
+    data_iterator,
+    vp_stage: Optional[int] = None,
+    cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
+):
     """Generate a batch.
 
     Packed sequence support (SFT / ``--sft`` flag):
@@ -127,6 +135,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """
     args = get_args()
     config = core_transformer_config_from_args(args)
+    cp_sequence_layout = (
+        normalize_cp_sequence_layout(cp_sequence_layout) or DEFAULT_CP_SEQUENCE_LAYOUT
+    )
 
     if args.sequence_packing_scheduler is not None:
         # `get_batch_on_this_rank_for_sequence_packing` owns scheduler THD metadata
@@ -138,6 +149,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             vp_stage=vp_stage,
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
+            cp_sequence_layout=cp_sequence_layout,
         )
 
     # TODO: this is pretty hacky, find a better way
@@ -188,11 +200,17 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+        batch = get_batch_on_this_cp_rank(  # The implementation of this function is in MCore
+            batch, cp_sequence_layout=cp_sequence_layout
+        )
         packed_seq_params = None
     else:  # Packed THD format
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
-            batch, cu_seqlens, cu_seqlens_padded, max_seqlen
+            batch,
+            cu_seqlens,
+            cu_seqlens_padded,
+            max_seqlen,
+            cp_sequence_layout=cp_sequence_layout,
         )
 
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
@@ -325,8 +343,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        cp_sequence_layout = get_attr_wrapped_model(model, "get_input_cp_sequence_layout")()
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
-            get_batch(data_iterator, vp_stage)
+            get_batch(data_iterator, vp_stage, cp_sequence_layout=cp_sequence_layout)
         )
     timers('batch-generator').stop()
 
