@@ -14,6 +14,12 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.context_parallel_layout import (
+    DEFAULT_CP_SEQUENCE_LAYOUT,
+    ContextParallelLayout,
+    get_context_parallel_layout_chunk_indices,
+    normalize_cp_sequence_layout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +52,10 @@ __all__ = [
 
 
 def get_pos_emb_on_this_cp_rank(
-    pos_emb: Tensor, seq_dim: int, cp_group: torch.distributed.ProcessGroup
+    pos_emb: Tensor,
+    seq_dim: int,
+    cp_group: torch.distributed.ProcessGroup,
+    cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
 ) -> Tensor:
     """Get the position embedding on the current context parallel rank.
 
@@ -57,11 +66,14 @@ def get_pos_emb_on_this_cp_rank(
     """
     if cp_group is None:
         raise ValueError("cp_group must be provided to get positional embedding per CP rank")
+    cp_sequence_layout = (
+        normalize_cp_sequence_layout(cp_sequence_layout) or DEFAULT_CP_SEQUENCE_LAYOUT
+    )
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    cp_idx = torch.tensor(
-        [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
-    ).cuda(non_blocking=True)
+    cp_idx = get_context_parallel_layout_chunk_indices(
+        cp_size, cp_rank, cp_sequence_layout
+    ).to(device=pos_emb.device, non_blocking=True)
     pos_emb = pos_emb.view(
         *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
     )
@@ -157,7 +169,12 @@ def _apply_rotary_pos_emb_bshd(
 
 
 def _get_thd_freqs_on_this_cp_rank(
-    cp_rank: int, cp_size: int, x: Tensor, freqs: Tensor, offset: int = 0
+    cp_rank: int,
+    cp_size: int,
+    x: Tensor,
+    freqs: Tensor,
+    offset: int = 0,
+    cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
 ) -> Tensor:
     """Get the correct frequency slice for this context parallel rank with optional sequence offset.
 
@@ -180,9 +197,16 @@ def _get_thd_freqs_on_this_cp_rank(
            All sequences use frequencies starting from position 0, preserving backward
            compatibility.
     """
+    cp_sequence_layout = (
+        normalize_cp_sequence_layout(cp_sequence_layout) or DEFAULT_CP_SEQUENCE_LAYOUT
+    )
     if cp_size > 1:
         cp_seg = x.size(0) // 2
         full_seqlen = cp_size * x.size(0)
+        if cp_sequence_layout == ContextParallelLayout.CONTIGUOUS:
+            return freqs[
+                offset + 2 * cp_rank * cp_seg : offset + 2 * (cp_rank + 1) * cp_seg
+            ]
         # Apply offset to both forward and backward segments for context parallelism
         # offset=0: traditional behavior, freqs[0:cp_seg] and freqs[...]
         # offset>0: exact mapping, freqs[offset+0:offset+cp_seg] and freqs[offset+...]
@@ -215,6 +239,7 @@ def _apply_rotary_pos_emb_thd(
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
     cp_group: torch.distributed.ProcessGroup = None,
+    cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
     multi_latent_attention: Optional[bool] = None,
     max_seqlen: Optional[int] = None,
 ) -> Tensor:
@@ -244,6 +269,9 @@ def _apply_rotary_pos_emb_thd(
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
+    cp_sequence_layout = (
+        normalize_cp_sequence_layout(cp_sequence_layout) or DEFAULT_CP_SEQUENCE_LAYOUT
+    )
 
     total_tokens = t.shape[0]
     device = t.device
@@ -270,7 +298,26 @@ def _apply_rotary_pos_emb_thd(
     local_seq_len = local_seq_lens[seq_idx]
     global_seq_start = cu_seqlens_i64[seq_idx]
 
-    if cp_size > 1:
+    assert max_seqlen is not None, (
+        "max_seqlen must be provided for THD RoPE so packed-frequency offset "
+        "detection does not silently depend on tensor shape heuristics."
+    )
+    exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
+
+    if cp_sequence_layout == ContextParallelLayout.CONTIGUOUS:
+        # THD contiguous layout partitions the flattened packed buffer into
+        # rank-contiguous spans. Compute absolute packed positions first, then
+        # map them back to sequence-local RoPE positions when needed.
+        if cp_size > 1:
+            part_len = cu_seqlens_i64[-1] // cp_size
+            global_token_pos = cp_rank * part_len + token_pos
+        else:
+            global_token_pos = token_pos
+        seq_idx = torch.searchsorted(cu_seqlens_i64[1:], global_token_pos, right=True)
+        seq_idx = seq_idx.clamp(min=0, max=cu_seqlens.shape[0] - 2)
+        global_seq_start = cu_seqlens_i64[seq_idx]
+        freq_pos = global_token_pos - global_seq_start
+    elif cp_size > 1:
         cp_seg = local_seq_len // 2
         full_seqlen = local_seq_len * cp_size
         is_first_half = local_pos < cp_seg
@@ -282,11 +329,6 @@ def _apply_rotary_pos_emb_thd(
     else:
         freq_pos = local_pos.to(torch.int64)
 
-    assert max_seqlen is not None, (
-        "max_seqlen must be provided for THD RoPE so packed-frequency offset "
-        "detection does not silently depend on tensor shape heuristics."
-    )
-    exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
     if exact_packed_freqs:
         # `freqs` covers all positions across all sequences (used for non-1D
         # RoPE / VLMs); shift by the per-sequence start offset so each token
@@ -320,6 +362,7 @@ def apply_rotary_pos_emb(
     mla_rotary_interleaved: bool = False,
     inverse: bool = False,
     mla_output_remove_interleaving: bool = False,
+    cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
     max_seqlen: Optional[int] = None,
 ):
     """
@@ -333,6 +376,9 @@ def apply_rotary_pos_emb(
         cp_group = parallel_state.get_context_parallel_group()
     if mla_rotary_interleaved is None:
         mla_rotary_interleaved = config.multi_latent_attention
+    cp_sequence_layout = (
+        normalize_cp_sequence_layout(cp_sequence_layout) or DEFAULT_CP_SEQUENCE_LAYOUT
+    )
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
@@ -367,14 +413,21 @@ def apply_rotary_pos_emb(
                 assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
-            assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
-            return fused_apply_rotary_pos_emb_thd(
-                t,
-                cu_seqlens,
-                freqs,
-                cp_size=cp_group.size(),
-                cp_rank=cp_group.rank(),
-                interleaved=config.rotary_interleaved,
+            if cp_sequence_layout == ContextParallelLayout.ZIGZAG:
+                assert (
+                    fused_apply_rotary_pos_emb_thd is not None
+                ), "apply_rope_fusion is not available."
+                return fused_apply_rotary_pos_emb_thd(
+                    t,
+                    cu_seqlens,
+                    freqs,
+                    cp_size=cp_group.size(),
+                    cp_rank=cp_group.rank(),
+                    interleaved=config.rotary_interleaved,
+                )
+            warnings.warn(
+                "TE fused THD RoPE assumes zigzag context-parallel layout. "
+                "Using unfused RoPE for the requested CP sequence layout."
             )
     # use unfused implementation
     if cu_seqlens is None:
@@ -396,6 +449,7 @@ def apply_rotary_pos_emb(
             mla_rotary_interleaved=mla_rotary_interleaved,
             mscale=mscale,
             cp_group=cp_group,
+            cp_sequence_layout=cp_sequence_layout,
             inverse=inverse,
             mla_output_remove_interleaving=mla_output_remove_interleaving,
             max_seqlen=max_seqlen,

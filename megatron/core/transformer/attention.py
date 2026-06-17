@@ -11,6 +11,10 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import (
+    DEFAULT_CP_SEQUENCE_LAYOUT,
+    get_required_cp_sequence_layout_for_layer,
+)
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -313,6 +317,7 @@ class Attention(MegatronModule, ABC):
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
+        self.cp_comm_type = cp_comm_type
         self.batch_invariant_mode = config.batch_invariant_mode
 
         assert self.config.kv_channels is not None
@@ -438,6 +443,15 @@ class Attention(MegatronModule, ABC):
         if getattr(self.config, 'rotary_base_per_layer', None):
             rotary_base = self.config.rotary_base_per_layer[self.layer_number - 1]
             self._build_per_layer_rotary_pos_emb(rotary_base)
+
+    def _get_cp_sequence_layout(self):
+        """Return the concrete CP sequence layout this attention module expects."""
+        return (
+            get_required_cp_sequence_layout_for_layer(
+                self, self.config, cp_comm_type=self.cp_comm_type
+            )
+            or DEFAULT_CP_SEQUENCE_LAYOUT
+        )
 
     def _build_per_layer_rotary_pos_emb(self, rotary_base: float) -> None:
         """Build self.rotary_pos_emb using a layer-specific rotary base."""
@@ -1314,6 +1328,7 @@ class Attention(MegatronModule, ABC):
             not self.config.flash_decode or inference_context is None
         ):
             q_pos_emb, k_pos_emb = rotary_pos_emb
+            cp_sequence_layout = self._get_cp_sequence_layout()
 
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -1341,6 +1356,7 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_q,
                             mscale=_yarn_get_concentration_factor_from_config(self.config),
                             cp_group=self.pg_collection.cp,
+                            cp_sequence_layout=cp_sequence_layout,
                             max_seqlen=rope_max_seqlen_q,
                         )
                     else:
@@ -1355,6 +1371,7 @@ class Attention(MegatronModule, ABC):
                         cu_seqlens=cu_seqlens_kv,
                         mscale=_yarn_get_concentration_factor_from_config(self.config),
                         cp_group=self.pg_collection.cp,
+                        cp_sequence_layout=cp_sequence_layout,
                         max_seqlen=rope_max_seqlen_kv,
                     )
             else:
