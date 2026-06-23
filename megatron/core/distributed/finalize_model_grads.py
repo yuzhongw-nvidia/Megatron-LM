@@ -24,7 +24,7 @@ from .. import parallel_state
 from ..transformer.moe.moe_utils import get_updated_expert_bias
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import (
-    all_reduce_tensor_in_chunks,
+    all_reduce_tensor_in_embedding_group,
     get_attr_wrapped_model,
     get_model_config,
     get_pg_size,
@@ -256,7 +256,7 @@ def _allreduce_embedding_grad(
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
-        all_reduce_tensor_in_chunks(grad, group=embd_group)
+        all_reduce_tensor_in_embedding_group(grad, group=embd_group)
         setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 

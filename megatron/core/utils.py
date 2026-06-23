@@ -55,7 +55,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_ALL_REDUCE_CHUNK_NUMEL = 32 * 1024 * 1024
+_DEFAULT_LARGE_TENSOR_COMM_CHUNK_NUMEL = 32 * 1024 * 1024
 
 try:
     # Register the TE CUDA kernels
@@ -102,19 +102,21 @@ class ExperimentalNotEnabledError(Exception):
     """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
 
 
-def all_reduce_tensor_in_chunks(tensor: torch.Tensor, group=None) -> None:
-    """All-reduce a tensor, splitting very large contiguous tensors into chunks.
-
-    Some model-parallel embedding paths reduce full vocab x hidden tensors that
-    can exceed 1GB. Splitting those reductions avoids a single oversized NCCL
-    operation while preserving the in-place all-reduce contract.
-    """
-    chunk_numel = int(
+def _get_large_tensor_comm_chunk_numel() -> int:
+    return int(
         os.getenv(
-            "MEGATRON_LARGE_TENSOR_ALL_REDUCE_CHUNK_NUMEL",
-            _DEFAULT_ALL_REDUCE_CHUNK_NUMEL,
+            "MEGATRON_LARGE_TENSOR_COMM_CHUNK_NUMEL",
+            os.getenv(
+                "MEGATRON_LARGE_TENSOR_ALL_REDUCE_CHUNK_NUMEL",
+                _DEFAULT_LARGE_TENSOR_COMM_CHUNK_NUMEL,
+            ),
         )
     )
+
+
+def all_reduce_tensor_in_chunks(tensor: torch.Tensor, group=None) -> None:
+    """All-reduce a tensor, splitting very large contiguous tensors into chunks."""
+    chunk_numel = _get_large_tensor_comm_chunk_numel()
     if chunk_numel <= 0 or tensor.numel() <= chunk_numel or not tensor.is_contiguous():
         torch.distributed.all_reduce(tensor, group=group)
         return
@@ -122,6 +124,68 @@ def all_reduce_tensor_in_chunks(tensor: torch.Tensor, group=None) -> None:
     flattened = tensor.view(-1)
     for start in range(0, flattened.numel(), chunk_numel):
         torch.distributed.all_reduce(flattened[start : start + chunk_numel], group=group)
+
+
+def copy_tensor_from_embedding_group_source(tensor: torch.Tensor, group) -> None:
+    """Copy a tensor from the first rank of a two-rank embedding group.
+
+    The default embedding initialization path uses an all-reduce over the
+    embedding process group. For PP2 MTP models, that group is a remote pair and
+    the destination rank starts from zeros, so a point-to-point copy over the
+    default process group is equivalent and avoids a separate NCCL subgroup
+    collective.
+    """
+    ranks = torch.distributed.get_process_group_ranks(group)
+    rank = torch.distributed.get_rank()
+    if len(ranks) != 2 or rank not in ranks or not tensor.is_contiguous():
+        all_reduce_tensor_in_chunks(tensor, group=group)
+        return
+
+    src_rank = ranks[0]
+    dst_rank = ranks[1]
+    chunk_numel = _get_large_tensor_comm_chunk_numel()
+    if chunk_numel <= 0:
+        chunk_numel = tensor.numel()
+    flattened = tensor.view(-1)
+    for start in range(0, flattened.numel(), chunk_numel):
+        chunk = flattened[start : start + chunk_numel]
+        if rank == src_rank:
+            reqs = torch.distributed.batch_isend_irecv(
+                [torch.distributed.P2POp(torch.distributed.isend, chunk, dst_rank)]
+            )
+        else:
+            reqs = torch.distributed.batch_isend_irecv(
+                [torch.distributed.P2POp(torch.distributed.irecv, chunk, src_rank)]
+            )
+        for req in reqs:
+            req.wait()
+
+
+def all_reduce_tensor_in_embedding_group(tensor: torch.Tensor, group) -> None:
+    """All-reduce a tensor over a two-rank embedding group using default-PG P2P."""
+    ranks = torch.distributed.get_process_group_ranks(group)
+    rank = torch.distributed.get_rank()
+    if len(ranks) != 2 or rank not in ranks or not tensor.is_contiguous():
+        all_reduce_tensor_in_chunks(tensor, group=group)
+        return
+
+    peer_rank = ranks[1] if rank == ranks[0] else ranks[0]
+    chunk_numel = _get_large_tensor_comm_chunk_numel()
+    if chunk_numel <= 0:
+        chunk_numel = tensor.numel()
+    flattened = tensor.view(-1)
+    for start in range(0, flattened.numel(), chunk_numel):
+        chunk = flattened[start : start + chunk_numel]
+        peer_chunk = torch.empty_like(chunk)
+        reqs = torch.distributed.batch_isend_irecv(
+            [
+                torch.distributed.P2POp(torch.distributed.isend, chunk, peer_rank),
+                torch.distributed.P2POp(torch.distributed.irecv, peer_chunk, peer_rank),
+            ]
+        )
+        for req in reqs:
+            req.wait()
+        chunk.add_(peer_chunk)
 
 
 def experimental_fn(introduced_with_version: str):
