@@ -10,6 +10,7 @@ import inspect
 import logging
 import math
 import operator
+import os
 import queue
 import socket
 import sys
@@ -54,6 +55,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_ALL_REDUCE_CHUNK_NUMEL = 32 * 1024 * 1024
+
 try:
     # Register the TE CUDA kernels
     import transformer_engine  # pylint: disable=unused-import
@@ -97,6 +100,28 @@ def null_decorator(*args, **kwargs):
 
 class ExperimentalNotEnabledError(Exception):
     """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
+
+
+def all_reduce_tensor_in_chunks(tensor: torch.Tensor, group=None) -> None:
+    """All-reduce a tensor, splitting very large contiguous tensors into chunks.
+
+    Some model-parallel embedding paths reduce full vocab x hidden tensors that
+    can exceed 1GB. Splitting those reductions avoids a single oversized NCCL
+    operation while preserving the in-place all-reduce contract.
+    """
+    chunk_numel = int(
+        os.getenv(
+            "MEGATRON_LARGE_TENSOR_ALL_REDUCE_CHUNK_NUMEL",
+            _DEFAULT_ALL_REDUCE_CHUNK_NUMEL,
+        )
+    )
+    if chunk_numel <= 0 or tensor.numel() <= chunk_numel or not tensor.is_contiguous():
+        torch.distributed.all_reduce(tensor, group=group)
+        return
+
+    flattened = tensor.view(-1)
+    for start in range(0, flattened.numel(), chunk_numel):
+        torch.distributed.all_reduce(flattened[start : start + chunk_numel], group=group)
 
 
 def experimental_fn(introduced_with_version: str):
