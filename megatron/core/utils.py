@@ -132,8 +132,7 @@ def copy_tensor_from_embedding_group_source(tensor: torch.Tensor, group) -> None
     The default embedding initialization path uses an all-reduce over the
     embedding process group. For PP2 MTP models, that group is a remote pair and
     the destination rank starts from zeros, so a point-to-point copy over the
-    default process group is equivalent and avoids a separate NCCL subgroup
-    collective.
+    same pair group is equivalent and avoids a large NCCL subgroup collective.
     """
     ranks = torch.distributed.get_process_group_ranks(group)
     rank = torch.distributed.get_rank()
@@ -151,18 +150,26 @@ def copy_tensor_from_embedding_group_source(tensor: torch.Tensor, group) -> None
         chunk = flattened[start : start + chunk_numel]
         if rank == src_rank:
             reqs = torch.distributed.batch_isend_irecv(
-                [torch.distributed.P2POp(torch.distributed.isend, chunk, dst_rank)]
+                [
+                    torch.distributed.P2POp(
+                        torch.distributed.isend, chunk, dst_rank, group=group
+                    )
+                ]
             )
         else:
             reqs = torch.distributed.batch_isend_irecv(
-                [torch.distributed.P2POp(torch.distributed.irecv, chunk, src_rank)]
+                [
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv, chunk, src_rank, group=group
+                    )
+                ]
             )
         for req in reqs:
             req.wait()
 
 
 def all_reduce_tensor_in_embedding_group(tensor: torch.Tensor, group) -> None:
-    """All-reduce a tensor over a two-rank embedding group using default-PG P2P."""
+    """All-reduce a tensor over a two-rank embedding group using pair-group P2P."""
     ranks = torch.distributed.get_process_group_ranks(group)
     rank = torch.distributed.get_rank()
     if len(ranks) != 2 or rank not in ranks or not tensor.is_contiguous():
@@ -179,8 +186,12 @@ def all_reduce_tensor_in_embedding_group(tensor: torch.Tensor, group) -> None:
         peer_chunk = torch.empty_like(chunk)
         reqs = torch.distributed.batch_isend_irecv(
             [
-                torch.distributed.P2POp(torch.distributed.isend, chunk, peer_rank),
-                torch.distributed.P2POp(torch.distributed.irecv, peer_chunk, peer_rank),
+                torch.distributed.P2POp(
+                    torch.distributed.isend, chunk, peer_rank, group=group
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, peer_chunk, peer_rank, group=group
+                ),
             ]
         )
         for req in reqs:
