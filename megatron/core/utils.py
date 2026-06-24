@@ -114,6 +114,11 @@ def _get_large_tensor_comm_chunk_numel() -> int:
     )
 
 
+def _use_blocking_embedding_group_p2p() -> bool:
+    value = os.getenv("MEGATRON_EMBEDDING_GROUP_BLOCKING_P2P", "0")
+    return value.lower() in ("1", "true", "yes", "on")
+
+
 def all_reduce_tensor_in_chunks(tensor: torch.Tensor, group=None) -> None:
     """All-reduce a tensor, splitting very large contiguous tensors into chunks."""
     chunk_numel = _get_large_tensor_comm_chunk_numel()
@@ -148,6 +153,12 @@ def copy_tensor_from_embedding_group_source(tensor: torch.Tensor, group) -> None
     flattened = tensor.view(-1)
     for start in range(0, flattened.numel(), chunk_numel):
         chunk = flattened[start : start + chunk_numel]
+        if _use_blocking_embedding_group_p2p():
+            if rank == src_rank:
+                torch.distributed.send(chunk, dst_rank, group=group)
+            else:
+                torch.distributed.recv(chunk, src_rank, group=group)
+            continue
         if rank == src_rank:
             reqs = torch.distributed.batch_isend_irecv(
                 [
@@ -184,6 +195,15 @@ def all_reduce_tensor_in_embedding_group(tensor: torch.Tensor, group) -> None:
     for start in range(0, flattened.numel(), chunk_numel):
         chunk = flattened[start : start + chunk_numel]
         peer_chunk = torch.empty_like(chunk)
+        if _use_blocking_embedding_group_p2p():
+            if rank == ranks[0]:
+                torch.distributed.send(chunk, peer_rank, group=group)
+                torch.distributed.recv(peer_chunk, peer_rank, group=group)
+            else:
+                torch.distributed.recv(peer_chunk, peer_rank, group=group)
+                torch.distributed.send(chunk, peer_rank, group=group)
+            chunk.add_(peer_chunk)
+            continue
         reqs = torch.distributed.batch_isend_irecv(
             [
                 torch.distributed.P2POp(
