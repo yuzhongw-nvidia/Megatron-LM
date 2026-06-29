@@ -1,5 +1,9 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+import os
 from functools import partial
+
+import torch
+import torch.nn.functional as F
 
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
@@ -60,6 +64,36 @@ moe = get_moe_module_spec(
 
 # Inference-optimized MoE spec
 moe_inference = get_inference_optimized_moe_spec()
+
+
+class DebugTorchRMSNorm(torch.nn.Module):
+    """Debug-only RMSNorm replacement that keeps Megatron's parameter contract."""
+
+    def __init__(self, config, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        if config.normalization != "RMSNorm":
+            raise ValueError("DebugTorchRMSNorm only supports RMSNorm configs")
+        if config.layernorm_zero_centered_gamma:
+            raise ValueError("DebugTorchRMSNorm does not support zero-centered gamma")
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+        if config.sequence_parallel:
+            setattr(self.weight, "sequence_parallel", True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(x, (self.hidden_size,), self.weight, self.eps)
+
+
+def _dsa_input_layernorm():
+    if os.environ.get("MCORE_DSV4_DEBUG_TORCH_DSA_INPUT_RMSNORM", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return DebugTorchRMSNorm
+    return TENorm
 
 
 # MTP block spec - provides norms and projection only.
@@ -138,7 +172,7 @@ hybrid_stack_spec = ModuleSpec(
         dsa_layer=ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm,
+                input_layernorm=_dsa_input_layernorm(),
                 self_attention=ModuleSpec(
                     module=MLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
