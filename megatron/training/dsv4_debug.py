@@ -69,7 +69,7 @@ def _jsonable(value: Any) -> Any:
 
 
 def _tensor_hash(tensor: torch.Tensor) -> str:
-    cpu = tensor.detach().contiguous().cpu()
+    cpu = tensor.detach().contiguous().cpu().reshape(-1)
     return hashlib.sha256(cpu.view(torch.uint8).numpy().tobytes()).hexdigest()
 
 
