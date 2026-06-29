@@ -56,6 +56,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.dsv4_debug import log_batch, log_forward_output, log_loss
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -274,6 +275,7 @@ def loss_func(
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+    log_loss(loss_mask=loss_mask, output_tensor=output_tensor, loss=loss, num_tokens=num_tokens)
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -328,6 +330,15 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
             get_batch(data_iterator, vp_stage)
         )
+        log_batch(
+            tokens=tokens,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
     timers('batch-generator').stop()
 
     with stimer:
@@ -355,6 +366,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
             )
+            log_forward_output(output_tensor)
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
