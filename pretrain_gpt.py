@@ -61,6 +61,7 @@ from megatron.training.dsv4_router_replay_debug import (
     prepare_router_replay,
     save_router_replay_record,
 )
+from megatron.training.module_grad_logging import set_module_grad_valid_mask
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -349,6 +350,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             loss_mask=loss_mask,
             position_ids=position_ids,
         )
+        set_module_grad_valid_mask(loss_mask)
     timers('batch-generator').stop()
 
     with stimer:

@@ -67,14 +67,12 @@ def _iter_named_tensors(obj: Any, prefix: str = "") -> Iterable[tuple[str, torch
             yield from _iter_named_tensors(getattr(obj, field.name), next_prefix)
 
 
-def _summary(tensor: torch.Tensor) -> dict[str, Any]:
+_CURRENT_VALID_MASK: torch.Tensor | None = None
+
+
+def _numeric_summary(tensor: torch.Tensor, prefix: str = "") -> dict[str, Any]:
     detached = tensor.detach()
-    out: dict[str, Any] = {
-        "shape": list(detached.shape),
-        "dtype": str(detached.dtype),
-        "device": str(detached.device),
-        "numel": int(detached.numel()),
-    }
+    out: dict[str, Any] = {}
     if detached.numel() == 0:
         return out
     if detached.is_floating_point() or detached.is_complex():
@@ -83,30 +81,64 @@ def _summary(tensor: torch.Tensor) -> dict[str, Any]:
         safe_values = values[finite] if finite.any() else values.reshape(-1)[:0]
         out.update(
             {
-                "sum": float(values.sum().item()),
-                "mean": float(values.mean().item()),
-                "std": float(values.std(unbiased=False).item()),
-                "min": float(values.min().item()),
-                "max": float(values.max().item()),
-                "abs_max": float(values.abs().max().item()),
-                "l2": float(torch.linalg.vector_norm(values).item()),
-                "nan_count": int(torch.isnan(values).sum().item()),
-                "inf_count": int(torch.isinf(values).sum().item()),
-                "finite_count": int(finite.sum().item()),
+                f"{prefix}sum": float(values.sum().item()),
+                f"{prefix}mean": float(values.mean().item()),
+                f"{prefix}std": float(values.std(unbiased=False).item()),
+                f"{prefix}min": float(values.min().item()),
+                f"{prefix}max": float(values.max().item()),
+                f"{prefix}abs_max": float(values.abs().max().item()),
+                f"{prefix}l2": float(torch.linalg.vector_norm(values).item()),
+                f"{prefix}nan_count": int(torch.isnan(values).sum().item()),
+                f"{prefix}inf_count": int(torch.isinf(values).sum().item()),
+                f"{prefix}finite_count": int(finite.sum().item()),
             }
         )
         if safe_values.numel() > 0:
-            out["finite_mean"] = float(safe_values.mean().item())
-            out["finite_abs_max"] = float(safe_values.abs().max().item())
+            out[f"{prefix}finite_mean"] = float(safe_values.mean().item())
+            out[f"{prefix}finite_abs_max"] = float(safe_values.abs().max().item())
     else:
         values = detached.reshape(-1).to(torch.int64)
         out.update(
             {
-                "sum": int(values.sum().item()),
-                "min": int(values.min().item()),
-                "max": int(values.max().item()),
+                f"{prefix}sum": int(values.sum().item()),
+                f"{prefix}min": int(values.min().item()),
+                f"{prefix}max": int(values.max().item()),
             }
         )
+    return out
+
+
+def _valid_view(tensor: torch.Tensor) -> tuple[torch.Tensor, int] | None:
+    if _CURRENT_VALID_MASK is None or tensor.dim() == 0:
+        return None
+    mask = _CURRENT_VALID_MASK.detach().reshape(-1).to(torch.bool)
+    if mask.numel() == 0:
+        return None
+    detached = tensor.detach()
+    if detached.numel() == mask.numel():
+        return detached.reshape(-1)[mask], int(mask.sum().item())
+    if detached.dim() >= 2 and detached.numel() % detached.shape[-1] == 0:
+        rows = detached.reshape(-1, detached.shape[-1])
+        if rows.shape[0] == mask.numel():
+            return rows[mask], int(mask.sum().item())
+    return None
+
+
+def _summary(tensor: torch.Tensor) -> dict[str, Any]:
+    detached = tensor.detach()
+    out: dict[str, Any] = {
+        "shape": list(detached.shape),
+        "dtype": str(detached.dtype),
+        "device": str(detached.device),
+        "numel": int(detached.numel()),
+    }
+    out.update(_numeric_summary(detached))
+    valid_result = _valid_view(detached)
+    if valid_result is not None:
+        valid, valid_tokens = valid_result
+        out["valid_numel"] = int(valid.numel())
+        out["valid_tokens"] = valid_tokens
+        out.update(_numeric_summary(valid, prefix="valid_"))
     return out
 
 
@@ -244,3 +276,16 @@ def disable_module_grad_logging() -> None:
 def save_module_grads(iteration: int) -> None:
     assert _LOGGER is not None
     _LOGGER.save(iteration)
+
+
+def set_module_grad_valid_mask(loss_mask: torch.Tensor | None) -> None:
+    global _CURRENT_VALID_MASK
+    if not module_grad_logging_enabled() or loss_mask is None:
+        _CURRENT_VALID_MASK = None
+        return
+    _CURRENT_VALID_MASK = loss_mask.detach().to(torch.bool)
+
+
+def clear_module_grad_valid_mask() -> None:
+    global _CURRENT_VALID_MASK
+    _CURRENT_VALID_MASK = None

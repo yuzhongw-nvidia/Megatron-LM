@@ -139,6 +139,7 @@ from megatron.training.checkpointing import (
 )
 from megatron.training.dsv4_router_replay_debug import cleanup_router_replay
 from megatron.training.module_grad_logging import (
+    clear_module_grad_valid_mask,
     disable_module_grad_logging,
     enable_module_grad_logging,
     save_module_grads,
@@ -2588,6 +2589,7 @@ def train_step(
         if save_module_grads_in_this_iteration:
             save_module_grads(iteration + 1)
             disable_module_grad_logging()
+            clear_module_grad_valid_mask()
 
         # Reset force_all_reduce field.
         for model_chunk in model:
