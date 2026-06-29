@@ -760,7 +760,20 @@ class TopKRouter(Router):
             # logits in processed by apply_random_logits or apply_biased_logits
             _, top_indices = torch.topk(logits, k=self.topk, dim=1)
 
-        probs = scores.gather(1, top_indices)
+        def _compute_hash_topk(
+            scores: torch.Tensor,
+            topk: int,
+            num_groups: Optional[int] = None,
+            group_topk: Optional[int] = None,
+        ):
+            return scores.gather(1, top_indices), top_indices
+
+        if self.router_replay is not None:
+            probs, top_indices = self.router_replay.get_replay_topk(
+                scores, self.topk, default_compute_topk=_compute_hash_topk
+            )
+        else:
+            probs = scores.gather(1, top_indices)
         if self.score_function != "softmax":
             probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
 

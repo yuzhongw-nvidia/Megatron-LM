@@ -137,6 +137,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
+from megatron.training.dsv4_router_replay_debug import cleanup_router_replay
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -2565,6 +2566,7 @@ def train_step(
             p2p_communicator=p2p_communicator,
             pg_collection=schedule_pg_collection,
         )
+        cleanup_router_replay()
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()

@@ -734,7 +734,7 @@ def topk_routing_with_score_function(
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
-    if fused:
+    if fused and router_replay is None:
         if not HAVE_TE or fused_topk_with_score_function is None:
             raise ValueError(
                 "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
