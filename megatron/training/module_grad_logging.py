@@ -142,6 +142,10 @@ def _summary(tensor: torch.Tensor) -> dict[str, Any]:
     return out
 
 
+def _sanitize_filename(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "tensor"
+
+
 def _summaries(obj: Any, prefix: str) -> list[dict[str, Any]]:
     return [
         {"path": name, **_summary(tensor)}
@@ -162,8 +166,14 @@ class ModuleGradLogger:
         )
         self._name_regex = re.compile(pattern)
         self._max_events = int(os.environ.get("MCORE_DSV4_MODULE_GRAD_MAX_EVENTS", "20000"))
+        self._dump_tensors = _truthy(os.environ.get("MCORE_DSV4_MODULE_GRAD_DUMP_TENSORS"))
+        dump_name_pattern = os.environ.get("MCORE_DSV4_MODULE_GRAD_DUMP_NAME_REGEX", r"$^")
+        dump_path_pattern = os.environ.get("MCORE_DSV4_MODULE_GRAD_DUMP_PATH_REGEX", r".*")
+        self._dump_name_regex = re.compile(dump_name_pattern)
+        self._dump_path_regex = re.compile(dump_path_pattern)
         self._hooks = []
         self._events: list[dict[str, Any]] = []
+        self._tensor_dumps: list[tuple[str, torch.Tensor]] = []
         self._call_counters: defaultdict[tuple[str, str], int] = defaultdict(int)
 
     def _module_class(self, module: torch.nn.Module) -> str:
@@ -180,19 +190,61 @@ class ModuleGradLogger:
         self._call_counters[key] += 1
         return idx
 
+    def _should_dump_tensor(self, module_name: str, tensor_path: str) -> bool:
+        return (
+            self._dump_tensors
+            and self._dump_name_regex.search(module_name) is not None
+            and self._dump_path_regex.search(tensor_path) is not None
+        )
+
+    def _summaries_with_optional_dump(
+        self,
+        obj: Any,
+        prefix: str,
+        module_name: str,
+        phase: str,
+        call_index: int,
+    ) -> list[dict[str, Any]]:
+        rows = []
+        for tensor_path, tensor in _iter_named_tensors(obj, prefix):
+            if tensor is None:
+                continue
+            row = {"path": tensor_path, **_summary(tensor)}
+            if self._should_dump_tensor(module_name, tensor_path):
+                file_name = (
+                    f"{len(self._tensor_dumps):05d}_{phase}_"
+                    f"{_sanitize_filename(module_name)}_call{call_index}_"
+                    f"{_sanitize_filename(tensor_path)}.pt"
+                )
+                row["tensor_file"] = file_name
+                self._tensor_dumps.append((file_name, tensor.detach().cpu()))
+            rows.append(row)
+        return rows
+
     def _make_forward_hook(self, model_chunk_name: str, module_name: str, module_class: str):
         def hook(_, args, kwargs, output):
+            call_index = self._call_index(module_name, "forward")
             self._append_event(
                 {
                     "phase": "forward",
                     "model_chunk": model_chunk_name,
                     "module": module_name,
                     "module_class": module_class,
-                    "call_index": self._call_index(module_name, "forward"),
+                    "call_index": call_index,
                     "tensors": [
-                        *_summaries(args if isinstance(args, tuple) else (args,), "args"),
-                        *_summaries(kwargs, "kwargs"),
-                        *_summaries(output, "output"),
+                        *self._summaries_with_optional_dump(
+                            args if isinstance(args, tuple) else (args,),
+                            "args",
+                            module_name,
+                            "forward",
+                            call_index,
+                        ),
+                        *self._summaries_with_optional_dump(
+                            kwargs, "kwargs", module_name, "forward", call_index
+                        ),
+                        *self._summaries_with_optional_dump(
+                            output, "output", module_name, "forward", call_index
+                        ),
                     ],
                 }
             )
@@ -201,16 +253,21 @@ class ModuleGradLogger:
 
     def _make_backward_hook(self, model_chunk_name: str, module_name: str, module_class: str):
         def hook(_, grad_input, grad_output):
+            call_index = self._call_index(module_name, "backward")
             self._append_event(
                 {
                     "phase": "backward",
                     "model_chunk": model_chunk_name,
                     "module": module_name,
                     "module_class": module_class,
-                    "call_index": self._call_index(module_name, "backward"),
+                    "call_index": call_index,
                     "tensors": [
-                        *_summaries(grad_input, "grad_input"),
-                        *_summaries(grad_output, "grad_output"),
+                        *self._summaries_with_optional_dump(
+                            grad_input, "grad_input", module_name, "backward", call_index
+                        ),
+                        *self._summaries_with_optional_dump(
+                            grad_output, "grad_output", module_name, "backward", call_index
+                        ),
                     ],
                 }
             )
@@ -244,7 +301,7 @@ class ModuleGradLogger:
         self._hooks.clear()
 
     def save(self, iteration: int) -> None:
-        if not self._events:
+        if not self._events and not self._tensor_dumps:
             return
         out_dir = os.path.join(
             self._save_dir, "module_grads", f"iter_{iteration:07d}"
@@ -254,7 +311,23 @@ class ModuleGradLogger:
         with open(path, "w", encoding="utf-8") as f:
             for event in self._events:
                 f.write(json.dumps(event, sort_keys=True) + "\n")
+        if self._tensor_dumps:
+            tensor_dir = os.path.join(
+                self._save_dir,
+                "module_grad_tensors",
+                f"iter_{iteration:07d}",
+                f"rank{_rank():05d}",
+            )
+            os.makedirs(tensor_dir, exist_ok=True)
+            if _CURRENT_VALID_MASK is not None:
+                torch.save(
+                    _CURRENT_VALID_MASK.detach().cpu(),
+                    os.path.join(tensor_dir, "valid_mask.pt"),
+                )
+            for file_name, tensor in self._tensor_dumps:
+                torch.save(tensor, os.path.join(tensor_dir, file_name))
         self._events.clear()
+        self._tensor_dumps.clear()
         self._call_counters.clear()
 
 
