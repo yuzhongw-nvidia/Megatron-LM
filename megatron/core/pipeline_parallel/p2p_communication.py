@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+import os
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -14,6 +15,47 @@ from megatron.core.utils import nvtx_decorator
 Shape = Union[List[int], torch.Size]
 
 
+def _get_pipeline_p2p_chunk_numel() -> int:
+    """Return the optional pipeline P2P chunk size in elements."""
+    chunk_numel = os.getenv(
+        "MEGATRON_PIPELINE_P2P_CHUNK_NUMEL",
+        os.getenv("MEGATRON_LARGE_TENSOR_ALL_REDUCE_CHUNK_NUMEL", ""),
+    )
+    if not chunk_numel:
+        return 0
+    try:
+        return max(int(chunk_numel), 0)
+    except ValueError:
+        return 0
+
+
+def _append_p2p_ops(
+    ops: List[torch.distributed.P2POp],
+    p2p_op,
+    tensor: torch.Tensor,
+    peer_rank: int,
+    group: torch.distributed.ProcessGroup,
+    chunk_numel: int,
+) -> None:
+    """Append one or more P2P ops for a tensor.
+
+    Some fabrics are sensitive to very large pipeline activation P2P transfers.
+    When chunking is enabled, split the flat tensor into a stable sequence of
+    P2POp entries while preserving the original send/recv ordering.
+    """
+    if chunk_numel <= 0 or tensor.numel() <= chunk_numel:
+        ops.append(torch.distributed.P2POp(p2p_op, tensor, peer_rank, group))
+        return
+
+    if not tensor.is_contiguous():
+        raise RuntimeError("Pipeline P2P chunking requires contiguous tensors.")
+
+    flat_tensor = tensor.view(-1)
+    for chunk_start in range(0, flat_tensor.numel(), chunk_numel):
+        chunk = flat_tensor.narrow(0, chunk_start, min(chunk_numel, flat_tensor.numel() - chunk_start))
+        ops.append(torch.distributed.P2POp(p2p_op, chunk, peer_rank, group))
+
+
 def _batched_p2p_ops(
     *,
     tensor_send_prev: Optional[torch.Tensor],
@@ -25,26 +67,43 @@ def _batched_p2p_ops(
     next_pipeline_rank: int,
 ):
     ops = []
+    chunk_numel = _get_pipeline_p2p_chunk_numel()
     if tensor_send_prev is not None:
-        send_prev_op = torch.distributed.P2POp(
-            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
+        _append_p2p_ops(
+            ops,
+            torch.distributed.isend,
+            tensor_send_prev,
+            prev_pipeline_rank,
+            group,
+            chunk_numel,
         )
-        ops.append(send_prev_op)
     if tensor_recv_prev is not None:
-        recv_prev_op = torch.distributed.P2POp(
-            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
+        _append_p2p_ops(
+            ops,
+            torch.distributed.irecv,
+            tensor_recv_prev,
+            prev_pipeline_rank,
+            group,
+            chunk_numel,
         )
-        ops.append(recv_prev_op)
     if tensor_send_next is not None:
-        send_next_op = torch.distributed.P2POp(
-            torch.distributed.isend, tensor_send_next, next_pipeline_rank, group
+        _append_p2p_ops(
+            ops,
+            torch.distributed.isend,
+            tensor_send_next,
+            next_pipeline_rank,
+            group,
+            chunk_numel,
         )
-        ops.append(send_next_op)
     if tensor_recv_next is not None:
-        recv_next_op = torch.distributed.P2POp(
-            torch.distributed.irecv, tensor_recv_next, next_pipeline_rank, group
+        _append_p2p_ops(
+            ops,
+            torch.distributed.irecv,
+            tensor_recv_next,
+            next_pipeline_rank,
+            group,
+            chunk_numel,
         )
-        ops.append(recv_next_op)
     if len(ops) > 0:
         reqs = torch.distributed.batch_isend_irecv(ops)
     else:
