@@ -10,6 +10,7 @@ import inspect
 import logging
 import math
 import operator
+import os
 import queue
 import socket
 import sys
@@ -54,6 +55,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_LARGE_TENSOR_COMM_CHUNK_NUMEL = 32 * 1024 * 1024
+
 try:
     # Register the TE CUDA kernels
     import transformer_engine  # pylint: disable=unused-import
@@ -97,6 +100,123 @@ def null_decorator(*args, **kwargs):
 
 class ExperimentalNotEnabledError(Exception):
     """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
+
+
+def _get_large_tensor_comm_chunk_numel() -> int:
+    return int(
+        os.getenv(
+            "MEGATRON_LARGE_TENSOR_COMM_CHUNK_NUMEL",
+            os.getenv(
+                "MEGATRON_LARGE_TENSOR_ALL_REDUCE_CHUNK_NUMEL",
+                _DEFAULT_LARGE_TENSOR_COMM_CHUNK_NUMEL,
+            ),
+        )
+    )
+
+
+def _use_blocking_embedding_group_p2p() -> bool:
+    value = os.getenv("MEGATRON_EMBEDDING_GROUP_BLOCKING_P2P", "0")
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+def all_reduce_tensor_in_chunks(tensor: torch.Tensor, group=None) -> None:
+    """All-reduce a tensor, splitting very large contiguous tensors into chunks."""
+    chunk_numel = _get_large_tensor_comm_chunk_numel()
+    if chunk_numel <= 0 or tensor.numel() <= chunk_numel or not tensor.is_contiguous():
+        torch.distributed.all_reduce(tensor, group=group)
+        return
+
+    flattened = tensor.view(-1)
+    for start in range(0, flattened.numel(), chunk_numel):
+        torch.distributed.all_reduce(flattened[start : start + chunk_numel], group=group)
+
+
+def copy_tensor_from_embedding_group_source(tensor: torch.Tensor, group) -> None:
+    """Copy a tensor from the first rank of a two-rank embedding group.
+
+    The default embedding initialization path uses an all-reduce over the
+    embedding process group. For PP2 MTP models, that group is a remote pair and
+    the destination rank starts from zeros, so a point-to-point copy over the
+    same pair group is equivalent and avoids a large NCCL subgroup collective.
+    """
+    ranks = torch.distributed.get_process_group_ranks(group)
+    rank = torch.distributed.get_rank()
+    if len(ranks) != 2 or rank not in ranks or not tensor.is_contiguous():
+        all_reduce_tensor_in_chunks(tensor, group=group)
+        return
+
+    src_rank = ranks[0]
+    dst_rank = ranks[1]
+    chunk_numel = _get_large_tensor_comm_chunk_numel()
+    if chunk_numel <= 0:
+        chunk_numel = tensor.numel()
+    flattened = tensor.view(-1)
+    for start in range(0, flattened.numel(), chunk_numel):
+        chunk = flattened[start : start + chunk_numel]
+        if _use_blocking_embedding_group_p2p():
+            if rank == src_rank:
+                torch.distributed.send(chunk, dst_rank, group=group)
+            else:
+                torch.distributed.recv(chunk, src_rank, group=group)
+            continue
+        if rank == src_rank:
+            reqs = torch.distributed.batch_isend_irecv(
+                [
+                    torch.distributed.P2POp(
+                        torch.distributed.isend, chunk, dst_rank, group=group
+                    )
+                ]
+            )
+        else:
+            reqs = torch.distributed.batch_isend_irecv(
+                [
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv, chunk, src_rank, group=group
+                    )
+                ]
+            )
+        for req in reqs:
+            req.wait()
+
+
+def all_reduce_tensor_in_embedding_group(tensor: torch.Tensor, group) -> None:
+    """All-reduce a tensor over a two-rank embedding group using pair-group P2P."""
+    ranks = torch.distributed.get_process_group_ranks(group)
+    rank = torch.distributed.get_rank()
+    if len(ranks) != 2 or rank not in ranks or not tensor.is_contiguous():
+        all_reduce_tensor_in_chunks(tensor, group=group)
+        return
+
+    peer_rank = ranks[1] if rank == ranks[0] else ranks[0]
+    chunk_numel = _get_large_tensor_comm_chunk_numel()
+    if chunk_numel <= 0:
+        chunk_numel = tensor.numel()
+    flattened = tensor.view(-1)
+    for start in range(0, flattened.numel(), chunk_numel):
+        chunk = flattened[start : start + chunk_numel]
+        peer_chunk = torch.empty_like(chunk)
+        if _use_blocking_embedding_group_p2p():
+            if rank == ranks[0]:
+                torch.distributed.send(chunk, peer_rank, group=group)
+                torch.distributed.recv(peer_chunk, peer_rank, group=group)
+            else:
+                torch.distributed.recv(peer_chunk, peer_rank, group=group)
+                torch.distributed.send(chunk, peer_rank, group=group)
+            chunk.add_(peer_chunk)
+            continue
+        reqs = torch.distributed.batch_isend_irecv(
+            [
+                torch.distributed.P2POp(
+                    torch.distributed.isend, chunk, peer_rank, group=group
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, peer_chunk, peer_rank, group=group
+                ),
+            ]
+        )
+        for req in reqs:
+            req.wait()
+        chunk.add_(peer_chunk)
 
 
 def experimental_fn(introduced_with_version: str):
