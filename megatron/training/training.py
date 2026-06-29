@@ -138,6 +138,12 @@ from megatron.training.checkpointing import (
     save_grads,
 )
 from megatron.training.dsv4_router_replay_debug import cleanup_router_replay
+from megatron.training.module_grad_logging import (
+    disable_module_grad_logging,
+    enable_module_grad_logging,
+    save_module_grads,
+    should_log_module_grads,
+)
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -2488,6 +2494,7 @@ def train_step(
     save_dgrads_in_this_iteration = (
         args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
     )
+    save_module_grads_in_this_iteration = should_log_module_grads(iteration + 1)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -2537,6 +2544,8 @@ def train_step(
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        if save_module_grads_in_this_iteration:
+            enable_module_grad_logging(model, args.save)
         if getattr(config, 'sequence_packing_scheduler', None) is not None:
             # Dynamic-CP / sequence packing (dev feature): produce the per-step packed
             # iterator and recompute num_microbatches. wrap_data_iterator returns a
@@ -2576,6 +2585,9 @@ def train_step(
         if save_dgrads_in_this_iteration:
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
+        if save_module_grads_in_this_iteration:
+            save_module_grads(iteration + 1)
+            disable_module_grad_logging()
 
         # Reset force_all_reduce field.
         for model_chunk in model:
