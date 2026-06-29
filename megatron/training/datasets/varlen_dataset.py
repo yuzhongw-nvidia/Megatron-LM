@@ -396,6 +396,31 @@ class VarlenDataset(SFTDataset):
         #     numerical reference for THD path verification (no scheduler,
         #     no dynamic-cp).
         if self.config.varlen_sbhd_validation:
+            preserve_mbs1_length = False
+            try:
+                from megatron.training import get_args
+
+                preserve_mbs1_length = getattr(get_args(), "micro_batch_size", None) == 1
+            except Exception:
+                preserve_mbs1_length = getattr(self.config, "micro_batch_size", None) == 1
+
+            # Diagnostic path: avoid sequence_length padding when MBS=1. Keep
+            # only the minimal MXFP8/HybridEP-friendly length alignment and mask its tail.
+            if preserve_mbs1_length:
+                aligned_len = ((valid_len + 127) // 128) * 128
+                pad_len = aligned_len - valid_len
+                input_ids = torch.tensor(tokens_list[:-1] + [pad] * pad_len, dtype=torch.int64)
+                labels = torch.tensor(targets_list[1:] + [pad] * pad_len, dtype=torch.int64)
+                loss_mask = torch.ones(aligned_len, dtype=torch.float32)
+                loss_mask[valid_len:] = 0.0
+                loss_mask[labels == IGNORE_INDEX] = 0.0
+                return {
+                    'tokens': input_ids,
+                    'labels': labels,
+                    'loss_mask': loss_mask,
+                    'position_ids': torch.arange(aligned_len, dtype=torch.int64),
+                }
+
             pad_len = max_len + 1 - len(tokens_list)
             if pad_len > 0:
                 tokens_list.extend([pad] * pad_len)
