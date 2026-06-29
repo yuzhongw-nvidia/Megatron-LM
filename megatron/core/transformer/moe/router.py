@@ -24,6 +24,7 @@ from megatron.core.transformer.moe.moe_utils import (
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
 )
+from megatron.core.transformer.moe.router_internal_logging import dump_router_internal_tensors
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -724,7 +725,12 @@ class TopKRouter(Router):
                     routing_map = routing_map & (~flat_mask).unsqueeze(-1)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
-    def _hash_routing(self, logits: torch.Tensor, input_ids: torch.Tensor):
+    def _hash_routing(
+        self,
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
         """Hash-based routing: expert indices come from the tid2eid lookup table.
 
         Scores are still computed from the gating logits for weight computation,
@@ -751,7 +757,8 @@ class TopKRouter(Router):
         # input_ids is [b, s] from the model, but hidden_states are [s, b, h]
         # and get flattened to [s*b, h]. Transpose to match.
         flat_ids = input_ids.T.reshape(-1)
-        top_indices = self.tid2eid[flat_ids].long()  # [num_tokens, topk]
+        hash_top_indices = self.tid2eid[flat_ids].long()  # [num_tokens, topk]
+        top_indices = hash_top_indices
         if (
             self.config.moe_router_force_load_balancing
             or self.config.moe_router_force_biased is not None
@@ -759,6 +766,7 @@ class TopKRouter(Router):
             # override top_indices with random topk indices
             # logits in processed by apply_random_logits or apply_biased_logits
             _, top_indices = torch.topk(logits, k=self.topk, dim=1)
+        forced_top_indices = top_indices
 
         def _compute_hash_topk(
             scores: torch.Tensor,
@@ -774,6 +782,7 @@ class TopKRouter(Router):
             )
         else:
             probs = scores.gather(1, top_indices)
+        probs_pre_norm = probs
         if self.score_function != "softmax":
             probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-20)
 
@@ -782,6 +791,25 @@ class TopKRouter(Router):
 
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+
+        valid_mask = None if padding_mask is None else ~padding_mask.to(torch.bool)
+        dump_router_internal_tensors(
+            self.layer_number,
+            "hash",
+            {
+                "logits_after_z_loss": logits,
+                "scores": scores,
+                "input_ids_flat": flat_ids,
+                "hash_top_indices": hash_top_indices,
+                "forced_top_indices": forced_top_indices,
+                "active_top_indices": top_indices,
+                "probs_pre_norm": probs_pre_norm,
+                "probs_post_norm": probs,
+                "routing_probs": routing_probs,
+                "routing_map": routing_map,
+                "valid_mask": valid_mask,
+            },
+        )
 
         return routing_probs, routing_map
 
@@ -823,7 +851,7 @@ class TopKRouter(Router):
                 "input_ids is required for hash-based routing but was None. "
                 "Ensure --moe-n-hash-layers is set correctly and input_ids are passed."
             )
-            probs, routing_map = self._hash_routing(logits, input_ids)
+            probs, routing_map = self._hash_routing(logits, input_ids, padding_mask=padding_mask)
         elif self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         else:

@@ -120,6 +120,11 @@ from megatron.core.process_groups_config import (
 )
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.router_internal_logging import (
+    disable_router_internal_logging,
+    enable_router_internal_logging,
+    should_log_router_internal,
+)
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.utils import (
     StragglerDetector,
@@ -2496,6 +2501,7 @@ def train_step(
         args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
     )
     save_module_grads_in_this_iteration = should_log_module_grads(iteration + 1)
+    save_router_internal_in_this_iteration = should_log_router_internal(iteration + 1)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -2547,6 +2553,8 @@ def train_step(
             enable_dgrad_logging(model, args.save)
         if save_module_grads_in_this_iteration:
             enable_module_grad_logging(model, args.save)
+        if save_router_internal_in_this_iteration:
+            enable_router_internal_logging(args.save, iteration + 1)
         if getattr(config, 'sequence_packing_scheduler', None) is not None:
             # Dynamic-CP / sequence packing (dev feature): produce the per-step packed
             # iterator and recompute num_microbatches. wrap_data_iterator returns a
@@ -2577,6 +2585,8 @@ def train_step(
             pg_collection=schedule_pg_collection,
         )
         cleanup_router_replay()
+        if save_router_internal_in_this_iteration:
+            disable_router_internal_logging()
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
