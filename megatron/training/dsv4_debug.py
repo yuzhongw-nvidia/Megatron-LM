@@ -120,6 +120,23 @@ def _tensor_summary(tensor: torch.Tensor | None, *, with_hash: bool = True) -> d
     return summary
 
 
+def _masked_tensor_summary(
+    tensor: torch.Tensor | None, mask: torch.Tensor | None, *, with_hash: bool = True
+) -> dict[str, Any] | None:
+    if tensor is None or mask is None:
+        return None
+    flat_tensor = tensor.detach().reshape(-1)
+    flat_mask = mask.detach().reshape(-1).to(torch.bool)
+    if flat_tensor.numel() != flat_mask.numel():
+        return {
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "mask_shape": list(mask.shape),
+            "error": "tensor/mask numel mismatch",
+        }
+    return _tensor_summary(flat_tensor[flat_mask], with_hash=with_hash)
+
+
 def _packed_seq_summary(packed_seq_params: Any) -> dict[str, Any] | None:
     if packed_seq_params is None:
         return None
@@ -180,6 +197,9 @@ def log_batch(
             "attention_mask": _tensor_summary(attention_mask, with_hash=False),
             "position_ids": _tensor_summary(position_ids),
             "padding_mask": _tensor_summary(padding_mask),
+            "valid_tokens": _masked_tensor_summary(tokens, loss_mask),
+            "valid_labels": _masked_tensor_summary(labels, loss_mask),
+            "valid_position_ids": _masked_tensor_summary(position_ids, loss_mask),
             "packed_seq_params": _packed_seq_summary(packed_seq_params),
         },
     )
