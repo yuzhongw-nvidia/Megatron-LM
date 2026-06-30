@@ -594,6 +594,48 @@ def _indexer_topk_core(
     return (topk_indices.view(b, sq, topk).int(), topk_length.view(b, sq), scores)
 
 
+def _sanitize_replayed_indexer_topk(
+    replayed_topk: Tensor,
+    current_topk: Tensor,
+    ratio: int,
+    *,
+    cu_seqlens_q: Optional[Tensor] = None,
+    cu_seqlens_q_unpadded: Optional[Tensor] = None,
+    cu_seqlens_kv: Optional[Tensor] = None,
+    max_seqlen_kv: Optional[int] = None,
+) -> Tensor:
+    """Mask replayed DSA indexer local ids to the current layout's legal row bounds."""
+    valid_slots = current_topk >= 0
+    is_thd = cu_seqlens_q is not None
+    if is_thd:
+        if cu_seqlens_kv is None:
+            raise ValueError("THD replay sanitization requires cu_seqlens_kv")
+        total_q = replayed_topk.shape[0]
+        row_idx = torch.arange(total_q, device=replayed_topk.device, dtype=torch.int32)
+        row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
+        pos_in_seq = row_idx - cu_seqlens_q[row_batch_ids].to(torch.int32)
+        pos_in_seq = torch.clamp(pos_in_seq, min=0)
+        seqlen_kv_per_row = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])[row_batch_ids]
+        row_bound = ((pos_in_seq + 1) // ratio).clamp(max=seqlen_kv_per_row).to(torch.int32)
+
+        if cu_seqlens_q_unpadded is not None:
+            real_seg_lens = cu_seqlens_q_unpadded[1:] - cu_seqlens_q_unpadded[:-1]
+            real_len_per_row = real_seg_lens[row_batch_ids].to(torch.int32)
+            padding_row_mask = pos_in_seq >= real_len_per_row
+            row_bound = torch.where(padding_row_mask, torch.zeros_like(row_bound), row_bound)
+        row_bound = row_bound.unsqueeze(-1)
+    else:
+        if replayed_topk.ndim != 3:
+            raise ValueError(f"SBHD replayed topk must be (b, sq, topk), got {replayed_topk.shape}")
+        _, sq, _ = replayed_topk.shape
+        q_idx = torch.arange(sq, device=replayed_topk.device, dtype=torch.int32)
+        row_bound = ((q_idx + 1) // ratio).clamp(max=int(max_seqlen_kv)).to(torch.int32)
+        row_bound = row_bound.view(1, sq, 1)
+
+    valid_slots = valid_slots & (replayed_topk >= 0) & (replayed_topk < row_bound)
+    return torch.where(valid_slots, replayed_topk, torch.full_like(replayed_topk, -1))
+
+
 def indexer_topk(
     q_indexer: Tensor,
     k_indexer: Tensor,
@@ -1079,7 +1121,21 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                 int(max_seqlen_compressed_idx) if max_seqlen_compressed_idx is not None else None
             ),
         )
+        current_topk_indices_cmp = topk_indices_cmp
         topk_indices_cmp = DSAIndexerReplay.apply(topk_indices_cmp)
+        topk_indices_cmp = _sanitize_replayed_indexer_topk(
+            topk_indices_cmp,
+            current_topk_indices_cmp,
+            ratio,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_q_unpadded=cu_seqlens_q_unpadded,
+            cu_seqlens_kv=cu_seqlens_compressed_idx,
+            max_seqlen_kv=(
+                int(max_seqlen_compressed_idx) if max_seqlen_compressed_idx is not None else None
+                if is_thd
+                else k_indexer_flat.shape[1]
+            ),
+        )
 
         # ---- 3. Combine indices (indexer first, then window) + globalize. ----
         if is_thd:
