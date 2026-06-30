@@ -29,6 +29,8 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.transformer.experimental_attention_variant.indexer_replay import DSAIndexerReplay
+
 # ---------------------------------------------------------------------------
 # Lazy kernel imports
 # ---------------------------------------------------------------------------
@@ -1077,6 +1079,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
                 int(max_seqlen_compressed_idx) if max_seqlen_compressed_idx is not None else None
             ),
         )
+        topk_indices_cmp = DSAIndexerReplay.apply(topk_indices_cmp)
 
         # ---- 3. Combine indices (indexer first, then window) + globalize. ----
         if is_thd:

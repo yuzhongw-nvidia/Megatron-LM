@@ -57,6 +57,10 @@ from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetC
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.dsv4_debug import log_batch, log_forward_output, log_loss
+from megatron.training.dsv4_indexer_replay_debug import (
+    prepare_indexer_replay,
+    save_indexer_replay_record,
+)
 from megatron.training.dsv4_router_replay_debug import (
     prepare_router_replay,
     save_router_replay_record,
@@ -350,6 +354,12 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             loss_mask=loss_mask,
             position_ids=position_ids,
         )
+        prepare_indexer_replay(
+            tokens=tokens,
+            labels=labels,
+            loss_mask=loss_mask,
+            position_ids=position_ids,
+        )
         set_module_grad_valid_mask(loss_mask)
     timers('batch-generator').stop()
 
@@ -379,6 +389,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 padding_mask=padding_mask,
             )
             save_router_replay_record()
+            save_indexer_replay_record()
             log_forward_output(output_tensor)
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses

@@ -142,6 +142,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
+from megatron.training.dsv4_indexer_replay_debug import cleanup_indexer_replay
 from megatron.training.dsv4_router_replay_debug import cleanup_router_replay
 from megatron.training.module_grad_logging import (
     clear_module_grad_valid_mask,
@@ -2585,6 +2586,7 @@ def train_step(
             pg_collection=schedule_pg_collection,
         )
         cleanup_router_replay()
+        cleanup_indexer_replay()
         if save_router_internal_in_this_iteration:
             disable_router_internal_logging()
         if save_activations_in_this_iteration:
