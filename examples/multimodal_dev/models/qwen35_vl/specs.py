@@ -19,6 +19,14 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+def _call_rope_helper(helper, *args, **kwargs):
+    """Call a RoPE helper while tolerating small API drift across MCore versions."""
+    from inspect import signature
+
+    supported = signature(helper).parameters
+    return helper(*args, **{k: v for k, v in kwargs.items() if k in supported})
+
+
 def _apply_rope_fp32(
     t,
     freqs,
@@ -47,7 +55,8 @@ def _apply_rope_fp32(
     t_fp32 = t.float()
 
     if cu_seqlens is None:
-        out = _apply_rotary_pos_emb_bshd(
+        out = _call_rope_helper(
+            _apply_rotary_pos_emb_bshd,
             t_fp32,
             freqs,
             rotary_interleaved=config.rotary_interleaved,
@@ -59,7 +68,8 @@ def _apply_rope_fp32(
     else:
         if cp_group is None:
             cp_group = parallel_state.get_context_parallel_group()
-        out = _apply_rotary_pos_emb_thd(
+        out = _call_rope_helper(
+            _apply_rotary_pos_emb_thd,
             t_fp32,
             cu_seqlens,
             freqs,
