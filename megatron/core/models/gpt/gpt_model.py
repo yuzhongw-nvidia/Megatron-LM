@@ -9,8 +9,8 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.context_parallel_layout import (
-    ContextParallelLayout,
-    convert_hidden_states_cp_sequence_layout,
+    CpPartitionMode,
+    convert_hidden_states_cp_partition_mode,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
@@ -115,7 +115,7 @@ class GPTModel(LanguageModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
-        cp_stage_entry_layout: Optional[str | ContextParallelLayout] = None,
+        cp_stage_entry_partition_mode: Optional[str] = None,
     ) -> None:
         super().__init__(config=config, pg_collection=pg_collection)
 
@@ -232,7 +232,7 @@ class GPTModel(LanguageModule):
             post_process=self.post_process,
             pg_collection=self.pg_collection,
             vp_stage=vp_stage,
-            cp_stage_entry_layout=cp_stage_entry_layout,
+            cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
         )
 
         if self.mtp_process:
@@ -315,13 +315,13 @@ class GPTModel(LanguageModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
-    def get_input_cp_sequence_layout(self) -> ContextParallelLayout:
-        """Return the CP sequence layout used for this model chunk's batch tensors."""
-        return self.decoder.get_input_cp_sequence_layout()
+    def get_input_cp_partition_mode(self) -> CpPartitionMode:
+        """Return the CP partition mode used for this model chunk's batch tensors."""
+        return self.decoder.get_input_cp_partition_mode()
 
-    def get_output_cp_sequence_layout(self) -> ContextParallelLayout:
-        """Return the CP sequence layout produced by this model chunk's decoder."""
-        return self.decoder.get_stage_exit_cp_sequence_layout()
+    def get_output_cp_partition_mode(self) -> CpPartitionMode:
+        """Return the CP partition mode produced by this model chunk's decoder."""
+        return self.decoder.get_stage_exit_cp_partition_mode()
 
     def _preprocess(
         self,
@@ -372,7 +372,7 @@ class GPTModel(LanguageModule):
         rotary_pos_sin = None
         # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
         rotary_pos_cos_sin = None
-        cp_sequence_layout = self.get_input_cp_sequence_layout()
+        cp_partition_mode = self.get_input_cp_partition_mode()
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             use_flash_infer_fused_rope = (
@@ -413,7 +413,7 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                    cp_sequence_layout=cp_sequence_layout,
+                    cp_partition_mode=cp_partition_mode,
                 )
         elif self.position_embedding_type == 'yarn' and not self.config.multi_latent_attention:
             if not InferenceMode.is_active() or not self.config.flash_decode:
@@ -425,7 +425,7 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                    cp_sequence_layout=cp_sequence_layout,
+                    cp_partition_mode=cp_partition_mode,
                 )
             else:
                 raise NotImplementedError(
@@ -438,7 +438,7 @@ class GPTModel(LanguageModule):
                     position_ids,
                     self.mrope_section,
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                    cp_sequence_layout=cp_sequence_layout,
+                    cp_partition_mode=cp_partition_mode,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
@@ -690,30 +690,30 @@ class GPTModel(LanguageModule):
             mtp_in_postprocess and not (in_inference_mode or is_spec_decode)
         )
         if needs_batch_layout:
-            target_layout = self.get_input_cp_sequence_layout()
-            current_layout = self.get_output_cp_sequence_layout()
-            if self.config.mtp_num_layers and target_layout != ContextParallelLayout.ZIGZAG:
+            target_partition_mode = self.get_input_cp_partition_mode()
+            current_partition_mode = self.get_output_cp_partition_mode()
+            if self.config.mtp_num_layers and target_partition_mode != "zigzag":
                 mtp_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
                 if mtp_cp_group is not None and mtp_cp_group.size() > 1:
                     raise NotImplementedError(
-                        "MTP with CP currently assumes zigzag sequence layout."
+                        "MTP with CP currently assumes zigzag CP partition mode."
                     )
-            hidden_states = convert_hidden_states_cp_sequence_layout(
+            hidden_states = convert_hidden_states_cp_partition_mode(
                 hidden_states,
                 self.pg_collection.cp,
-                source_layout=current_layout,
-                target_layout=target_layout,
+                source_partition_mode=current_partition_mode,
+                target_partition_mode=target_partition_mode,
                 packed_seq_params=packed_seq_params,
                 sequence_parallel=self.config.sequence_parallel,
                 tp_group=self.pg_collection.tp,
                 tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
             )
             if mhc_multistream is not None:
-                mhc_multistream = convert_hidden_states_cp_sequence_layout(
+                mhc_multistream = convert_hidden_states_cp_partition_mode(
                     mhc_multistream,
                     self.pg_collection.cp,
-                    source_layout=current_layout,
-                    target_layout=target_layout,
+                    source_partition_mode=current_partition_mode,
+                    target_partition_mode=target_partition_mode,
                     packed_seq_params=packed_seq_params,
                     sequence_parallel=self.config.sequence_parallel,
                     tp_group=self.pg_collection.tp,

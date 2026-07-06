@@ -18,7 +18,7 @@ import torch
 from torch import Tensor, nn
 
 from megatron.core import parallel_state
-from megatron.core.context_parallel_layout import DEFAULT_CP_SEQUENCE_LAYOUT
+from megatron.core.context_parallel_layout import DEFAULT_CP_PARTITION_MODE
 from megatron.core.models.common.embeddings.rope_utils import (  # for backward compatibility; pylint: disable=unused-import
     _apply_rotary_pos_emb_bshd,
     _apply_rotary_pos_emb_thd,
@@ -183,7 +183,7 @@ class RotaryEmbedding(nn.Module):
         offset: int = 0,
         packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
-        cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
+        cp_partition_mode=DEFAULT_CP_PARTITION_MODE,
     ) -> Tensor:
         """Forward pass of RoPE embedding.
 
@@ -204,7 +204,7 @@ class RotaryEmbedding(nn.Module):
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
             emb = get_pos_emb_on_this_cp_rank(
-                emb, 0, cp_group, cp_sequence_layout=cp_sequence_layout
+                emb, 0, cp_group, cp_partition_mode=cp_partition_mode
             )
 
         return emb
@@ -216,21 +216,21 @@ class RotaryEmbedding(nn.Module):
         dtype,
         packed_seq=False,
         cp_group=None,
-        cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
+        cp_partition_mode=DEFAULT_CP_PARTITION_MODE,
     ):
         """Materialize cached cos/sin tensors for ``[seq_len, ..., dim]``."""
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
         self.packed_seq_cached = packed_seq
-        self.cp_sequence_layout_cached = cp_sequence_layout
+        self.cp_partition_mode_cached = cp_partition_mode
 
         emb = self.forward(
             seq_len,
             offset,
             packed_seq=packed_seq,
             cp_group=cp_group,
-            cp_sequence_layout=cp_sequence_layout,
+            cp_partition_mode=cp_partition_mode,
         )
         self.register_buffer("cos_cached", emb.cos().to(dtype).contiguous(), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype).contiguous(), persistent=False)
@@ -242,7 +242,7 @@ class RotaryEmbedding(nn.Module):
         dtype=torch.get_default_dtype(),
         packed_seq=False,
         cp_group=None,
-        cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
+        cp_partition_mode=DEFAULT_CP_PARTITION_MODE,
         mscale=None,
     ):
         """Get cached cos and sin values.
@@ -262,10 +262,10 @@ class RotaryEmbedding(nn.Module):
             or offset != self.offset_cached
             or dtype != self.dtype_cached
             or packed_seq != self.packed_seq_cached
-            or cp_sequence_layout != getattr(self, "cp_sequence_layout_cached", None)
+            or cp_partition_mode != getattr(self, "cp_partition_mode_cached", None)
         ):
             self._set_cos_sin_cache(
-                seq_len, offset, dtype, packed_seq, cp_group, cp_sequence_layout
+                seq_len, offset, dtype, packed_seq, cp_group, cp_partition_mode
             )
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
@@ -405,7 +405,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         position_ids: torch.Tensor,
         mrope_section: List[int],
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
-        cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
+        cp_partition_mode=DEFAULT_CP_PARTITION_MODE,
     ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
@@ -467,6 +467,6 @@ class MultimodalRotaryEmbedding(nn.Module):
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
             emb = get_pos_emb_on_this_cp_rank(
-                emb, 0, cp_group, cp_sequence_layout=cp_sequence_layout
+                emb, 0, cp_group, cp_partition_mode=cp_partition_mode
             )
         return emb

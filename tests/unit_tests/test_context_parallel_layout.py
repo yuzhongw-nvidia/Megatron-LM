@@ -6,13 +6,12 @@ import pytest
 import torch
 
 from megatron.core.context_parallel_layout import (
-    ContextParallelLayout,
     get_context_parallel_layout_chunk_indices,
-    get_required_cp_sequence_layout_for_layer,
+    get_required_cp_partition_mode_for_layer,
     get_thd_context_parallel_rank_indices,
 )
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_experimental_attention_variant_stage_input_cp_sequence_layout,
+    get_experimental_attention_variant_stage_input_cp_partition_mode,
 )
 
 
@@ -82,6 +81,17 @@ def test_thd_context_parallel_rank_indices_reject_uneven_chunks():
         get_thd_context_parallel_rank_indices(torch.tensor([0, 10]), 2, 0, "zigzag")
 
 
+def test_thd_contiguous_rank_indices_allow_uneven_sequence_lengths():
+    cu_seqlens = torch.tensor([0, 10, 18])
+
+    assert get_thd_context_parallel_rank_indices(cu_seqlens, 2, 0, "contiguous").tolist() == list(
+        range(0, 9)
+    )
+    assert get_thd_context_parallel_rank_indices(cu_seqlens, 2, 1, "contiguous").tolist() == list(
+        range(9, 18)
+    )
+
+
 def test_thd_context_parallel_rank_indices_reject_decreasing_boundaries():
     with pytest.raises(ValueError, match="nondecreasing"):
         get_thd_context_parallel_rank_indices(torch.tensor([0, 16, 8]), 2, 0, "zigzag")
@@ -92,9 +102,9 @@ def test_thd_context_parallel_rank_indices_reject_unknown_layout():
         get_thd_context_parallel_rank_indices(torch.tensor([0, 16]), 2, 0, "interleaved")
 
 
-def test_required_layout_rejects_unknown_layer_type():
-    with pytest.raises(ValueError, match="Cannot determine CP sequence layout"):
-        get_required_cp_sequence_layout_for_layer(object(), SimpleNamespace(cp_comm_type=None))
+def test_required_partition_mode_rejects_unknown_layer_type():
+    with pytest.raises(ValueError, match="Cannot determine CP partition mode"):
+        get_required_cp_partition_mode_for_layer(object(), SimpleNamespace(cp_comm_type=None))
 
 
 def test_gated_delta_net_chunkwise_layout_plan_follows_linear_attention_pattern():
@@ -108,18 +118,18 @@ def test_gated_delta_net_chunkwise_layout_plan_follows_linear_attention_pattern(
     )
 
     assert (
-        get_experimental_attention_variant_stage_input_cp_sequence_layout(config)
-        == ContextParallelLayout.CONTIGUOUS
+        get_experimental_attention_variant_stage_input_cp_partition_mode(config)
+        == "contiguous"
     )
 
     config.pipeline_model_parallel_layout = _PipelineLayout(offset=2)
     assert (
-        get_experimental_attention_variant_stage_input_cp_sequence_layout(config)
-        == ContextParallelLayout.ZIGZAG
+        get_experimental_attention_variant_stage_input_cp_partition_mode(config)
+        == "zigzag"
     )
 
 
-def test_gated_delta_net_headwise_layout_plan_preserves_zigzag():
+def test_gated_delta_net_headwise_layout_plan_uses_contiguous():
     config = SimpleNamespace(
         experimental_attention_variant="gated_delta_net",
         linear_attention_freq=[1, 0],
@@ -130,6 +140,6 @@ def test_gated_delta_net_headwise_layout_plan_preserves_zigzag():
     )
 
     assert (
-        get_experimental_attention_variant_stage_input_cp_sequence_layout(config)
-        == ContextParallelLayout.ZIGZAG
+        get_experimental_attention_variant_stage_input_cp_partition_mode(config)
+        == "contiguous"
     )

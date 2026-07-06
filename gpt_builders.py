@@ -2,7 +2,7 @@
 
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_experimental_attention_variant_stage_input_cp_sequence_layout,
+    get_experimental_attention_variant_stage_input_cp_partition_mode,
     get_transformer_block_with_experimental_attention_variant_spec,
     get_transformer_layer_with_experimental_attention_variant_spec,
 )
@@ -31,7 +31,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
-    cp_stage_entry_layout = None
+    cp_stage_entry_partition_mode = None
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:
@@ -43,8 +43,8 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 if pg_collection is not None and hasattr(pg_collection, "pp")
                 else None
             )
-            cp_stage_entry_layout = (
-                get_experimental_attention_variant_stage_input_cp_sequence_layout(
+            cp_stage_entry_partition_mode = (
+                get_experimental_attention_variant_stage_input_cp_partition_mode(
                     config=config, vp_stage=vp_stage, pp_rank=pp_rank
                 )
             )
@@ -115,7 +115,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         mtp_block_spec=mtp_block_spec,
         vp_stage=vp_stage,
         pg_collection=pg_collection,
-        cp_stage_entry_layout=cp_stage_entry_layout,
+        cp_stage_entry_partition_mode=cp_stage_entry_partition_mode,
     )
 
     return model

@@ -26,8 +26,8 @@ import torch
 from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.context_parallel_layout import (
-    DEFAULT_CP_SEQUENCE_LAYOUT,
-    normalize_cp_sequence_layout,
+    DEFAULT_CP_PARTITION_MODE,
+    normalize_cp_partition_mode,
 )
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
@@ -82,7 +82,7 @@ stimer = StragglerDetector()
 def get_batch(
     data_iterator,
     vp_stage: Optional[int] = None,
-    cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
+    cp_partition_mode=DEFAULT_CP_PARTITION_MODE,
 ):
     """Generate a batch.
 
@@ -135,8 +135,8 @@ def get_batch(
     """
     args = get_args()
     config = core_transformer_config_from_args(args)
-    cp_sequence_layout = (
-        normalize_cp_sequence_layout(cp_sequence_layout) or DEFAULT_CP_SEQUENCE_LAYOUT
+    cp_partition_mode = (
+        normalize_cp_partition_mode(cp_partition_mode) or DEFAULT_CP_PARTITION_MODE
     )
 
     if args.sequence_packing_scheduler is not None:
@@ -149,7 +149,7 @@ def get_batch(
             vp_stage=vp_stage,
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
-            cp_sequence_layout=cp_sequence_layout,
+            cp_partition_mode=cp_partition_mode,
         )
 
     # TODO: this is pretty hacky, find a better way
@@ -194,6 +194,7 @@ def get_batch(
                 max_seqlen_q=int(max_seqlen[0].item()),
                 max_seqlen_kv=int(max_seqlen[0].item()),
                 qkv_format='thd',
+                cp_partition_mode=cp_partition_mode,
             ),
             None,
         )
@@ -201,7 +202,7 @@ def get_batch(
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
         batch = get_batch_on_this_cp_rank(  # The implementation of this function is in MCore
-            batch, cp_sequence_layout=cp_sequence_layout
+            batch, cp_partition_mode=cp_partition_mode
         )
         packed_seq_params = None
     else:  # Packed THD format
@@ -210,7 +211,7 @@ def get_batch(
             cu_seqlens,
             cu_seqlens_padded,
             max_seqlen,
-            cp_sequence_layout=cp_sequence_layout,
+            cp_partition_mode=cp_partition_mode,
         )
 
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
@@ -343,9 +344,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        cp_sequence_layout = get_attr_wrapped_model(model, "get_input_cp_sequence_layout")()
+        cp_partition_mode = get_attr_wrapped_model(model, "get_input_cp_partition_mode")()
         tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
-            get_batch(data_iterator, vp_stage, cp_sequence_layout=cp_sequence_layout)
+            get_batch(data_iterator, vp_stage, cp_partition_mode=cp_partition_mode)
         )
     timers('batch-generator').stop()
 

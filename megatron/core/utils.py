@@ -43,11 +43,10 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.context_parallel_layout import (
-    DEFAULT_CP_SEQUENCE_LAYOUT,
-    ContextParallelLayout,
+    DEFAULT_CP_PARTITION_MODE,
     get_context_parallel_layout_chunk_indices,
     get_thd_context_parallel_rank_indices,
-    normalize_cp_sequence_layout,
+    normalize_cp_partition_mode,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -2276,7 +2275,7 @@ def get_batch_on_this_tp_rank(
 def get_sft_batch_on_this_cp_rank(
     batch: dict[str, torch.Tensor],
     cp_group: torch.distributed.ProcessGroup,
-    cp_sequence_layout: str | ContextParallelLayout = DEFAULT_CP_SEQUENCE_LAYOUT,
+    cp_partition_mode: str = DEFAULT_CP_PARTITION_MODE,
 ):
     """Partition an SFT packed-sequence batch across context-parallel ranks using THD indexing.
 
@@ -2300,8 +2299,8 @@ def get_sft_batch_on_this_cp_rank(
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
         index-selected to this CP rank's partition.
     """
-    cp_sequence_layout = (
-        normalize_cp_sequence_layout(cp_sequence_layout) or DEFAULT_CP_SEQUENCE_LAYOUT
+    cp_partition_mode = (
+        normalize_cp_partition_mode(cp_partition_mode) or DEFAULT_CP_PARTITION_MODE
     )
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
@@ -2318,7 +2317,7 @@ def get_sft_batch_on_this_cp_rank(
         total_tokens = (
             batch["tokens"].size(1) if batch["tokens"] is not None else batch["labels"].size(1)
         )  # NOTE(asolergi-nv): Labels to enable PP!
-        if cp_sequence_layout == ContextParallelLayout.ZIGZAG:
+        if cp_partition_mode == "zigzag":
             index = tex.thd_get_partitioned_indices(
                 cu_seqlens_for_te,
                 total_tokens,
@@ -2327,7 +2326,7 @@ def get_sft_batch_on_this_cp_rank(
             )
         else:
             index = get_thd_context_parallel_rank_indices(
-                cu_seqlens_for_te, cp_size, cp_rank, cp_sequence_layout
+                cu_seqlens_for_te, cp_size, cp_rank, cp_partition_mode
             )
         SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids')
         for key in SEQUENCE_KEYS:
@@ -2339,7 +2338,7 @@ def get_sft_batch_on_this_cp_rank(
 def get_pretrain_batch_on_this_cp_rank(
     batch: dict[str, torch.Tensor],
     cp_group: torch.distributed.ProcessGroup,
-    cp_sequence_layout: str | ContextParallelLayout = DEFAULT_CP_SEQUENCE_LAYOUT,
+    cp_partition_mode: str = DEFAULT_CP_PARTITION_MODE,
 ):
     """Partition a pretraining batch across context-parallel ranks with load-balanced chunking.
 
@@ -2365,8 +2364,8 @@ def get_pretrain_batch_on_this_cp_rank(
         sliced to this CP rank's zigzag partition.
     """
 
-    cp_sequence_layout = (
-        normalize_cp_sequence_layout(cp_sequence_layout) or DEFAULT_CP_SEQUENCE_LAYOUT
+    cp_partition_mode = (
+        normalize_cp_partition_mode(cp_partition_mode) or DEFAULT_CP_PARTITION_MODE
     )
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
@@ -2393,7 +2392,7 @@ def get_pretrain_batch_on_this_cp_rank(
                 *val.shape[(seq_dim + 1) :],
             )
             index = get_context_parallel_layout_chunk_indices(
-                cp_size, cp_rank, cp_sequence_layout
+                cp_size, cp_rank, cp_partition_mode
             ).to(device=val.device)
             val = val.index_select(seq_dim, index)
             val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
@@ -2407,7 +2406,7 @@ def get_batch_on_this_cp_rank(
     is_hybrid_cp: bool = False,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     hybrid_cp_group_func: Optional[Callable[[int], torch.distributed.ProcessGroup]] = None,
-    cp_sequence_layout: str | ContextParallelLayout = DEFAULT_CP_SEQUENCE_LAYOUT,
+    cp_partition_mode: str = DEFAULT_CP_PARTITION_MODE,
 ):
     """Dispatch batch partitioning across context-parallel ranks.
 
@@ -2452,16 +2451,16 @@ def get_batch_on_this_cp_rank(
             if batch['local_cp_size'].item() > 1:
                 hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
                 batch = get_pretrain_batch_on_this_cp_rank(
-                    batch, cp_group=hybrid_cp_group, cp_sequence_layout=cp_sequence_layout
+                    batch, cp_group=hybrid_cp_group, cp_partition_mode=cp_partition_mode
                 )
                 batch["hybrid_cp_group"] = hybrid_cp_group
         else:
             batch = get_sft_batch_on_this_cp_rank(
-                batch, cp_group=cp_group, cp_sequence_layout=cp_sequence_layout
+                batch, cp_group=cp_group, cp_partition_mode=cp_partition_mode
             )
     else:  # NOTE(asolergi-nv): Pretrain case
         batch = get_pretrain_batch_on_this_cp_rank(
-            batch, cp_group=cp_group, cp_sequence_layout=cp_sequence_layout
+            batch, cp_group=cp_group, cp_partition_mode=cp_partition_mode
         )
     return batch
 
@@ -2473,14 +2472,14 @@ def get_thd_batch_on_this_cp_rank(
     max_seqlen: torch.Tensor,
     cp_size: Optional[int] = None,
     cp_rank: Optional[int] = None,
-    cp_sequence_layout: str | ContextParallelLayout = DEFAULT_CP_SEQUENCE_LAYOUT,
+    cp_partition_mode: str = DEFAULT_CP_PARTITION_MODE,
 ):
     """Slice each sub-sample in a packed sample batch input along
     sequence dimension into multiple chunks, which are parallelized
     across GPUs in a context parallel group.
     """
-    cp_sequence_layout = (
-        normalize_cp_sequence_layout(cp_sequence_layout) or DEFAULT_CP_SEQUENCE_LAYOUT
+    cp_partition_mode = (
+        normalize_cp_partition_mode(cp_partition_mode) or DEFAULT_CP_PARTITION_MODE
     )
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
@@ -2490,6 +2489,7 @@ def get_thd_batch_on_this_cp_rank(
         cu_seqlens_kv_padded=cu_seqlens_padded,
         max_seqlen_q=int(max_seqlen[0].item()),
         max_seqlen_kv=int(max_seqlen[0].item()),
+        cp_partition_mode=cp_partition_mode,
     )
 
     cp_size = parallel_state.get_context_parallel_world_size() if cp_size is None else cp_size
@@ -2499,13 +2499,13 @@ def get_thd_batch_on_this_cp_rank(
             "Please update Transformer Engine to >= 1.10 to use "
             "Context Parallel with THD format data"
         )
-        if cp_sequence_layout == ContextParallelLayout.ZIGZAG:
+        if cp_partition_mode == "zigzag":
             index = tex.thd_get_partitioned_indices(
                 cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
             )
         else:
             index = get_thd_context_parallel_rank_indices(
-                cu_seqlens_padded, cp_size, cp_rank, cp_sequence_layout
+                cu_seqlens_padded, cp_size, cp_rank, cp_partition_mode
             )
         for key, data in batch.items():
             if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:

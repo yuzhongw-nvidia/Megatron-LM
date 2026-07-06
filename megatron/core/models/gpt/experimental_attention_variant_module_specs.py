@@ -3,8 +3,8 @@
 from typing import List, Optional
 
 from megatron.core.context_parallel_layout import (
-    DEFAULT_CP_SEQUENCE_LAYOUT,
-    ContextParallelLayout,
+    CpPartitionMode,
+    DEFAULT_CP_PARTITION_MODE,
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.backends import BackendSpecProvider
@@ -416,12 +416,12 @@ def is_linear_attention_variant(experimental_attention_variant: Optional[str]) -
     return experimental_attention_variant in linear_attention_variants
 
 
-def get_experimental_attention_variant_layer_cp_sequence_layout_pattern(
+def get_experimental_attention_variant_layer_cp_partition_mode_pattern(
     config: TransformerConfig,
-) -> List[Optional[ContextParallelLayout]]:
-    """Return per-layer CP sequence layout requirements for experimental GPT specs."""
+) -> List[Optional[CpPartitionMode]]:
+    """Return per-layer CP partition-mode requirements for experimental GPT specs."""
     if config.experimental_attention_variant is None:
-        return [DEFAULT_CP_SEQUENCE_LAYOUT] * config.num_layers
+        return [DEFAULT_CP_PARTITION_MODE] * config.num_layers
 
     experimental_attention_pattern = [0] * config.num_layers
     if is_linear_attention_variant(config.experimental_attention_variant):
@@ -429,18 +429,18 @@ def get_experimental_attention_variant_layer_cp_sequence_layout_pattern(
     else:
         experimental_attention_pattern = [1] * config.num_layers
 
-    experimental_layout = _get_experimental_attention_variant_cp_sequence_layout(config)
+    experimental_layout = _get_experimental_attention_variant_cp_partition_mode(config)
     return [
-        experimental_layout if uses_experimental_attention else ContextParallelLayout.ZIGZAG
+        experimental_layout if uses_experimental_attention else "zigzag"
         for uses_experimental_attention in experimental_attention_pattern
     ]
 
 
-def get_experimental_attention_variant_stage_input_cp_sequence_layout(
+def get_experimental_attention_variant_stage_input_cp_partition_mode(
     config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
-) -> ContextParallelLayout:
-    """Return the CP sequence layout expected at one experimental GPT stage input."""
-    layer_layouts = get_experimental_attention_variant_layer_cp_sequence_layout_pattern(config)
+) -> CpPartitionMode:
+    """Return the CP partition mode expected at one experimental GPT stage input."""
+    layer_layouts = get_experimental_attention_variant_layer_cp_partition_mode_pattern(config)
 
     if config.pipeline_model_parallel_layout is not None:
         stage_layer_offset = config.pipeline_model_parallel_layout.get_layer_offset(
@@ -453,33 +453,33 @@ def get_experimental_attention_variant_stage_input_cp_sequence_layout(
             config, vp_stage=vp_stage, pp_rank=pp_rank
         )
 
-    current_layout = None
-    for required_layout in layer_layouts[:stage_layer_offset]:
-        if required_layout is not None:
-            current_layout = required_layout
+    current_partition_mode = None
+    for required_partition_mode in layer_layouts[:stage_layer_offset]:
+        if required_partition_mode is not None:
+            current_partition_mode = required_partition_mode
 
-    if current_layout is None:
-        for required_layout in layer_layouts[stage_layer_offset:]:
-            if required_layout is not None:
-                current_layout = required_layout
+    if current_partition_mode is None:
+        for required_partition_mode in layer_layouts[stage_layer_offset:]:
+            if required_partition_mode is not None:
+                current_partition_mode = required_partition_mode
                 break
 
-    return current_layout or DEFAULT_CP_SEQUENCE_LAYOUT
+    return current_partition_mode or DEFAULT_CP_PARTITION_MODE
 
 
-def _get_experimental_attention_variant_cp_sequence_layout(
+def _get_experimental_attention_variant_cp_partition_mode(
     config: TransformerConfig,
-) -> ContextParallelLayout:
-    """Return the CP sequence layout required by the experimental attention variant."""
+) -> CpPartitionMode:
+    """Return the CP partition mode required by the experimental attention variant."""
     if config.experimental_attention_variant == "gated_delta_net":
         mode = getattr(config, "linear_cp_mode", "chunkwise")
-        if mode == "chunkwise":
-            return ContextParallelLayout.CONTIGUOUS
-        if mode == "headwise":
-            return ContextParallelLayout.ZIGZAG
+        if mode in {"chunkwise", "headwise"}:
+            return "contiguous"
         raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
-    if config.experimental_attention_variant in {"dsa", "dsv4_hybrid"}:
-        return ContextParallelLayout.ZIGZAG
+    if config.experimental_attention_variant == "dsv4_hybrid":
+        return "contiguous"
+    if config.experimental_attention_variant == "dsa":
+        return "zigzag"
     raise ValueError(
         f"Invalid experimental attention variant: {config.experimental_attention_variant}"
     )

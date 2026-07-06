@@ -10,7 +10,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from megatron.core.context_parallel_layout import DEFAULT_CP_SEQUENCE_LAYOUT
+from megatron.core.context_parallel_layout import DEFAULT_CP_PARTITION_MODE
 from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer import TransformerConfig
@@ -165,7 +165,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         offset: int = 0,
         packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
-        cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
+        cp_partition_mode=DEFAULT_CP_PARTITION_MODE,
     ) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
@@ -186,7 +186,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
             emb = get_pos_emb_on_this_cp_rank(
-                emb, 0, cp_group, cp_sequence_layout=cp_sequence_layout
+                emb, 0, cp_group, cp_partition_mode=cp_partition_mode
             )
         return emb, _mscale
 
@@ -197,14 +197,14 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         dtype,
         packed_seq=False,
         cp_group=None,
-        cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
+        cp_partition_mode=DEFAULT_CP_PARTITION_MODE,
         mscale=None,
     ):
         self.max_seq_len_cached = seq_len
         self.offset_cached = offset
         self.dtype_cached = dtype
         self.packed_seq_cached = packed_seq
-        self.cp_sequence_layout_cached = cp_sequence_layout
+        self.cp_partition_mode_cached = cp_partition_mode
         self.mscale_cached = mscale
 
         emb, _mscale = self.forward(
@@ -212,7 +212,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             offset,
             packed_seq=packed_seq,
             cp_group=cp_group,
-            cp_sequence_layout=cp_sequence_layout,
+            cp_partition_mode=cp_partition_mode,
         )
         if mscale is not None:
             _mscale = mscale
@@ -230,7 +230,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         dtype=torch.get_default_dtype(),
         packed_seq=False,
         cp_group=None,
-        cp_sequence_layout=DEFAULT_CP_SEQUENCE_LAYOUT,
+        cp_partition_mode=DEFAULT_CP_PARTITION_MODE,
         mscale=None,
     ):
         """Get cached cos and sin values.
@@ -250,11 +250,11 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             or offset != self.offset_cached
             or dtype != self.dtype_cached
             or packed_seq != self.packed_seq_cached
-            or cp_sequence_layout != getattr(self, "cp_sequence_layout_cached", None)
+            or cp_partition_mode != getattr(self, "cp_partition_mode_cached", None)
             or mscale != getattr(self, "mscale_cached", None)
         ):
             self._set_cos_sin_cache(
-                seq_len, offset, dtype, packed_seq, cp_group, cp_sequence_layout, mscale
+                seq_len, offset, dtype, packed_seq, cp_group, cp_partition_mode, mscale
             )
         return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 

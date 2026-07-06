@@ -2,7 +2,7 @@
 
 import logging
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Set, Tuple, Union, cast
 
 import torch
@@ -11,11 +11,11 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.context_parallel_layout import (
-    DEFAULT_CP_SEQUENCE_LAYOUT,
-    ContextParallelLayout,
-    convert_cp_sequence_layout,
-    get_required_cp_sequence_layout_for_layer,
-    normalize_cp_sequence_layout,
+    CpPartitionMode,
+    DEFAULT_CP_PARTITION_MODE,
+    convert_cp_partition_mode,
+    get_required_cp_partition_mode_for_layer,
+    normalize_cp_partition_mode,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
@@ -290,7 +290,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         post_process: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
-        cp_stage_entry_layout: Optional[str | ContextParallelLayout] = None,
+        cp_stage_entry_partition_mode: Optional[str] = None,
     ):
         super().__init__(config=config)
 
@@ -307,7 +307,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.pre_process = pre_process
         self.post_process = post_process
         self.vp_stage = vp_stage
-        self._cp_stage_entry_layout_override = normalize_cp_sequence_layout(cp_stage_entry_layout)
+        self._cp_stage_entry_partition_mode_override = normalize_cp_partition_mode(cp_stage_entry_partition_mode)
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -343,7 +343,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         self.num_residual_streams = config.num_residual_streams
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
-        self._build_cp_sequence_layout_plan()
+        self._build_cp_partition_mode_plan()
 
     def _build_layers(self):
         # Transformer layers.
@@ -472,39 +472,39 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]
 
-    def _build_cp_sequence_layout_plan(self) -> None:
-        """Build the immutable CP sequence layout plan for this block."""
-        current_layout = self._cp_stage_entry_layout_override
-        self.cp_stage_entry_layout = current_layout
-        self.cp_layout_plan: List[Optional[ContextParallelLayout]] = []
+    def _build_cp_partition_mode_plan(self) -> None:
+        """Build the immutable CP partition-mode plan for this block."""
+        current_partition_mode = self._cp_stage_entry_partition_mode_override
+        self.cp_stage_entry_partition_mode = current_partition_mode
+        self.cp_partition_mode_plan: List[Optional[CpPartitionMode]] = []
         for layer in self.layers:
             layer_config = getattr(layer, "config", self.config)
-            required_layout = get_required_cp_sequence_layout_for_layer(layer, layer_config)
-            self.cp_layout_plan.append(required_layout)
-            if self.cp_stage_entry_layout is None and required_layout is not None:
-                self.cp_stage_entry_layout = required_layout
-                current_layout = required_layout
-            if required_layout is not None:
-                current_layout = required_layout
-        if self.cp_stage_entry_layout is None:
-            self.cp_stage_entry_layout = DEFAULT_CP_SEQUENCE_LAYOUT
-        self.cp_stage_exit_layout = current_layout or self.cp_stage_entry_layout
+            required_partition_mode = get_required_cp_partition_mode_for_layer(layer, layer_config)
+            self.cp_partition_mode_plan.append(required_partition_mode)
+            if self.cp_stage_entry_partition_mode is None and required_partition_mode is not None:
+                self.cp_stage_entry_partition_mode = required_partition_mode
+                current_partition_mode = required_partition_mode
+            if required_partition_mode is not None:
+                current_partition_mode = required_partition_mode
+        if self.cp_stage_entry_partition_mode is None:
+            self.cp_stage_entry_partition_mode = DEFAULT_CP_PARTITION_MODE
+        self.cp_stage_exit_partition_mode = current_partition_mode or self.cp_stage_entry_partition_mode
 
-    def get_input_cp_sequence_layout(self) -> ContextParallelLayout:
-        """Return the CP sequence layout expected at this block's stage input."""
-        return self.cp_stage_entry_layout
+    def get_input_cp_partition_mode(self) -> CpPartitionMode:
+        """Return the CP partition mode expected at this block's stage input."""
+        return self.cp_stage_entry_partition_mode
 
-    def get_stage_exit_cp_sequence_layout(self) -> ContextParallelLayout:
-        """Return the CP sequence layout produced after this block's local layers."""
-        return self.cp_stage_exit_layout
+    def get_stage_exit_cp_partition_mode(self) -> CpPartitionMode:
+        """Return the CP partition mode produced after this block's local layers."""
+        return self.cp_stage_exit_partition_mode
 
-    def get_cp_sequence_layout_before_local_index(self, local_index: int) -> ContextParallelLayout:
-        """Return the CP layout immediately before a local layer index."""
-        current_layout = self.cp_stage_entry_layout
-        for required_layout in self.cp_layout_plan[:local_index]:
-            if required_layout is not None:
-                current_layout = required_layout
-        return current_layout
+    def get_cp_partition_mode_before_local_index(self, local_index: int) -> CpPartitionMode:
+        """Return the CP partition mode immediately before a local layer index."""
+        current_partition_mode = self.cp_stage_entry_partition_mode
+        for required_partition_mode in self.cp_partition_mode_plan[:local_index]:
+            if required_partition_mode is not None:
+                current_partition_mode = required_partition_mode
+        return current_partition_mode
 
     @staticmethod
     def _get_cp_layout_cu_seqlens(
@@ -518,44 +518,60 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             else packed_seq_params.cu_seqlens_q
         )
 
-    def _convert_rotary_cp_sequence_layout(
+    def _convert_rotary_cp_partition_mode(
         self,
         rotary_pos_emb,
         cp_group: Optional[torch.distributed.ProcessGroup],
-        source_layout: ContextParallelLayout,
-        target_layout: ContextParallelLayout,
+        source_partition_mode: CpPartitionMode,
+        target_partition_mode: CpPartitionMode,
     ):
         if rotary_pos_emb is None:
             return None
         if isinstance(rotary_pos_emb, tuple):
             return tuple(
-                self._convert_rotary_cp_sequence_layout(
-                    rotary_part, cp_group, source_layout, target_layout
+                self._convert_rotary_cp_partition_mode(
+                    rotary_part, cp_group, source_partition_mode, target_partition_mode
                 )
                 for rotary_part in rotary_pos_emb
             )
         if isinstance(rotary_pos_emb, list):
             return [
-                self._convert_rotary_cp_sequence_layout(
-                    rotary_part, cp_group, source_layout, target_layout
+                self._convert_rotary_cp_partition_mode(
+                    rotary_part, cp_group, source_partition_mode, target_partition_mode
                 )
                 for rotary_part in rotary_pos_emb
             ]
         if not torch.is_tensor(rotary_pos_emb):
             return rotary_pos_emb
-        return convert_cp_sequence_layout(
+        return convert_cp_partition_mode(
             rotary_pos_emb,
             cp_group,
-            source_layout=source_layout,
-            target_layout=target_layout,
+            source_partition_mode=source_partition_mode,
+            target_partition_mode=target_partition_mode,
             seq_dim=0,
         )
 
-    def _convert_cp_sequence_layout_for_layer(
+    @staticmethod
+    def _replace_packed_seq_params_cp_partition_mode(
+        packed_seq_params: Optional[PackedSeqParams],
+        cp_partition_mode: CpPartitionMode,
+    ) -> Optional[PackedSeqParams]:
+        """Return packed-sequence metadata annotated with the current CP partition mode.
+
+        The block owns layout conversion and updates THD metadata copy-on-write so
+        attention modules can assert the mode they receive without mutating caller state.
+        """
+        if packed_seq_params is None or packed_seq_params.qkv_format != 'thd':
+            return packed_seq_params
+        if packed_seq_params.cp_partition_mode == cp_partition_mode:
+            return packed_seq_params
+        return replace(packed_seq_params, cp_partition_mode=cp_partition_mode)
+
+    def _convert_cp_partition_mode_for_layer(
         self,
         *,
         local_index: int,
-        current_layout: ContextParallelLayout,
+        current_partition_mode: CpPartitionMode,
         hidden_states: Tensor,
         attention_mask: Optional[Tensor],
         rotary_pos_emb,
@@ -565,26 +581,36 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         input_ids: Optional[Tensor],
     ):
         """Convert per-token tensors to the layout required by one local layer."""
-        required_layout = self.cp_layout_plan[local_index]
-        if required_layout is None or required_layout == current_layout:
-            return hidden_states, rotary_pos_emb, padding_mask, input_ids, current_layout
+        required_partition_mode = self.cp_partition_mode_plan[local_index]
+        if required_partition_mode is None or required_partition_mode == current_partition_mode:
+            packed_seq_params = self._replace_packed_seq_params_cp_partition_mode(
+                packed_seq_params, current_partition_mode
+            )
+            return (
+                hidden_states,
+                rotary_pos_emb,
+                padding_mask,
+                input_ids,
+                packed_seq_params,
+                current_partition_mode,
+            )
 
         if attention_mask is not None:
             raise NotImplementedError(
-                "Changing CP sequence layout with an explicit attention_mask is not supported yet."
+                "Changing CP partition mode with an explicit attention_mask is not supported yet."
             )
         if attention_bias is not None:
             raise NotImplementedError(
-                "Changing CP sequence layout with attention_bias is not supported yet."
+                "Changing CP partition mode with attention_bias is not supported yet."
             )
 
         cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
         cu_seqlens = self._get_cp_layout_cu_seqlens(packed_seq_params)
-        hidden_states = convert_cp_sequence_layout(
+        hidden_states = convert_cp_partition_mode(
             hidden_states,
             cp_group,
-            source_layout=current_layout,
-            target_layout=required_layout,
+            source_partition_mode=current_partition_mode,
+            target_partition_mode=required_partition_mode,
             seq_dim=0,
             cu_seqlens=cu_seqlens,
             sequence_parallel=self.config.sequence_parallel,
@@ -592,15 +618,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
         )
         if packed_seq_params is None:
-            rotary_pos_emb = self._convert_rotary_cp_sequence_layout(
-                rotary_pos_emb, cp_group, current_layout, required_layout
+            rotary_pos_emb = self._convert_rotary_cp_partition_mode(
+                rotary_pos_emb, cp_group, current_partition_mode, required_partition_mode
             )
         if padding_mask is not None:
-            padding_mask = convert_cp_sequence_layout(
+            padding_mask = convert_cp_partition_mode(
                 padding_mask,
                 cp_group,
-                source_layout=current_layout,
-                target_layout=required_layout,
+                source_partition_mode=current_partition_mode,
+                target_partition_mode=required_partition_mode,
                 seq_dim=1,
                 cu_seqlens=cu_seqlens,
                 sequence_parallel=self.config.sequence_parallel,
@@ -608,16 +634,26 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
             )
         if input_ids is not None:
-            input_ids = convert_cp_sequence_layout(
+            input_ids = convert_cp_partition_mode(
                 input_ids,
                 cp_group,
-                source_layout=current_layout,
-                target_layout=required_layout,
+                source_partition_mode=current_partition_mode,
+                target_partition_mode=required_partition_mode,
                 seq_dim=1,
                 cu_seqlens=cu_seqlens,
             )
 
-        return hidden_states, rotary_pos_emb, padding_mask, input_ids, required_layout
+        packed_seq_params = self._replace_packed_seq_params_cp_partition_mode(
+            packed_seq_params, required_partition_mode
+        )
+        return (
+            hidden_states,
+            rotary_pos_emb,
+            padding_mask,
+            input_ids,
+            packed_seq_params,
+            required_partition_mode,
+        )
 
     def _checkpointed_forward(
         self,
@@ -661,7 +697,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 rotary_pos_emb,
                 padding_mask=None,
             ):
-                current_layout = self.get_cp_sequence_layout_before_local_index(start)
+                current_partition_mode = self.get_cp_partition_mode_before_local_index(start)
+                local_packed_seq_params = self._replace_packed_seq_params_cp_partition_mode(
+                    packed_seq_params, current_partition_mode
+                )
                 local_input_ids = input_ids
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -670,15 +709,16 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         rotary_pos_emb,
                         padding_mask,
                         local_input_ids,
-                        current_layout,
-                    ) = self._convert_cp_sequence_layout_for_layer(
+                        local_packed_seq_params,
+                        current_partition_mode,
+                    ) = self._convert_cp_partition_mode_for_layer(
                         local_index=index,
-                        current_layout=current_layout,
+                        current_partition_mode=current_partition_mode,
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         attention_bias=attention_bias,
-                        packed_seq_params=packed_seq_params,
+                        packed_seq_params=local_packed_seq_params,
                         padding_mask=padding_mask,
                         input_ids=local_input_ids,
                     )
@@ -708,7 +748,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             rotary_pos_emb=rotary_pos_emb,
                             attention_bias=attention_bias,
                             inference_context=None,
-                            packed_seq_params=packed_seq_params,
+                            packed_seq_params=local_packed_seq_params,
                             padding_mask=padding_mask,
                             input_ids=local_input_ids,
                         )
@@ -1040,7 +1080,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
 
         with rng_context, outer_quantization_context:
-            current_layout = self.cp_stage_entry_layout
+            current_partition_mode = self.cp_stage_entry_partition_mode
+            packed_seq_params = self._replace_packed_seq_params_cp_partition_mode(
+                packed_seq_params, current_partition_mode
+            )
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
                 checkpointed_result = self._checkpointed_forward(
@@ -1071,10 +1114,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         rotary_pos_emb,
                         padding_mask,
                         input_ids,
-                        current_layout,
-                    ) = self._convert_cp_sequence_layout_for_layer(
+                        packed_seq_params,
+                        current_partition_mode,
+                    ) = self._convert_cp_partition_mode_for_layer(
                         local_index=l_no,
-                        current_layout=current_layout,
+                        current_partition_mode=current_partition_mode,
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
                         rotary_pos_emb=rotary_pos_emb,
