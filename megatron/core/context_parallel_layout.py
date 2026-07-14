@@ -1,16 +1,156 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Context parallel tensor layout helpers."""
+"""Context parallel sequence partition-mode helpers."""
 
-from typing import List, Optional, Tuple
+from dataclasses import replace
+from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 
 import torch
 
-from megatron.core.tensor_parallel import all_to_all
+
+CpPartitionMode = Literal["zigzag", "contiguous"]
+
+
+def get_context_parallel_layout_chunk_indices(
+    cp_size: int, cp_rank: int, cp_partition_mode: str
+) -> torch.Tensor:
+    """Return the two global chunk indices owned by this CP rank in ``cp_partition_mode``."""
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}.")
+
+    if cp_partition_mode == "zigzag":
+        return torch.tensor([cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.long)
+    if cp_partition_mode == "contiguous":
+        return torch.tensor([2 * cp_rank, 2 * cp_rank + 1], dtype=torch.long)
+    raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
+
+
+################################################################################
+# Layer-to-CP-partition-mode mapping
+################################################################################
+#
+# ``None`` is a meaningful result here: it means the module is token-layout
+# agnostic and preserves whichever CP partition mode it receives.  It must not
+# be used as the fallback for an unrecognized module type; unknown types should
+# fail loudly so new layer implementations add an explicit partition-mode policy.
+
+
+def get_required_cp_partition_mode_for_layer(
+    layer: Any, config: Any, *, cp_comm_type: Optional[str] = None
+) -> Optional[CpPartitionMode]:
+    """Return the CP partition mode required by a layer or attention-like module.
+
+    The helper intentionally uses light duck-typing instead of importing concrete
+    modules, because several of those modules already import this file.
+    """
+    if cp_comm_type is None:
+        cp_comm_type = getattr(config, "cp_comm_type", None)
+
+    if layer is None:
+        raise ValueError("Cannot determine CP partition mode for None.")
+
+    module_name = layer.__class__.__name__
+    module_type_names = {cls.__name__ for cls in type(layer).__mro__}
+    if hasattr(layer, "inner_layer"):
+        return get_required_cp_partition_mode_for_layer(
+            layer.inner_layer, getattr(layer, "config", config), cp_comm_type=cp_comm_type
+        )
+    if hasattr(layer, "self_attention"):
+        return get_required_cp_partition_mode_for_layer(
+            layer.self_attention, getattr(layer, "config", config), cp_comm_type=cp_comm_type
+        )
+    if module_type_names & {"IdentityOp", "IdentityFuncOp"}:
+        return None
+    if "MambaLayer" in module_type_names:
+        # MambaContextParallel currently undoes/redoes Megatron's attention
+        # load-balancing layout internally, so it expects zigzag inputs.
+        return "zigzag"
+    if module_type_names & {"MLPLayer", "MoETransformerLayer"}:
+        return None
+    if "GatedDeltaNet" in module_type_names:
+        mode = getattr(config, "linear_cp_mode", "chunkwise")
+        if mode in {"chunkwise", "headwise"}:
+            return "contiguous"
+        raise ValueError(f"Unsupported GatedDeltaNet linear_cp_mode: {mode!r}.")
+    if module_type_names & {"DSv4HybridAttention", "DSv4HybridSelfAttention"}:
+        return "contiguous"
+
+    # Preserve current standard-attention behavior.  Ring/P2P needs zigzag for
+    # causal load balancing, and TE A2A currently still expects zigzag input.
+    # ``cp_comm_type`` is deliberately part of this policy surface so TE A2A can
+    # switch to contiguous here once the backend stops requiring zigzag.
+    del cp_comm_type
+    if module_type_names & {
+        "SelfAttention",
+        "CrossAttention",
+        "MultiLatentAttention",
+        "MLASelfAttention",
+        "FusedMLASelfAttention",
+        "AbsorbedMLASelfAttention",
+    }:
+        return "zigzag"
+    raise ValueError(
+        f"Cannot determine CP partition mode for layer/module type {module_name!r}."
+    )
+
+
+def build_cp_partition_mode_plan(
+    layers: Any,
+    config: Any,
+    cp_stage_entry_partition_mode: Optional[CpPartitionMode],
+    *,
+    owner_name: str,
+) -> Tuple[CpPartitionMode, List[Optional[CpPartitionMode]], CpPartitionMode]:
+    """Build a local immutable CP partition-mode plan for a block-like module.
+
+    The stage entry partition mode is an external pipeline boundary property.
+    It must not be inferred from local layers.
+    """
+    if (
+        getattr(config, "context_parallel_size", 1) == 1
+        and not getattr(config, "dynamic_context_parallel", False)
+    ):
+        return "zigzag", [None] * len(layers), "zigzag"
+
+    if cp_stage_entry_partition_mode is None:
+        raise ValueError(
+            f"cp_stage_entry_partition_mode must be provided for {owner_name}. "
+            "A block cannot infer its input tensor partition mode from its local layers."
+        )
+    if cp_stage_entry_partition_mode not in ("zigzag", "contiguous"):
+        raise ValueError(
+            f"Unsupported cp_stage_entry_partition_mode {cp_stage_entry_partition_mode!r}."
+        )
+
+    current_partition_mode = cp_stage_entry_partition_mode
+    cp_partition_mode_plan: List[Optional[CpPartitionMode]] = []
+    for layer in layers:
+        layer_config = getattr(layer, "config", config)
+        required_partition_mode = get_required_cp_partition_mode_for_layer(layer, layer_config)
+        cp_partition_mode_plan.append(required_partition_mode)
+        if required_partition_mode is not None:
+            current_partition_mode = required_partition_mode
+
+    return cp_stage_entry_partition_mode, cp_partition_mode_plan, current_partition_mode
+
+
+def get_cp_partition_mode_before_local_index(
+    cp_stage_entry_partition_mode: CpPartitionMode,
+    cp_partition_mode_plan: List[Optional[CpPartitionMode]],
+    local_index: int,
+) -> CpPartitionMode:
+    """Return the CP partition mode immediately before a local layer index."""
+    current_partition_mode = cp_stage_entry_partition_mode
+    for required_partition_mode in cp_partition_mode_plan[:local_index]:
+        if required_partition_mode is not None:
+            current_partition_mode = required_partition_mode
+    return current_partition_mode
 
 
 def get_thd_context_parallel_rank_indices(
-    cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, layout: str
+    cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, cp_partition_mode: str
 ) -> torch.Tensor:
     """Return global THD token indices owned by one CP rank in a layout.
 
@@ -18,14 +158,12 @@ def get_thd_context_parallel_rank_indices(
         cu_seqlens: Global packed-sequence cumulative lengths before CP partitioning.
         cp_size: Context-parallel group size.
         cp_rank: Context-parallel rank.
-        layout: Either ``"zigzag"`` or ``"contiguous"``.
+        cp_partition_mode: Either ``"zigzag"`` or ``"contiguous"``.
 
     The returned indices are ordered exactly as the rank-local THD tensor is stored.
     ``"zigzag"`` follows Megatron's per-sequence load-balanced chunk order; ``"contiguous"``
     partitions the flattened packed THD buffer into rank-contiguous spans.
     """
-    if layout not in ("zigzag", "contiguous"):
-        raise ValueError(f"Unsupported context-parallel layout {layout!r}.")
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
     if not 0 <= cp_rank < cp_size:
@@ -46,22 +184,29 @@ def get_thd_context_parallel_rank_indices(
 
     total_tokens = int(cu[-1].item())
     positions = torch.arange(total_tokens, device=cu.device, dtype=torch.long)
+    if cp_partition_mode not in ("zigzag", "contiguous"):
+        raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
     if total_tokens == 0:
         return positions
 
     seq_lens = torch.diff(cu)
+    if cp_partition_mode == "contiguous":
+        if total_tokens % cp_size != 0:
+            raise ValueError(
+                f"Contiguous CP partitioning requires total_tokens={total_tokens} "
+                f"to be divisible by cp_size={cp_size}."
+            )
+        part_len = total_tokens // cp_size
+        rank_start = cp_rank * part_len
+        return positions[rank_start : rank_start + part_len]
+
     chunk_divisor = 2 * cp_size
     if torch.any(seq_lens % chunk_divisor != 0):
         raise ValueError(
             "All packed sequence lengths must be divisible by "
-            f"2 * cp_size ({chunk_divisor}) for zigzag/contiguous CP layout conversion, "
+            f"2 * cp_size ({chunk_divisor}) for zigzag CP layout conversion, "
             f"got {seq_lens}."
         )
-
-    if layout == "contiguous":
-        part_len = total_tokens // cp_size
-        rank_start = cp_rank * part_len
-        return positions[rank_start : rank_start + part_len]
 
     seq_idx = torch.bucketize(positions, cu[1:], right=True)
     global_starts = cu[:-1]
@@ -96,7 +241,12 @@ def zigzag_to_contiguous_chunks(
     """
     if cu_seqlens is not None:
         return _zigzag_contiguous_thd_swap(
-            x, cp_group, seq_dim, cu_seqlens, source_layout="zigzag", target_layout="contiguous"
+            x,
+            cp_group,
+            seq_dim,
+            cu_seqlens,
+            source_partition_mode="zigzag",
+            target_partition_mode="contiguous",
         )
     return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=True)
 
@@ -110,9 +260,200 @@ def contiguous_to_zigzag_chunks(
     """Inverse of :func:`zigzag_to_contiguous_chunks`."""
     if cu_seqlens is not None:
         return _zigzag_contiguous_thd_swap(
-            x, cp_group, seq_dim, cu_seqlens, source_layout="contiguous", target_layout="zigzag"
+            x,
+            cp_group,
+            seq_dim,
+            cu_seqlens,
+            source_partition_mode="contiguous",
+            target_partition_mode="zigzag",
         )
     return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=False)
+
+
+def convert_cp_partition_mode(
+    x: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    source_partition_mode: str,
+    target_partition_mode: str,
+    seq_dim: int = 0,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    sequence_parallel: bool = False,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """Convert a sequence tensor between CP zigzag and contiguous layouts.
+
+    With sequence parallel enabled, the baseline path gathers the full CP-local
+    sequence on each TP rank, performs the CP layout conversion, then scatters
+    back to the original SP sharding.  ``tp_cp_group`` is accepted for the
+    future direct TPxCP all-to-all implementation.
+    """
+    del tp_cp_group
+
+    if source_partition_mode not in ("zigzag", "contiguous") or target_partition_mode not in (
+        "zigzag",
+        "contiguous",
+    ):
+        raise ValueError(
+            f"Unsupported CP partition mode conversion "
+            f"{source_partition_mode!r} -> {target_partition_mode!r}."
+        )
+    if source_partition_mode == target_partition_mode:
+        return x
+
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if cp_size == 1:
+        return x
+
+    if sequence_parallel and tp_group is not None and tp_group.size() > 1:
+        from megatron.core.tensor_parallel.mappings import (
+            gather_from_sequence_parallel_region,
+            scatter_to_sequence_parallel_region,
+        )
+
+        moved = x.movedim(seq_dim, 0) if seq_dim != 0 else x
+        gathered = gather_from_sequence_parallel_region(moved, group=tp_group)
+        converted = _convert_cp_partition_mode_full_sequence(
+            gathered,
+            cp_group,
+            source_partition_mode=source_partition_mode,
+            target_partition_mode=target_partition_mode,
+            seq_dim=0,
+            cu_seqlens=cu_seqlens,
+        )
+        scattered = scatter_to_sequence_parallel_region(converted, group=tp_group)
+        return scattered.movedim(0, seq_dim).contiguous() if seq_dim != 0 else scattered
+
+    return _convert_cp_partition_mode_full_sequence(
+        x,
+        cp_group,
+        source_partition_mode=source_partition_mode,
+        target_partition_mode=target_partition_mode,
+        seq_dim=seq_dim,
+        cu_seqlens=cu_seqlens,
+    )
+
+
+def get_packed_seq_params_cp_partition_cu_seqlens(
+    packed_seq_params: Optional[Any],
+) -> Optional[torch.Tensor]:
+    """Return THD cumulative sequence lengths used for CP layout conversion."""
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        return None
+    return (
+        packed_seq_params.cu_seqlens_q_padded
+        if packed_seq_params.cu_seqlens_q_padded is not None
+        else packed_seq_params.cu_seqlens_q
+    )
+
+
+def replace_packed_seq_params_cp_partition_mode(
+    packed_seq_params: Optional[Any],
+    cp_partition_mode: CpPartitionMode,
+) -> Optional[Any]:
+    """Return packed-sequence metadata annotated with the current CP partition mode."""
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        return packed_seq_params
+    if getattr(packed_seq_params, "cp_partition_mode", None) == cp_partition_mode:
+        return packed_seq_params
+    return replace(packed_seq_params, cp_partition_mode=cp_partition_mode)
+
+
+def convert_cp_partition_mode_nested(
+    value: Any,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    source_partition_mode: str,
+    target_partition_mode: str,
+    seq_dim: Union[int, Callable[[torch.Tensor], int]] = 0,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    sequence_parallel: bool = False,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Any:
+    """Recursively convert tensors inside a nested value between CP layouts.
+
+    ``None`` and non-tensor leaves are returned unchanged.  Lists and tuples are
+    traversed recursively while preserving their container type.
+    """
+    if source_partition_mode not in ("zigzag", "contiguous") or target_partition_mode not in (
+        "zigzag",
+        "contiguous",
+    ):
+        raise ValueError(
+            f"Unsupported CP partition mode conversion "
+            f"{source_partition_mode!r} -> {target_partition_mode!r}."
+        )
+    if source_partition_mode == target_partition_mode:
+        return value
+    if value is None:
+        return None
+    if isinstance(value, tuple):
+        return tuple(
+            convert_cp_partition_mode_nested(
+                part,
+                cp_group,
+                source_partition_mode=source_partition_mode,
+                target_partition_mode=target_partition_mode,
+                seq_dim=seq_dim,
+                cu_seqlens=cu_seqlens,
+                sequence_parallel=sequence_parallel,
+                tp_group=tp_group,
+                tp_cp_group=tp_cp_group,
+            )
+            for part in value
+        )
+    if isinstance(value, list):
+        return [
+            convert_cp_partition_mode_nested(
+                part,
+                cp_group,
+                source_partition_mode=source_partition_mode,
+                target_partition_mode=target_partition_mode,
+                seq_dim=seq_dim,
+                cu_seqlens=cu_seqlens,
+                sequence_parallel=sequence_parallel,
+                tp_group=tp_group,
+                tp_cp_group=tp_cp_group,
+            )
+            for part in value
+        ]
+    if not torch.is_tensor(value):
+        return value
+
+    resolved_seq_dim = seq_dim(value) if callable(seq_dim) else seq_dim
+    return convert_cp_partition_mode(
+        value,
+        cp_group,
+        source_partition_mode=source_partition_mode,
+        target_partition_mode=target_partition_mode,
+        seq_dim=resolved_seq_dim,
+        cu_seqlens=cu_seqlens,
+        sequence_parallel=sequence_parallel,
+        tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
+    )
+
+
+def _convert_cp_partition_mode_full_sequence(
+    x: torch.Tensor,
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    *,
+    source_partition_mode: CpPartitionMode,
+    target_partition_mode: CpPartitionMode,
+    seq_dim: int,
+    cu_seqlens: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Convert a tensor whose sequence dim contains the full CP-local sequence."""
+    if source_partition_mode == "zigzag" and target_partition_mode == "contiguous":
+        return zigzag_to_contiguous_chunks(x, cp_group, seq_dim=seq_dim, cu_seqlens=cu_seqlens)
+    if source_partition_mode == "contiguous" and target_partition_mode == "zigzag":
+        return contiguous_to_zigzag_chunks(x, cp_group, seq_dim=seq_dim, cu_seqlens=cu_seqlens)
+    raise ValueError(
+        f"Unsupported CP partition mode conversion "
+        f"{source_partition_mode!r} -> {target_partition_mode!r}."
+    )
 
 
 def _zigzag_contiguous_thd_swap(
@@ -120,8 +461,8 @@ def _zigzag_contiguous_thd_swap(
     cp_group: Optional[torch.distributed.ProcessGroup],
     seq_dim: int,
     cu_seqlens: torch.Tensor,
-    source_layout: str,
-    target_layout: str,
+    source_partition_mode: str,
+    target_partition_mode: str,
 ) -> torch.Tensor:
     """Single-all-to-all THD permutation between zigzag and contiguous layouts.
 
@@ -133,6 +474,7 @@ def _zigzag_contiguous_thd_swap(
     if cp_size == 1:
         return x
     cp_rank = cp_group.rank()
+    from megatron.core.tensor_parallel.mappings import all_to_all
 
     if seq_dim != 0:
         x = x.movedim(seq_dim, 0)
@@ -143,11 +485,11 @@ def _zigzag_contiguous_thd_swap(
     # microbatch from immutable cu_seqlens and pass it through both THD swaps.
     # Do not cache it across microbatches because packed sequence boundaries change.
     source_by_rank = [
-        get_thd_context_parallel_rank_indices(cu, cp_size, rank, source_layout)
+        get_thd_context_parallel_rank_indices(cu, cp_size, rank, source_partition_mode)
         for rank in range(cp_size)
     ]
     target_by_rank = [
-        get_thd_context_parallel_rank_indices(cu, cp_size, rank, target_layout)
+        get_thd_context_parallel_rank_indices(cu, cp_size, rank, target_partition_mode)
         for rank in range(cp_size)
     ]
 
@@ -155,7 +497,7 @@ def _zigzag_contiguous_thd_swap(
     local_target_indices = target_by_rank[cp_rank]
     if x.size(0) != local_source_indices.numel():
         raise ValueError(
-            f"Local THD tensor length ({x.size(0)}) does not match {source_layout} "
+            f"Local THD tensor length ({x.size(0)}) does not match {source_partition_mode} "
             f"rank-{cp_rank} partition length ({local_source_indices.numel()})."
         )
 
@@ -231,6 +573,7 @@ def _zigzag_contiguous_chunk_swap(
     if cp_size == 1:
         return x
     cp_rank = cp_group.rank()
+    from megatron.core.tensor_parallel.mappings import all_to_all
 
     # Work with seq_dim at position 0.
     if seq_dim != 0:
