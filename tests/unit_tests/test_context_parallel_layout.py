@@ -16,6 +16,9 @@ from megatron.core.context_parallel_layout import (
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_stage_input_cp_partition_mode,
 )
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    get_hybrid_stage_input_cp_partition_mode,
+)
 
 
 class _PipelineLayout:
@@ -203,7 +206,10 @@ def test_gated_delta_net_chunkwise_layout_plan_follows_linear_attention_pattern(
     )
 
     config.pipeline_model_parallel_layout = _PipelineLayout(offset=2)
-    assert get_experimental_attention_variant_stage_input_cp_partition_mode(config) == "zigzag"
+    assert (
+        get_experimental_attention_variant_stage_input_cp_partition_mode(config)
+        == "zigzag"
+    )
 
 
 def test_gated_delta_net_headwise_layout_plan_uses_contiguous():
@@ -220,3 +226,26 @@ def test_gated_delta_net_headwise_layout_plan_uses_contiguous():
         get_experimental_attention_variant_stage_input_cp_partition_mode(config)
         == "contiguous"
     )
+
+
+def test_hybrid_stage_input_layout_follows_previous_sensitive_layer():
+    config = SimpleNamespace(experimental_attention_variant=None, linear_cp_mode="chunkwise")
+
+    assert get_hybrid_stage_input_cp_partition_mode(config, "M-G", 0) == "zigzag"
+    assert get_hybrid_stage_input_cp_partition_mode(config, "M-G", 2) == "zigzag"
+    assert get_hybrid_stage_input_cp_partition_mode(config, "M-G", 3) == "contiguous"
+
+
+def test_hybrid_stage_input_layout_uses_future_layer_before_first_sensitive_layer():
+    config = SimpleNamespace(experimental_attention_variant=None, linear_cp_mode="chunkwise")
+
+    assert get_hybrid_stage_input_cp_partition_mode(config, "-G", 0) == "contiguous"
+
+
+def test_hybrid_stage_input_layout_handles_dsv4_symbols():
+    config = SimpleNamespace(
+        experimental_attention_variant="dsv4_hybrid", linear_cp_mode="chunkwise"
+    )
+
+    assert get_hybrid_stage_input_cp_partition_mode(config, "D-E", 0) == "contiguous"
+    assert get_hybrid_stage_input_cp_partition_mode(config, "C-E", 0) == "contiguous"
