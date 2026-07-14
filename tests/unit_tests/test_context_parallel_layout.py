@@ -13,6 +13,18 @@ from megatron.core.context_parallel_layout import (
     get_required_cp_partition_mode_for_layer,
     get_thd_context_parallel_rank_indices,
 )
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_experimental_attention_variant_stage_input_cp_partition_mode,
+)
+
+
+class _PipelineLayout:
+
+    def __init__(self, offset):
+        self.offset = offset
+
+    def get_layer_offset(self, **_kwargs):
+        return self.offset
 
 
 class IdentityOp:
@@ -173,3 +185,38 @@ def test_build_cp_partition_mode_plan_skips_layer_inspection_without_cp():
     assert entry == "zigzag"
     assert plan == [None, None]
     assert exit_layout == "zigzag"
+
+
+def test_gated_delta_net_chunkwise_layout_plan_follows_linear_attention_pattern():
+    config = SimpleNamespace(
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=2,
+        linear_cp_mode="chunkwise",
+        num_layers=4,
+        pipeline_model_parallel_layout=None,
+        pipeline_model_parallel_size=1,
+    )
+
+    assert (
+        get_experimental_attention_variant_stage_input_cp_partition_mode(config)
+        == "contiguous"
+    )
+
+    config.pipeline_model_parallel_layout = _PipelineLayout(offset=2)
+    assert get_experimental_attention_variant_stage_input_cp_partition_mode(config) == "zigzag"
+
+
+def test_gated_delta_net_headwise_layout_plan_uses_contiguous():
+    config = SimpleNamespace(
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=[1, 0],
+        linear_cp_mode="headwise",
+        num_layers=2,
+        pipeline_model_parallel_layout=None,
+        pipeline_model_parallel_size=1,
+    )
+
+    assert (
+        get_experimental_attention_variant_stage_input_cp_partition_mode(config)
+        == "contiguous"
+    )
