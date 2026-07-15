@@ -748,9 +748,12 @@ class GPTModel(LanguageModule):
                 padding_mask = convert_cp_partition_mode_nested(
                     padding_mask, cp_group, seq_dim=-1, **cp_conversion_kwargs
                 )
-                rotary_pos_emb = convert_cp_partition_mode_nested(
-                    rotary_pos_emb, cp_group, seq_dim=0, **cp_conversion_kwargs
-                )
+                # THD RoPE tables stay in global packed-token order; only SBHD
+                # RoPE tensors are CP-rank local and need layout conversion.
+                if packed_seq_params is None:
+                    rotary_pos_emb = convert_cp_partition_mode_nested(
+                        rotary_pos_emb, cp_group, seq_dim=0, **cp_conversion_kwargs
+                    )
                 packed_seq_params = replace_packed_seq_params_cp_partition_mode(
                     packed_seq_params, target_partition_mode
                 )
