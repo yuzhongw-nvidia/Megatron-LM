@@ -7,9 +7,11 @@ import torch
 
 import megatron.core.context_parallel_layout as context_parallel_layout
 from megatron.core.context_parallel_layout import (
+    build_thd_cp_partition_route,
     build_cp_partition_mode_plan,
     convert_cp_partition_mode_nested,
     get_context_parallel_layout_chunk_indices,
+    get_or_build_thd_cp_partition_route,
     get_required_cp_partition_mode_for_layer,
     get_thd_context_parallel_rank_indices,
 )
@@ -36,6 +38,19 @@ class IdentityOp:
 
 class GatedDeltaNet:
     pass
+
+
+class _FakeGroup:
+
+    def __init__(self, size, rank):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
 
 
 def _token_ranges(*spans):
@@ -104,6 +119,66 @@ def test_thd_contiguous_rank_indices_allow_uneven_sequence_lengths():
     assert get_thd_context_parallel_rank_indices(cu_seqlens, 2, 1, "contiguous").tolist() == list(
         range(9, 18)
     )
+
+
+@pytest.mark.parametrize(
+    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+)
+def test_thd_cp_partition_route_reassembles_target_layout(source_layout, target_layout):
+    cu_seqlens = torch.tensor([0, 16, 40])
+    cp_size = 2
+
+    source_indices = [
+        get_thd_context_parallel_rank_indices(cu_seqlens, cp_size, rank, source_layout)
+        for rank in range(cp_size)
+    ]
+    target_indices = [
+        get_thd_context_parallel_rank_indices(cu_seqlens, cp_size, rank, target_layout)
+        for rank in range(cp_size)
+    ]
+    routes = [
+        build_thd_cp_partition_route(cu_seqlens, cp_size, rank, source_layout, target_layout)
+        for rank in range(cp_size)
+    ]
+    send_buffers = [
+        source_indices[rank].index_select(0, routes[rank].send_rows) for rank in range(cp_size)
+    ]
+
+    for dst_rank in range(cp_size):
+        recv_chunks = []
+        for src_rank in range(cp_size):
+            src_route = routes[src_rank]
+            send_offset = sum(src_route.input_split_sizes[:dst_rank])
+            send_len = src_route.input_split_sizes[dst_rank]
+            recv_chunks.append(send_buffers[src_rank].narrow(0, send_offset, send_len))
+        recv_buf = torch.cat(recv_chunks, dim=0)
+        out = torch.empty(routes[dst_rank].local_target_length, dtype=recv_buf.dtype)
+        out.index_copy_(0, routes[dst_rank].recv_rows, recv_buf)
+        assert torch.equal(out, target_indices[dst_rank])
+
+
+def test_thd_cp_partition_route_cache_reuses_same_microbatch_route():
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor([0, 16, 40]),
+        cu_seqlens_q_padded=None,
+        cp_partition_route_cache=None,
+    )
+    cp_group = _FakeGroup(size=2, rank=0)
+
+    route = get_or_build_thd_cp_partition_route(
+        packed_seq_params, cp_group, "zigzag", "contiguous"
+    )
+    same_route = get_or_build_thd_cp_partition_route(
+        packed_seq_params, cp_group, "zigzag", "contiguous"
+    )
+    reverse_route = get_or_build_thd_cp_partition_route(
+        packed_seq_params, cp_group, "contiguous", "zigzag"
+    )
+
+    assert same_route is route
+    assert reverse_route is not route
+    assert len(packed_seq_params.cp_partition_route_cache) == 2
 
 
 def test_thd_context_parallel_rank_indices_reject_decreasing_boundaries():

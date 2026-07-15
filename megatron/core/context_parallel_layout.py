@@ -2,13 +2,29 @@
 
 """Context parallel sequence partition-mode helpers."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 
 import torch
 
 
 CpPartitionMode = Literal["zigzag", "contiguous"]
+
+
+@dataclass(frozen=True)
+class ThdCPPartitionRoute:
+    """Precomputed local routing for one THD CP partition-mode conversion."""
+
+    source_partition_mode: CpPartitionMode
+    target_partition_mode: CpPartitionMode
+    cp_size: int
+    cp_rank: int
+    local_source_length: int
+    local_target_length: int
+    send_rows: torch.Tensor
+    recv_rows: torch.Tensor
+    input_split_sizes: List[int]
+    output_split_sizes: List[int]
 
 
 def get_context_parallel_layout_chunk_indices(
@@ -227,11 +243,188 @@ def get_thd_context_parallel_rank_indices(
     return rank_positions[torch.argsort(rank_local_pos)]
 
 
+def build_thd_cp_partition_route(
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    source_partition_mode: CpPartitionMode,
+    target_partition_mode: CpPartitionMode,
+    *,
+    device: Optional[torch.device] = None,
+) -> ThdCPPartitionRoute:
+    """Precompute local send/receive indices for one THD CP layout conversion.
+
+    The route depends only on packed sequence metadata, CP rank/size, and the
+    source/target partition modes.  It can be reused for every tensor that has
+    the same THD sequence axis in the same microbatch.
+    """
+    if source_partition_mode not in ("zigzag", "contiguous") or target_partition_mode not in (
+        "zigzag",
+        "contiguous",
+    ):
+        raise ValueError(
+            f"Unsupported CP partition mode conversion "
+            f"{source_partition_mode!r} -> {target_partition_mode!r}."
+        )
+    if source_partition_mode == target_partition_mode:
+        raise ValueError("A THD CP partition route is only needed when partition modes differ.")
+    if device is None:
+        device = cu_seqlens.device
+
+    cu = cu_seqlens.to(device=device, dtype=torch.long)
+    source_by_rank = [
+        get_thd_context_parallel_rank_indices(cu, cp_size, rank, source_partition_mode)
+        for rank in range(cp_size)
+    ]
+    target_by_rank = [
+        get_thd_context_parallel_rank_indices(cu, cp_size, rank, target_partition_mode)
+        for rank in range(cp_size)
+    ]
+
+    local_source_indices = source_by_rank[cp_rank]
+    local_target_indices = target_by_rank[cp_rank]
+    total_tokens = int(cu[-1].item())
+    target_owner = torch.empty(total_tokens, device=device, dtype=torch.long)
+    target_local_pos = torch.empty(total_tokens, device=device, dtype=torch.long)
+    for rank, indices in enumerate(target_by_rank):
+        target_owner[indices] = rank
+        target_local_pos[indices] = torch.arange(indices.numel(), device=device)
+
+    local_target_owner = target_owner[local_source_indices]
+    local_target_pos = target_local_pos[local_source_indices]
+
+    send_row_parts: List[torch.Tensor] = []
+    input_split_sizes: List[int] = []
+    for dst_rank in range(cp_size):
+        dst_rows = (local_target_owner == dst_rank).nonzero(as_tuple=False).flatten()
+        if dst_rows.numel() > 0:
+            dst_rows = dst_rows[torch.argsort(local_target_pos[dst_rows])]
+        send_row_parts.append(dst_rows)
+        input_split_sizes.append(dst_rows.numel())
+    send_rows = (
+        torch.cat(send_row_parts, dim=0)
+        if send_row_parts
+        else torch.empty(0, device=device, dtype=torch.long)
+    )
+
+    recv_row_parts: List[torch.Tensor] = []
+    output_split_sizes: List[int] = []
+    for src_rank in range(cp_size):
+        src_indices = source_by_rank[src_rank]
+        src_to_this_rank = target_owner[src_indices] == cp_rank
+        recv_global_indices = src_indices[src_to_this_rank]
+        if recv_global_indices.numel() > 0:
+            recv_positions = target_local_pos[recv_global_indices]
+            recv_positions = recv_positions[torch.argsort(recv_positions)]
+        else:
+            recv_positions = local_target_indices.narrow(0, 0, 0)
+        recv_row_parts.append(recv_positions)
+        output_split_sizes.append(recv_positions.numel())
+    recv_rows = (
+        torch.cat(recv_row_parts, dim=0)
+        if recv_row_parts
+        else torch.empty(0, device=device, dtype=torch.long)
+    )
+
+    assert send_rows.numel() == local_source_indices.numel()
+    assert recv_rows.numel() == local_target_indices.numel()
+    return ThdCPPartitionRoute(
+        source_partition_mode=source_partition_mode,
+        target_partition_mode=target_partition_mode,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        local_source_length=local_source_indices.numel(),
+        local_target_length=local_target_indices.numel(),
+        send_rows=send_rows,
+        recv_rows=recv_rows,
+        input_split_sizes=input_split_sizes,
+        output_split_sizes=output_split_sizes,
+    )
+
+
+def _thd_route_cache_key(
+    cu_seqlens: torch.Tensor,
+    device: torch.device,
+    cp_size: int,
+    cp_rank: int,
+    source_partition_mode: CpPartitionMode,
+    target_partition_mode: CpPartitionMode,
+) -> Tuple[Any, ...]:
+    device_index = device.index if device.index is not None else -1
+    return (
+        source_partition_mode,
+        target_partition_mode,
+        cp_size,
+        cp_rank,
+        device.type,
+        device_index,
+        cu_seqlens.data_ptr(),
+        cu_seqlens.storage_offset(),
+        tuple(cu_seqlens.shape),
+        getattr(cu_seqlens, "_version", None),
+    )
+
+
+def get_or_build_thd_cp_partition_route(
+    packed_seq_params: Optional[Any],
+    cp_group: Optional[torch.distributed.ProcessGroup],
+    source_partition_mode: CpPartitionMode,
+    target_partition_mode: CpPartitionMode,
+    *,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    device: Optional[torch.device] = None,
+) -> Optional[ThdCPPartitionRoute]:
+    """Return a cached THD CP partition route for one packed microbatch."""
+    if source_partition_mode == target_partition_mode:
+        return None
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if cp_size == 1:
+        return None
+    cp_rank = cp_group.rank()
+    if cu_seqlens is None:
+        cu_seqlens = get_packed_seq_params_cp_partition_cu_seqlens(packed_seq_params)
+    if cu_seqlens is None:
+        return None
+    if device is None:
+        device = cu_seqlens.device
+
+    if packed_seq_params is None:
+        return build_thd_cp_partition_route(
+            cu_seqlens,
+            cp_size,
+            cp_rank,
+            source_partition_mode,
+            target_partition_mode,
+            device=device,
+        )
+
+    cache = getattr(packed_seq_params, "cp_partition_route_cache", None)
+    if cache is None:
+        cache = {}
+        packed_seq_params.cp_partition_route_cache = cache
+    key = _thd_route_cache_key(
+        cu_seqlens, device, cp_size, cp_rank, source_partition_mode, target_partition_mode
+    )
+    route = cache.get(key)
+    if route is None:
+        route = build_thd_cp_partition_route(
+            cu_seqlens,
+            cp_size,
+            cp_rank,
+            source_partition_mode,
+            target_partition_mode,
+            device=device,
+        )
+        cache[key] = route
+    return route
+
+
 def zigzag_to_contiguous_chunks(
     x: torch.Tensor,
     cp_group: torch.distributed.ProcessGroup,
     seq_dim: int = 0,
     cu_seqlens: Optional[torch.Tensor] = None,
+    thd_cp_partition_route: Optional[ThdCPPartitionRoute] = None,
 ) -> torch.Tensor:
     """Permute CP chunks from Megatron zigzag layout to contiguous-time layout.
 
@@ -247,6 +440,7 @@ def zigzag_to_contiguous_chunks(
             cu_seqlens,
             source_partition_mode="zigzag",
             target_partition_mode="contiguous",
+            thd_cp_partition_route=thd_cp_partition_route,
         )
     return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=True)
 
@@ -256,6 +450,7 @@ def contiguous_to_zigzag_chunks(
     cp_group: torch.distributed.ProcessGroup,
     seq_dim: int = 0,
     cu_seqlens: Optional[torch.Tensor] = None,
+    thd_cp_partition_route: Optional[ThdCPPartitionRoute] = None,
 ) -> torch.Tensor:
     """Inverse of :func:`zigzag_to_contiguous_chunks`."""
     if cu_seqlens is not None:
@@ -266,6 +461,7 @@ def contiguous_to_zigzag_chunks(
             cu_seqlens,
             source_partition_mode="contiguous",
             target_partition_mode="zigzag",
+            thd_cp_partition_route=thd_cp_partition_route,
         )
     return _zigzag_contiguous_chunk_swap(x, cp_group, seq_dim, to_contiguous=False)
 
@@ -281,6 +477,7 @@ def convert_cp_partition_mode(
     sequence_parallel: bool = False,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    thd_cp_partition_route: Optional[ThdCPPartitionRoute] = None,
 ) -> torch.Tensor:
     """Convert a sequence tensor between CP zigzag and contiguous layouts.
 
@@ -321,6 +518,7 @@ def convert_cp_partition_mode(
             target_partition_mode=target_partition_mode,
             seq_dim=0,
             cu_seqlens=cu_seqlens,
+            thd_cp_partition_route=thd_cp_partition_route,
         )
         scattered = scatter_to_sequence_parallel_region(converted, group=tp_group)
         return scattered.movedim(0, seq_dim).contiguous() if seq_dim != 0 else scattered
@@ -332,6 +530,7 @@ def convert_cp_partition_mode(
         target_partition_mode=target_partition_mode,
         seq_dim=seq_dim,
         cu_seqlens=cu_seqlens,
+        thd_cp_partition_route=thd_cp_partition_route,
     )
 
 
@@ -371,6 +570,7 @@ def convert_cp_partition_mode_nested(
     sequence_parallel: bool = False,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    thd_cp_partition_route: Optional[ThdCPPartitionRoute] = None,
 ) -> Any:
     """Recursively convert tensors inside a nested value between CP layouts.
 
@@ -401,6 +601,7 @@ def convert_cp_partition_mode_nested(
                 sequence_parallel=sequence_parallel,
                 tp_group=tp_group,
                 tp_cp_group=tp_cp_group,
+                thd_cp_partition_route=thd_cp_partition_route,
             )
             for part in value
         )
@@ -416,6 +617,7 @@ def convert_cp_partition_mode_nested(
                 sequence_parallel=sequence_parallel,
                 tp_group=tp_group,
                 tp_cp_group=tp_cp_group,
+                thd_cp_partition_route=thd_cp_partition_route,
             )
             for part in value
         ]
@@ -433,6 +635,7 @@ def convert_cp_partition_mode_nested(
         sequence_parallel=sequence_parallel,
         tp_group=tp_group,
         tp_cp_group=tp_cp_group,
+        thd_cp_partition_route=thd_cp_partition_route,
     )
 
 
@@ -444,12 +647,25 @@ def _convert_cp_partition_mode_full_sequence(
     target_partition_mode: CpPartitionMode,
     seq_dim: int,
     cu_seqlens: Optional[torch.Tensor],
+    thd_cp_partition_route: Optional[ThdCPPartitionRoute] = None,
 ) -> torch.Tensor:
     """Convert a tensor whose sequence dim contains the full CP-local sequence."""
     if source_partition_mode == "zigzag" and target_partition_mode == "contiguous":
-        return zigzag_to_contiguous_chunks(x, cp_group, seq_dim=seq_dim, cu_seqlens=cu_seqlens)
+        return zigzag_to_contiguous_chunks(
+            x,
+            cp_group,
+            seq_dim=seq_dim,
+            cu_seqlens=cu_seqlens,
+            thd_cp_partition_route=thd_cp_partition_route,
+        )
     if source_partition_mode == "contiguous" and target_partition_mode == "zigzag":
-        return contiguous_to_zigzag_chunks(x, cp_group, seq_dim=seq_dim, cu_seqlens=cu_seqlens)
+        return contiguous_to_zigzag_chunks(
+            x,
+            cp_group,
+            seq_dim=seq_dim,
+            cu_seqlens=cu_seqlens,
+            thd_cp_partition_route=thd_cp_partition_route,
+        )
     raise ValueError(
         f"Unsupported CP partition mode conversion "
         f"{source_partition_mode!r} -> {target_partition_mode!r}."
@@ -463,6 +679,7 @@ def _zigzag_contiguous_thd_swap(
     cu_seqlens: torch.Tensor,
     source_partition_mode: str,
     target_partition_mode: str,
+    thd_cp_partition_route: Optional[ThdCPPartitionRoute] = None,
 ) -> torch.Tensor:
     """Single-all-to-all THD permutation between zigzag and contiguous layouts.
 
@@ -480,75 +697,58 @@ def _zigzag_contiguous_thd_swap(
         x = x.movedim(seq_dim, 0)
     x = x.contiguous()
 
-    cu = cu_seqlens.to(device=x.device, dtype=torch.long)
-    # TODO: Let a future CP layout scheduler precompute this routing once per
-    # microbatch from immutable cu_seqlens and pass it through both THD swaps.
-    # Do not cache it across microbatches because packed sequence boundaries change.
-    source_by_rank = [
-        get_thd_context_parallel_rank_indices(cu, cp_size, rank, source_partition_mode)
-        for rank in range(cp_size)
-    ]
-    target_by_rank = [
-        get_thd_context_parallel_rank_indices(cu, cp_size, rank, target_partition_mode)
-        for rank in range(cp_size)
-    ]
-
-    local_source_indices = source_by_rank[cp_rank]
-    local_target_indices = target_by_rank[cp_rank]
-    if x.size(0) != local_source_indices.numel():
+    route = thd_cp_partition_route
+    if route is None:
+        route = build_thd_cp_partition_route(
+            cu_seqlens,
+            cp_size,
+            cp_rank,
+            source_partition_mode,
+            target_partition_mode,
+            device=x.device,
+        )
+    if (
+        route.source_partition_mode != source_partition_mode
+        or route.target_partition_mode != target_partition_mode
+        or route.cp_size != cp_size
+        or route.cp_rank != cp_rank
+    ):
         raise ValueError(
-            f"Local THD tensor length ({x.size(0)}) does not match {source_partition_mode} "
-            f"rank-{cp_rank} partition length ({local_source_indices.numel()})."
+            "THD CP partition route does not match the requested conversion: "
+            f"route={route.source_partition_mode}->{route.target_partition_mode}, "
+            f"cp_size={route.cp_size}, cp_rank={route.cp_rank}; "
+            f"requested={source_partition_mode}->{target_partition_mode}, "
+            f"cp_size={cp_size}, cp_rank={cp_rank}."
+        )
+    if route.send_rows.device != x.device or route.recv_rows.device != x.device:
+        route = build_thd_cp_partition_route(
+            cu_seqlens,
+            cp_size,
+            cp_rank,
+            source_partition_mode,
+            target_partition_mode,
+            device=x.device,
         )
 
-    total_tokens = int(cu[-1].item())
-    target_owner = torch.empty(total_tokens, device=x.device, dtype=torch.long)
-    target_local_pos = torch.empty(total_tokens, device=x.device, dtype=torch.long)
-    for rank, indices in enumerate(target_by_rank):
-        target_owner[indices] = rank
-        target_local_pos[indices] = torch.arange(indices.numel(), device=x.device)
+    if x.size(0) != route.local_source_length:
+        raise ValueError(
+            f"Local THD tensor length ({x.size(0)}) does not match {source_partition_mode} "
+            f"rank-{cp_rank} partition length ({route.local_source_length})."
+        )
 
-    local_target_owner = target_owner[local_source_indices]
-    local_target_pos = target_local_pos[local_source_indices]
+    send_buf = (
+        x.index_select(0, route.send_rows)
+        if route.send_rows.numel() > 0
+        else x.narrow(0, 0, 0)
+    )
+    recv_buf = all_to_all(
+        cp_group, send_buf.contiguous(), route.output_split_sizes, route.input_split_sizes
+    )
 
-    send_parts: List[torch.Tensor] = []
-    input_split_sizes: List[int] = []
-    for dst_rank in range(cp_size):
-        dst_mask = local_target_owner == dst_rank
-        dst_rows = dst_mask.nonzero(as_tuple=False).flatten()
-        if dst_rows.numel() > 0:
-            dst_rows = dst_rows[torch.argsort(local_target_pos[dst_rows])]
-            send_part = x.index_select(0, dst_rows)
-        else:
-            send_part = x.narrow(0, 0, 0)
-        send_parts.append(send_part)
-        input_split_sizes.append(send_part.size(0))
-    send_buf = torch.cat(send_parts, dim=0).contiguous()
-
-    output_split_sizes: List[int] = []
-    recv_target_positions: List[torch.Tensor] = []
-    for src_rank in range(cp_size):
-        src_indices = source_by_rank[src_rank]
-        src_to_this_rank = target_owner[src_indices] == cp_rank
-        recv_global_indices = src_indices[src_to_this_rank]
-        if recv_global_indices.numel() > 0:
-            recv_positions = target_local_pos[recv_global_indices]
-            recv_positions = recv_positions[torch.argsort(recv_positions)]
-        else:
-            recv_positions = local_target_indices.narrow(0, 0, 0)
-        recv_target_positions.append(recv_positions)
-        output_split_sizes.append(recv_positions.numel())
-
-    recv_buf = all_to_all(cp_group, send_buf, output_split_sizes, input_split_sizes)
-
-    out_shape = (local_target_indices.numel(),) + tuple(x.shape[1:])
+    out_shape = (route.local_target_length,) + tuple(x.shape[1:])
     out = x.new_empty(out_shape)
-    offset = 0
-    for recv_positions in recv_target_positions:
-        recv_len = recv_positions.numel()
-        if recv_len > 0:
-            out[recv_positions] = recv_buf[offset : offset + recv_len]
-            offset += recv_len
+    if route.recv_rows.numel() > 0:
+        out.index_copy_(0, route.recv_rows, recv_buf)
 
     if seq_dim != 0:
         out = out.movedim(0, seq_dim)

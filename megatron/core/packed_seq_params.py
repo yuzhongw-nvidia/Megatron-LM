@@ -28,6 +28,7 @@ class PackedSeqParams:
     seq_idx: Tensor = None
     pad_between_seqs: Optional[bool] = None
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    cp_partition_route_cache: Optional[dict] = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

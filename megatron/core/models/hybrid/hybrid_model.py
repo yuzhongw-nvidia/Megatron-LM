@@ -11,6 +11,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.context_parallel_layout import (
     CpPartitionMode,
     convert_cp_partition_mode_nested,
+    get_or_build_thd_cp_partition_route,
     get_packed_seq_params_cp_partition_cu_seqlens,
     replace_packed_seq_params_cp_partition_mode,
 )
@@ -580,6 +581,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if self.config.mtp_num_layers:
                 if cp_group is not None and cp_group.size() > 1:
                     target_partition_mode = "zigzag"
+            hidden_thd_cp_partition_route = get_or_build_thd_cp_partition_route(
+                packed_seq_params,
+                cp_group,
+                current_partition_mode,
+                target_partition_mode,
+                cu_seqlens=cu_seqlens,
+                device=hidden_states.device,
+            )
             hidden_conversion_kwargs = {
                 "source_partition_mode": current_partition_mode,
                 "target_partition_mode": target_partition_mode,
@@ -587,6 +596,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "sequence_parallel": self.config.sequence_parallel,
                 "tp_group": self.pg_collection.tp,
                 "tp_cp_group": getattr(self.pg_collection, "tp_cp", None),
+                "thd_cp_partition_route": hidden_thd_cp_partition_route,
             }
             hidden_states = convert_cp_partition_mode_nested(
                 hidden_states,
@@ -612,6 +622,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "source_partition_mode": input_partition_mode,
                     "target_partition_mode": target_partition_mode,
                     "cu_seqlens": cu_seqlens,
+                    "thd_cp_partition_route": get_or_build_thd_cp_partition_route(
+                        packed_seq_params,
+                        cp_group,
+                        input_partition_mode,
+                        target_partition_mode,
+                        cu_seqlens=cu_seqlens,
+                        device=hidden_states.device,
+                    ),
                 }
                 input_ids = convert_cp_partition_mode_nested(
                     input_ids, cp_group, seq_dim=-1, **cp_conversion_kwargs
