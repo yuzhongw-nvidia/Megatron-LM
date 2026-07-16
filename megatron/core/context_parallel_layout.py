@@ -42,12 +42,6 @@ def _cp_layout_nvtx_range(message: str):
             torch.cuda.nvtx.range_pop()
 
 
-def _row_order_is_identity(rows: torch.Tensor) -> bool:
-    if rows.numel() == 0:
-        return True
-    return torch.equal(rows, torch.arange(rows.numel(), device=rows.device, dtype=rows.dtype))
-
-
 def get_context_parallel_layout_chunk_indices(
     cp_size: int, cp_rank: int, cp_partition_mode: str
 ) -> torch.Tensor:
@@ -265,6 +259,126 @@ def get_thd_context_parallel_rank_indices(
     return rank_positions[torch.argsort(rank_local_pos)]
 
 
+_ThdLayoutSegment = Tuple[int, int, int]
+
+
+def _compact_thd_cu_seqlens_to_list(cu_seqlens: torch.Tensor) -> List[int]:
+    if cu_seqlens.dim() != 1:
+        raise ValueError(f"cu_seqlens must be 1-D, got shape {tuple(cu_seqlens.shape)}.")
+
+    cu = cu_seqlens.detach().to(device="cpu", dtype=torch.long).tolist()
+    if not cu or cu[0] != 0:
+        raise ValueError(f"cu_seqlens must start at 0, got {cu_seqlens}.")
+
+    compact_cu: List[int] = [cu[0]]
+    prev = cu[0]
+    for value in cu[1:]:
+        if value < prev:
+            raise ValueError(f"cu_seqlens must be nondecreasing, got {cu_seqlens}.")
+        if value != prev:
+            compact_cu.append(value)
+        prev = value
+    return compact_cu
+
+
+def _validate_thd_route_partitioning(cu: List[int], cp_size: int) -> None:
+    total_tokens = cu[-1]
+    if total_tokens % cp_size != 0:
+        raise ValueError(
+            f"Contiguous CP partitioning requires total_tokens={total_tokens} "
+            f"to be divisible by cp_size={cp_size}."
+        )
+
+    chunk_divisor = 2 * cp_size
+    bad_seq_lens = [
+        seq_end - seq_start
+        for seq_start, seq_end in zip(cu[:-1], cu[1:])
+        if (seq_end - seq_start) % chunk_divisor != 0
+    ]
+    if bad_seq_lens:
+        raise ValueError(
+            "All packed sequence lengths must be divisible by "
+            f"2 * cp_size ({chunk_divisor}) for zigzag CP layout conversion, "
+            f"got {bad_seq_lens}."
+        )
+
+
+def _build_thd_layout_segments(
+    cu: List[int],
+    cp_size: int,
+    cp_rank: int,
+    cp_partition_mode: CpPartitionMode,
+) -> Tuple[List[_ThdLayoutSegment], int]:
+    total_tokens = cu[-1]
+    if cp_partition_mode == "contiguous":
+        part_len = total_tokens // cp_size
+        if part_len == 0:
+            return [], 0
+        return [(cp_rank * part_len, part_len, 0)], part_len
+
+    if cp_partition_mode != "zigzag":
+        raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
+
+    segments: List[_ThdLayoutSegment] = []
+    local_start = 0
+    for seq_start, seq_end in zip(cu[:-1], cu[1:]):
+        seq_len = seq_end - seq_start
+        chunk_len = seq_len // (2 * cp_size)
+        first_chunk = cp_rank
+        second_chunk = 2 * cp_size - cp_rank - 1
+        segments.append((seq_start + first_chunk * chunk_len, chunk_len, local_start))
+        segments.append((seq_start + second_chunk * chunk_len, chunk_len, local_start + chunk_len))
+        local_start += 2 * chunk_len
+
+    return segments, local_start
+
+
+def _intersect_thd_layout_segments(
+    source_segments: List[_ThdLayoutSegment],
+    target_segments: List[_ThdLayoutSegment],
+) -> List[Tuple[int, int, int]]:
+    intersections: List[Tuple[int, int, int]] = []
+    source_index = 0
+    target_index = 0
+    while source_index < len(source_segments) and target_index < len(target_segments):
+        source_global_start, source_len, source_local_start = source_segments[source_index]
+        target_global_start, target_len, target_local_start = target_segments[target_index]
+        source_global_end = source_global_start + source_len
+        target_global_end = target_global_start + target_len
+
+        overlap_start = max(source_global_start, target_global_start)
+        overlap_end = min(source_global_end, target_global_end)
+        if overlap_start < overlap_end:
+            intersections.append(
+                (
+                    source_local_start + overlap_start - source_global_start,
+                    target_local_start + overlap_start - target_global_start,
+                    overlap_end - overlap_start,
+                )
+            )
+
+        if source_global_end <= target_global_end:
+            source_index += 1
+        else:
+            target_index += 1
+
+    return intersections
+
+
+def _append_range(rows: List[int], start: int, length: int) -> None:
+    rows.extend(range(start, start + length))
+
+
+def _row_list_is_identity(rows: List[int]) -> bool:
+    return all(row == index for index, row in enumerate(rows))
+
+
+def _row_list_to_tensor(rows: List[int], device: torch.device) -> torch.Tensor:
+    if not rows:
+        return torch.empty(0, device=device, dtype=torch.long)
+    return torch.tensor(rows, device=device, dtype=torch.long)
+
+
 def build_thd_cp_partition_route(
     cu_seqlens: torch.Tensor,
     cp_size: int,
@@ -296,76 +410,71 @@ def build_thd_cp_partition_route(
     with _cp_layout_nvtx_range(
         f"cp_layout/build_thd_route/{source_partition_mode}_to_{target_partition_mode}"
     ):
-        cu = cu_seqlens.to(device=device, dtype=torch.long)
-        source_by_rank = [
-            get_thd_context_parallel_rank_indices(cu, cp_size, rank, source_partition_mode)
-            for rank in range(cp_size)
-        ]
-        target_by_rank = [
-            get_thd_context_parallel_rank_indices(cu, cp_size, rank, target_partition_mode)
-            for rank in range(cp_size)
-        ]
+        cu = _compact_thd_cu_seqlens_to_list(cu_seqlens)
+        _validate_thd_route_partitioning(cu, cp_size)
 
-        local_source_indices = source_by_rank[cp_rank]
-        local_target_indices = target_by_rank[cp_rank]
-        total_tokens = int(cu[-1].item())
-        target_owner = torch.empty(total_tokens, device=device, dtype=torch.long)
-        target_local_pos = torch.empty(total_tokens, device=device, dtype=torch.long)
-        for rank, indices in enumerate(target_by_rank):
-            target_owner[indices] = rank
-            target_local_pos[indices] = torch.arange(indices.numel(), device=device)
+        source_segments_by_rank: List[List[_ThdLayoutSegment]] = []
+        source_lengths: List[int] = []
+        target_segments_by_rank: List[List[_ThdLayoutSegment]] = []
+        target_lengths: List[int] = []
+        for rank in range(cp_size):
+            source_segments, source_length = _build_thd_layout_segments(
+                cu, cp_size, rank, source_partition_mode
+            )
+            target_segments, target_length = _build_thd_layout_segments(
+                cu, cp_size, rank, target_partition_mode
+            )
+            source_segments_by_rank.append(source_segments)
+            source_lengths.append(source_length)
+            target_segments_by_rank.append(target_segments)
+            target_lengths.append(target_length)
 
-        local_target_owner = target_owner[local_source_indices]
-        local_target_pos = target_local_pos[local_source_indices]
+        local_source_segments = source_segments_by_rank[cp_rank]
+        local_target_segments = target_segments_by_rank[cp_rank]
 
-        send_row_parts: List[torch.Tensor] = []
+        send_rows_list: List[int] = []
         input_split_sizes: List[int] = []
         for dst_rank in range(cp_size):
-            dst_rows = (local_target_owner == dst_rank).nonzero(as_tuple=False).flatten()
-            if dst_rows.numel() > 0:
-                dst_rows = dst_rows[torch.argsort(local_target_pos[dst_rows])]
-            send_row_parts.append(dst_rows)
-            input_split_sizes.append(dst_rows.numel())
-        send_rows = (
-            torch.cat(send_row_parts, dim=0)
-            if send_row_parts
-            else torch.empty(0, device=device, dtype=torch.long)
-        )
+            intersections = _intersect_thd_layout_segments(
+                local_source_segments, target_segments_by_rank[dst_rank]
+            )
+            intersections.sort(key=lambda item: item[1])
+            input_split_size = 0
+            for source_row, _, length in intersections:
+                _append_range(send_rows_list, source_row, length)
+                input_split_size += length
+            input_split_sizes.append(input_split_size)
 
-        recv_row_parts: List[torch.Tensor] = []
+        recv_rows_list: List[int] = []
         output_split_sizes: List[int] = []
         for src_rank in range(cp_size):
-            src_indices = source_by_rank[src_rank]
-            src_to_this_rank = target_owner[src_indices] == cp_rank
-            recv_global_indices = src_indices[src_to_this_rank]
-            if recv_global_indices.numel() > 0:
-                recv_positions = target_local_pos[recv_global_indices]
-                recv_positions = recv_positions[torch.argsort(recv_positions)]
-            else:
-                recv_positions = local_target_indices.narrow(0, 0, 0)
-            recv_row_parts.append(recv_positions)
-            output_split_sizes.append(recv_positions.numel())
-        recv_rows = (
-            torch.cat(recv_row_parts, dim=0)
-            if recv_row_parts
-            else torch.empty(0, device=device, dtype=torch.long)
-        )
+            intersections = _intersect_thd_layout_segments(
+                source_segments_by_rank[src_rank], local_target_segments
+            )
+            intersections.sort(key=lambda item: item[1])
+            output_split_size = 0
+            for _, target_row, length in intersections:
+                _append_range(recv_rows_list, target_row, length)
+                output_split_size += length
+            output_split_sizes.append(output_split_size)
 
-        assert send_rows.numel() == local_source_indices.numel()
-        assert recv_rows.numel() == local_target_indices.numel()
+        assert len(send_rows_list) == source_lengths[cp_rank]
+        assert len(recv_rows_list) == target_lengths[cp_rank]
+        send_rows = _row_list_to_tensor(send_rows_list, device)
+        recv_rows = _row_list_to_tensor(recv_rows_list, device)
         return ThdCPPartitionRoute(
             source_partition_mode=source_partition_mode,
             target_partition_mode=target_partition_mode,
             cp_size=cp_size,
             cp_rank=cp_rank,
-            local_source_length=local_source_indices.numel(),
-            local_target_length=local_target_indices.numel(),
+            local_source_length=source_lengths[cp_rank],
+            local_target_length=target_lengths[cp_rank],
             send_rows=send_rows,
             recv_rows=recv_rows,
             input_split_sizes=input_split_sizes,
             output_split_sizes=output_split_sizes,
-            send_rows_are_identity=_row_order_is_identity(send_rows),
-            recv_rows_are_identity=_row_order_is_identity(recv_rows),
+            send_rows_are_identity=_row_list_is_identity(send_rows_list),
+            recv_rows_are_identity=_row_list_is_identity(recv_rows_list),
         )
 
 

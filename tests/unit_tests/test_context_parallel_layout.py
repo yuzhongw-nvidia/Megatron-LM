@@ -124,10 +124,17 @@ def test_thd_contiguous_rank_indices_allow_uneven_sequence_lengths():
 @pytest.mark.parametrize(
     ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
 )
-def test_thd_cp_partition_route_reassembles_target_layout(source_layout, target_layout):
-    cu_seqlens = torch.tensor([0, 16, 40])
-    cp_size = 2
-
+@pytest.mark.parametrize(
+    ("cu_seqlens", "cp_size"),
+    [
+        (torch.tensor([0, 16, 40]), 2),
+        (torch.tensor([0, 32, 96, 128]), 4),
+        (torch.tensor([0, 32, 96, 128, 128, 128]), 4),
+    ],
+)
+def test_thd_cp_partition_route_reassembles_target_layout(
+    source_layout, target_layout, cu_seqlens, cp_size
+):
     source_indices = [
         get_thd_context_parallel_rank_indices(cu_seqlens, cp_size, rank, source_layout)
         for rank in range(cp_size)
