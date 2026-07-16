@@ -2,6 +2,7 @@
 
 """Context parallel sequence partition-mode helpers."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 
@@ -25,6 +26,26 @@ class ThdCPPartitionRoute:
     recv_rows: torch.Tensor
     input_split_sizes: List[int]
     output_split_sizes: List[int]
+    send_rows_are_identity: bool
+    recv_rows_are_identity: bool
+
+
+@contextmanager
+def _cp_layout_nvtx_range(message: str):
+    active = torch.cuda.is_available()
+    if active:
+        torch.cuda.nvtx.range_push(message)
+    try:
+        yield
+    finally:
+        if active:
+            torch.cuda.nvtx.range_pop()
+
+
+def _row_order_is_identity(rows: torch.Tensor) -> bool:
+    if rows.numel() == 0:
+        return True
+    return torch.equal(rows, torch.arange(rows.numel(), device=rows.device, dtype=rows.dtype))
 
 
 def get_context_parallel_layout_chunk_indices(
@@ -271,75 +292,80 @@ def build_thd_cp_partition_route(
     if device is None:
         device = cu_seqlens.device
 
-    cu = cu_seqlens.to(device=device, dtype=torch.long)
-    source_by_rank = [
-        get_thd_context_parallel_rank_indices(cu, cp_size, rank, source_partition_mode)
-        for rank in range(cp_size)
-    ]
-    target_by_rank = [
-        get_thd_context_parallel_rank_indices(cu, cp_size, rank, target_partition_mode)
-        for rank in range(cp_size)
-    ]
+    with _cp_layout_nvtx_range(
+        f"cp_layout/build_thd_route/{source_partition_mode}_to_{target_partition_mode}"
+    ):
+        cu = cu_seqlens.to(device=device, dtype=torch.long)
+        source_by_rank = [
+            get_thd_context_parallel_rank_indices(cu, cp_size, rank, source_partition_mode)
+            for rank in range(cp_size)
+        ]
+        target_by_rank = [
+            get_thd_context_parallel_rank_indices(cu, cp_size, rank, target_partition_mode)
+            for rank in range(cp_size)
+        ]
 
-    local_source_indices = source_by_rank[cp_rank]
-    local_target_indices = target_by_rank[cp_rank]
-    total_tokens = int(cu[-1].item())
-    target_owner = torch.empty(total_tokens, device=device, dtype=torch.long)
-    target_local_pos = torch.empty(total_tokens, device=device, dtype=torch.long)
-    for rank, indices in enumerate(target_by_rank):
-        target_owner[indices] = rank
-        target_local_pos[indices] = torch.arange(indices.numel(), device=device)
+        local_source_indices = source_by_rank[cp_rank]
+        local_target_indices = target_by_rank[cp_rank]
+        total_tokens = int(cu[-1].item())
+        target_owner = torch.empty(total_tokens, device=device, dtype=torch.long)
+        target_local_pos = torch.empty(total_tokens, device=device, dtype=torch.long)
+        for rank, indices in enumerate(target_by_rank):
+            target_owner[indices] = rank
+            target_local_pos[indices] = torch.arange(indices.numel(), device=device)
 
-    local_target_owner = target_owner[local_source_indices]
-    local_target_pos = target_local_pos[local_source_indices]
+        local_target_owner = target_owner[local_source_indices]
+        local_target_pos = target_local_pos[local_source_indices]
 
-    send_row_parts: List[torch.Tensor] = []
-    input_split_sizes: List[int] = []
-    for dst_rank in range(cp_size):
-        dst_rows = (local_target_owner == dst_rank).nonzero(as_tuple=False).flatten()
-        if dst_rows.numel() > 0:
-            dst_rows = dst_rows[torch.argsort(local_target_pos[dst_rows])]
-        send_row_parts.append(dst_rows)
-        input_split_sizes.append(dst_rows.numel())
-    send_rows = (
-        torch.cat(send_row_parts, dim=0)
-        if send_row_parts
-        else torch.empty(0, device=device, dtype=torch.long)
-    )
+        send_row_parts: List[torch.Tensor] = []
+        input_split_sizes: List[int] = []
+        for dst_rank in range(cp_size):
+            dst_rows = (local_target_owner == dst_rank).nonzero(as_tuple=False).flatten()
+            if dst_rows.numel() > 0:
+                dst_rows = dst_rows[torch.argsort(local_target_pos[dst_rows])]
+            send_row_parts.append(dst_rows)
+            input_split_sizes.append(dst_rows.numel())
+        send_rows = (
+            torch.cat(send_row_parts, dim=0)
+            if send_row_parts
+            else torch.empty(0, device=device, dtype=torch.long)
+        )
 
-    recv_row_parts: List[torch.Tensor] = []
-    output_split_sizes: List[int] = []
-    for src_rank in range(cp_size):
-        src_indices = source_by_rank[src_rank]
-        src_to_this_rank = target_owner[src_indices] == cp_rank
-        recv_global_indices = src_indices[src_to_this_rank]
-        if recv_global_indices.numel() > 0:
-            recv_positions = target_local_pos[recv_global_indices]
-            recv_positions = recv_positions[torch.argsort(recv_positions)]
-        else:
-            recv_positions = local_target_indices.narrow(0, 0, 0)
-        recv_row_parts.append(recv_positions)
-        output_split_sizes.append(recv_positions.numel())
-    recv_rows = (
-        torch.cat(recv_row_parts, dim=0)
-        if recv_row_parts
-        else torch.empty(0, device=device, dtype=torch.long)
-    )
+        recv_row_parts: List[torch.Tensor] = []
+        output_split_sizes: List[int] = []
+        for src_rank in range(cp_size):
+            src_indices = source_by_rank[src_rank]
+            src_to_this_rank = target_owner[src_indices] == cp_rank
+            recv_global_indices = src_indices[src_to_this_rank]
+            if recv_global_indices.numel() > 0:
+                recv_positions = target_local_pos[recv_global_indices]
+                recv_positions = recv_positions[torch.argsort(recv_positions)]
+            else:
+                recv_positions = local_target_indices.narrow(0, 0, 0)
+            recv_row_parts.append(recv_positions)
+            output_split_sizes.append(recv_positions.numel())
+        recv_rows = (
+            torch.cat(recv_row_parts, dim=0)
+            if recv_row_parts
+            else torch.empty(0, device=device, dtype=torch.long)
+        )
 
-    assert send_rows.numel() == local_source_indices.numel()
-    assert recv_rows.numel() == local_target_indices.numel()
-    return ThdCPPartitionRoute(
-        source_partition_mode=source_partition_mode,
-        target_partition_mode=target_partition_mode,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        local_source_length=local_source_indices.numel(),
-        local_target_length=local_target_indices.numel(),
-        send_rows=send_rows,
-        recv_rows=recv_rows,
-        input_split_sizes=input_split_sizes,
-        output_split_sizes=output_split_sizes,
-    )
+        assert send_rows.numel() == local_source_indices.numel()
+        assert recv_rows.numel() == local_target_indices.numel()
+        return ThdCPPartitionRoute(
+            source_partition_mode=source_partition_mode,
+            target_partition_mode=target_partition_mode,
+            cp_size=cp_size,
+            cp_rank=cp_rank,
+            local_source_length=local_source_indices.numel(),
+            local_target_length=local_target_indices.numel(),
+            send_rows=send_rows,
+            recv_rows=recv_rows,
+            input_split_sizes=input_split_sizes,
+            output_split_sizes=output_split_sizes,
+            send_rows_are_identity=_row_order_is_identity(send_rows),
+            recv_rows_are_identity=_row_order_is_identity(recv_rows),
+        )
 
 
 def _thd_route_cache_key(
@@ -672,6 +698,30 @@ def _convert_cp_partition_mode_full_sequence(
     )
 
 
+def _pack_thd_cp_route_send_buffer(
+    x: torch.Tensor,
+    route: ThdCPPartitionRoute,
+) -> torch.Tensor:
+    if route.local_source_length == 0:
+        return x.narrow(0, 0, 0)
+    if route.send_rows_are_identity:
+        return x
+    return x.index_select(0, route.send_rows)
+
+
+def _scatter_thd_cp_route_recv_buffer(
+    recv_buf: torch.Tensor,
+    route: ThdCPPartitionRoute,
+    out_shape: Tuple[int, ...],
+) -> torch.Tensor:
+    if route.recv_rows_are_identity:
+        return recv_buf
+    out = recv_buf.new_empty(out_shape)
+    if route.recv_rows.numel() > 0:
+        out.index_copy_(0, route.recv_rows, recv_buf)
+    return out
+
+
 def _zigzag_contiguous_thd_swap(
     x: torch.Tensor,
     cp_group: Optional[torch.distributed.ProcessGroup],
@@ -693,66 +743,69 @@ def _zigzag_contiguous_thd_swap(
     cp_rank = cp_group.rank()
     from megatron.core.tensor_parallel.mappings import all_to_all
 
-    if seq_dim != 0:
-        x = x.movedim(seq_dim, 0)
-    x = x.contiguous()
-
-    route = thd_cp_partition_route
-    if route is None:
-        route = build_thd_cp_partition_route(
-            cu_seqlens,
-            cp_size,
-            cp_rank,
-            source_partition_mode,
-            target_partition_mode,
-            device=x.device,
-        )
-    if (
-        route.source_partition_mode != source_partition_mode
-        or route.target_partition_mode != target_partition_mode
-        or route.cp_size != cp_size
-        or route.cp_rank != cp_rank
+    with _cp_layout_nvtx_range(
+        f"cp_layout/thd_swap/{source_partition_mode}_to_{target_partition_mode}"
     ):
-        raise ValueError(
-            "THD CP partition route does not match the requested conversion: "
-            f"route={route.source_partition_mode}->{route.target_partition_mode}, "
-            f"cp_size={route.cp_size}, cp_rank={route.cp_rank}; "
-            f"requested={source_partition_mode}->{target_partition_mode}, "
-            f"cp_size={cp_size}, cp_rank={cp_rank}."
-        )
-    if route.send_rows.device != x.device or route.recv_rows.device != x.device:
-        route = build_thd_cp_partition_route(
-            cu_seqlens,
-            cp_size,
-            cp_rank,
-            source_partition_mode,
-            target_partition_mode,
-            device=x.device,
-        )
+        if seq_dim != 0:
+            x = x.movedim(seq_dim, 0)
+        x = x.contiguous()
 
-    if x.size(0) != route.local_source_length:
-        raise ValueError(
-            f"Local THD tensor length ({x.size(0)}) does not match {source_partition_mode} "
-            f"rank-{cp_rank} partition length ({route.local_source_length})."
-        )
+        route = thd_cp_partition_route
+        if route is None:
+            route = build_thd_cp_partition_route(
+                cu_seqlens,
+                cp_size,
+                cp_rank,
+                source_partition_mode,
+                target_partition_mode,
+                device=x.device,
+            )
+        if (
+            route.source_partition_mode != source_partition_mode
+            or route.target_partition_mode != target_partition_mode
+            or route.cp_size != cp_size
+            or route.cp_rank != cp_rank
+        ):
+            raise ValueError(
+                "THD CP partition route does not match the requested conversion: "
+                f"route={route.source_partition_mode}->{route.target_partition_mode}, "
+                f"cp_size={route.cp_size}, cp_rank={route.cp_rank}; "
+                f"requested={source_partition_mode}->{target_partition_mode}, "
+                f"cp_size={cp_size}, cp_rank={cp_rank}."
+            )
+        if route.send_rows.device != x.device or route.recv_rows.device != x.device:
+            route = build_thd_cp_partition_route(
+                cu_seqlens,
+                cp_size,
+                cp_rank,
+                source_partition_mode,
+                target_partition_mode,
+                device=x.device,
+            )
 
-    send_buf = (
-        x.index_select(0, route.send_rows)
-        if route.send_rows.numel() > 0
-        else x.narrow(0, 0, 0)
-    )
-    recv_buf = all_to_all(
-        cp_group, send_buf.contiguous(), route.output_split_sizes, route.input_split_sizes
-    )
+        if x.size(0) != route.local_source_length:
+            raise ValueError(
+                f"Local THD tensor length ({x.size(0)}) does not match {source_partition_mode} "
+                f"rank-{cp_rank} partition length ({route.local_source_length})."
+            )
 
-    out_shape = (route.local_target_length,) + tuple(x.shape[1:])
-    out = x.new_empty(out_shape)
-    if route.recv_rows.numel() > 0:
-        out.index_copy_(0, route.recv_rows, recv_buf)
+        with _cp_layout_nvtx_range("cp_layout/thd_swap/pack"):
+            send_buf = _pack_thd_cp_route_send_buffer(x, route)
+            if not send_buf.is_contiguous():
+                send_buf = send_buf.contiguous()
 
-    if seq_dim != 0:
-        out = out.movedim(0, seq_dim)
-    return out.contiguous()
+        with _cp_layout_nvtx_range("cp_layout/thd_swap/all_to_all"):
+            recv_buf = all_to_all(
+                cp_group, send_buf, route.output_split_sizes, route.input_split_sizes
+            )
+
+        with _cp_layout_nvtx_range("cp_layout/thd_swap/scatter"):
+            out_shape = (route.local_target_length,) + tuple(x.shape[1:])
+            out = _scatter_thd_cp_route_recv_buffer(recv_buf, route, out_shape)
+
+        if seq_dim != 0:
+            out = out.movedim(0, seq_dim)
+        return out.contiguous()
 
 
 def _zigzag_contiguous_chunk_swap(

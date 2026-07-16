@@ -140,6 +140,13 @@ def test_thd_cp_partition_route_reassembles_target_layout(source_layout, target_
         build_thd_cp_partition_route(cu_seqlens, cp_size, rank, source_layout, target_layout)
         for rank in range(cp_size)
     ]
+    for route in routes:
+        assert route.send_rows_are_identity == torch.equal(
+            route.send_rows, torch.arange(route.send_rows.numel(), dtype=route.send_rows.dtype)
+        )
+        assert route.recv_rows_are_identity == torch.equal(
+            route.recv_rows, torch.arange(route.recv_rows.numel(), dtype=route.recv_rows.dtype)
+        )
     send_buffers = [
         source_indices[rank].index_select(0, routes[rank].send_rows) for rank in range(cp_size)
     ]
