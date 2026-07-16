@@ -220,13 +220,6 @@ def get_thd_context_parallel_rank_indices(
     cu = cu[nonduplicate_boundaries]
 
     total_tokens = int(cu[-1].item())
-    positions = torch.arange(total_tokens, device=cu.device, dtype=torch.long)
-    if cp_partition_mode not in ("zigzag", "contiguous"):
-        raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
-    if total_tokens == 0:
-        return positions
-
-    seq_lens = torch.diff(cu)
     if cp_partition_mode == "contiguous":
         if total_tokens % cp_size != 0:
             raise ValueError(
@@ -235,7 +228,15 @@ def get_thd_context_parallel_rank_indices(
             )
         part_len = total_tokens // cp_size
         rank_start = cp_rank * part_len
-        return positions[rank_start : rank_start + part_len]
+        return torch.arange(rank_start, rank_start + part_len, device=cu.device, dtype=torch.long)
+    if cp_partition_mode != "zigzag":
+        raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
+
+    positions = torch.arange(total_tokens, device=cu.device, dtype=torch.long)
+    if total_tokens == 0:
+        return positions
+
+    seq_lens = torch.diff(cu)
 
     chunk_divisor = 2 * cp_size
     if torch.any(seq_lens % chunk_divisor != 0):
