@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from types import SimpleNamespace
+from typing import List, Tuple
 
 import pytest
 import torch
@@ -55,6 +56,193 @@ class _FakeGroup:
 
 def _token_ranges(*spans):
     return [token for start, end in spans for token in range(start, end)]
+
+
+_CpuThdLayoutSegment = Tuple[int, int, int]
+
+
+def _cpu_compact_thd_cu_seqlens_to_list(cu_seqlens: torch.Tensor) -> List[int]:
+    if cu_seqlens.dim() != 1:
+        raise ValueError(f"cu_seqlens must be 1-D, got shape {tuple(cu_seqlens.shape)}.")
+
+    cu = cu_seqlens.detach().to(device="cpu", dtype=torch.long).tolist()
+    if not cu or cu[0] != 0:
+        raise ValueError(f"cu_seqlens must start at 0, got {cu_seqlens}.")
+
+    compact_cu: List[int] = [cu[0]]
+    prev = cu[0]
+    for value in cu[1:]:
+        if value < prev:
+            raise ValueError(f"cu_seqlens must be nondecreasing, got {cu_seqlens}.")
+        if value != prev:
+            compact_cu.append(value)
+        prev = value
+    return compact_cu
+
+
+def _cpu_validate_thd_route_partitioning(cu: List[int], cp_size: int) -> None:
+    total_tokens = cu[-1]
+    if total_tokens % cp_size != 0:
+        raise ValueError(
+            f"Contiguous CP partitioning requires total_tokens={total_tokens} "
+            f"to be divisible by cp_size={cp_size}."
+        )
+
+    chunk_divisor = 2 * cp_size
+    bad_seq_lens = [
+        seq_end - seq_start
+        for seq_start, seq_end in zip(cu[:-1], cu[1:])
+        if (seq_end - seq_start) % chunk_divisor != 0
+    ]
+    if bad_seq_lens:
+        raise ValueError(
+            "All packed sequence lengths must be divisible by "
+            f"2 * cp_size ({chunk_divisor}) for zigzag CP layout conversion, "
+            f"got {bad_seq_lens}."
+        )
+
+
+def _cpu_build_thd_layout_segments(
+    cu: List[int],
+    cp_size: int,
+    cp_rank: int,
+    cp_partition_mode: str,
+) -> Tuple[List[_CpuThdLayoutSegment], int]:
+    total_tokens = cu[-1]
+    if cp_partition_mode == "contiguous":
+        part_len = total_tokens // cp_size
+        if part_len == 0:
+            return [], 0
+        return [(cp_rank * part_len, part_len, 0)], part_len
+
+    if cp_partition_mode != "zigzag":
+        raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
+
+    segments: List[_CpuThdLayoutSegment] = []
+    local_start = 0
+    for seq_start, seq_end in zip(cu[:-1], cu[1:]):
+        seq_len = seq_end - seq_start
+        chunk_len = seq_len // (2 * cp_size)
+        first_chunk = cp_rank
+        second_chunk = 2 * cp_size - cp_rank - 1
+        segments.append((seq_start + first_chunk * chunk_len, chunk_len, local_start))
+        segments.append((seq_start + second_chunk * chunk_len, chunk_len, local_start + chunk_len))
+        local_start += 2 * chunk_len
+
+    return segments, local_start
+
+
+def _cpu_intersect_thd_layout_segments(
+    source_segments: List[_CpuThdLayoutSegment],
+    target_segments: List[_CpuThdLayoutSegment],
+) -> List[Tuple[int, int, int]]:
+    intersections: List[Tuple[int, int, int]] = []
+    source_index = 0
+    target_index = 0
+    while source_index < len(source_segments) and target_index < len(target_segments):
+        source_global_start, source_len, source_local_start = source_segments[source_index]
+        target_global_start, target_len, target_local_start = target_segments[target_index]
+        source_global_end = source_global_start + source_len
+        target_global_end = target_global_start + target_len
+
+        overlap_start = max(source_global_start, target_global_start)
+        overlap_end = min(source_global_end, target_global_end)
+        if overlap_start < overlap_end:
+            intersections.append(
+                (
+                    source_local_start + overlap_start - source_global_start,
+                    target_local_start + overlap_start - target_global_start,
+                    overlap_end - overlap_start,
+                )
+            )
+
+        if source_global_end <= target_global_end:
+            source_index += 1
+        else:
+            target_index += 1
+
+    return intersections
+
+
+def _cpu_append_range(rows: List[int], start: int, length: int) -> None:
+    rows.extend(range(start, start + length))
+
+
+def _cpu_row_list_is_identity(rows: List[int]) -> bool:
+    return all(row == index for index, row in enumerate(rows))
+
+
+def _cpu_row_list_to_tensor(rows: List[int]) -> torch.Tensor:
+    if not rows:
+        return torch.empty(0, dtype=torch.long)
+    return torch.tensor(rows, dtype=torch.long)
+
+
+def _cpu_build_thd_cp_partition_route(
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    source_partition_mode: str,
+    target_partition_mode: str,
+):
+    cu = _cpu_compact_thd_cu_seqlens_to_list(cu_seqlens)
+    _cpu_validate_thd_route_partitioning(cu, cp_size)
+
+    source_segments_by_rank: List[List[_CpuThdLayoutSegment]] = []
+    source_lengths: List[int] = []
+    target_segments_by_rank: List[List[_CpuThdLayoutSegment]] = []
+    target_lengths: List[int] = []
+    for rank in range(cp_size):
+        source_segments, source_length = _cpu_build_thd_layout_segments(
+            cu, cp_size, rank, source_partition_mode
+        )
+        target_segments, target_length = _cpu_build_thd_layout_segments(
+            cu, cp_size, rank, target_partition_mode
+        )
+        source_segments_by_rank.append(source_segments)
+        source_lengths.append(source_length)
+        target_segments_by_rank.append(target_segments)
+        target_lengths.append(target_length)
+
+    local_source_segments = source_segments_by_rank[cp_rank]
+    local_target_segments = target_segments_by_rank[cp_rank]
+
+    send_rows_list: List[int] = []
+    input_split_sizes: List[int] = []
+    for dst_rank in range(cp_size):
+        intersections = _cpu_intersect_thd_layout_segments(
+            local_source_segments, target_segments_by_rank[dst_rank]
+        )
+        intersections.sort(key=lambda item: item[1])
+        input_split_size = 0
+        for source_row, _, length in intersections:
+            _cpu_append_range(send_rows_list, source_row, length)
+            input_split_size += length
+        input_split_sizes.append(input_split_size)
+
+    recv_rows_list: List[int] = []
+    output_split_sizes: List[int] = []
+    for src_rank in range(cp_size):
+        intersections = _cpu_intersect_thd_layout_segments(
+            source_segments_by_rank[src_rank], local_target_segments
+        )
+        intersections.sort(key=lambda item: item[1])
+        output_split_size = 0
+        for _, target_row, length in intersections:
+            _cpu_append_range(recv_rows_list, target_row, length)
+            output_split_size += length
+        output_split_sizes.append(output_split_size)
+
+    return SimpleNamespace(
+        local_source_length=source_lengths[cp_rank],
+        local_target_length=target_lengths[cp_rank],
+        send_rows=_cpu_row_list_to_tensor(send_rows_list),
+        recv_rows=_cpu_row_list_to_tensor(recv_rows_list),
+        input_split_sizes=input_split_sizes,
+        output_split_sizes=output_split_sizes,
+        send_rows_are_identity=_cpu_row_list_is_identity(send_rows_list),
+        recv_rows_are_identity=_cpu_row_list_is_identity(recv_rows_list),
+    )
 
 
 def test_context_parallel_layout_chunk_indices():
@@ -169,6 +357,40 @@ def test_thd_cp_partition_route_reassembles_target_layout(
         out = torch.empty(routes[dst_rank].local_target_length, dtype=recv_buf.dtype)
         out.index_copy_(0, routes[dst_rank].recv_rows, recv_buf)
         assert torch.equal(out, target_indices[dst_rank])
+
+
+@pytest.mark.parametrize(
+    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+)
+@pytest.mark.parametrize(
+    ("cu_seqlens", "cp_size"),
+    [
+        (torch.tensor([0, 16, 40]), 2),
+        (torch.tensor([0, 32, 96, 128]), 4),
+        (torch.tensor([0, 32, 96, 128, 128, 128]), 4),
+        (torch.tensor([0, 64, 192, 256]), 8),
+        (torch.tensor([0]), 4),
+    ],
+)
+def test_thd_cp_partition_route_matches_cpu_range_oracle(
+    source_layout, target_layout, cu_seqlens, cp_size
+):
+    for rank in range(cp_size):
+        actual = build_thd_cp_partition_route(
+            cu_seqlens, cp_size, rank, source_layout, target_layout
+        )
+        expected = _cpu_build_thd_cp_partition_route(
+            cu_seqlens, cp_size, rank, source_layout, target_layout
+        )
+
+        assert actual.local_source_length == expected.local_source_length
+        assert actual.local_target_length == expected.local_target_length
+        assert actual.input_split_sizes == expected.input_split_sizes
+        assert actual.output_split_sizes == expected.output_split_sizes
+        assert actual.send_rows_are_identity == expected.send_rows_are_identity
+        assert actual.recv_rows_are_identity == expected.recv_rows_are_identity
+        assert torch.equal(actual.send_rows.cpu(), expected.send_rows)
+        assert torch.equal(actual.recv_rows.cpu(), expected.recv_rows)
 
 
 def test_thd_cp_partition_route_cache_reuses_same_microbatch_route():

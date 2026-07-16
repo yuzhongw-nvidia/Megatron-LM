@@ -259,30 +259,24 @@ def get_thd_context_parallel_rank_indices(
     return rank_positions[torch.argsort(rank_local_pos)]
 
 
-_ThdLayoutSegment = Tuple[int, int, int]
-
-
-def _compact_thd_cu_seqlens_to_list(cu_seqlens: torch.Tensor) -> List[int]:
+def _compact_thd_cu_seqlens(cu_seqlens: torch.Tensor, device: torch.device) -> torch.Tensor:
     if cu_seqlens.dim() != 1:
         raise ValueError(f"cu_seqlens must be 1-D, got shape {tuple(cu_seqlens.shape)}.")
 
-    cu = cu_seqlens.detach().to(device="cpu", dtype=torch.long).tolist()
-    if not cu or cu[0] != 0:
+    cu = cu_seqlens.to(device=device, dtype=torch.long)
+    if cu.numel() == 0 or cu[0].item() != 0:
         raise ValueError(f"cu_seqlens must start at 0, got {cu_seqlens}.")
 
-    compact_cu: List[int] = [cu[0]]
-    prev = cu[0]
-    for value in cu[1:]:
-        if value < prev:
-            raise ValueError(f"cu_seqlens must be nondecreasing, got {cu_seqlens}.")
-        if value != prev:
-            compact_cu.append(value)
-        prev = value
-    return compact_cu
+    if torch.any(torch.diff(cu) < 0):
+        raise ValueError(f"cu_seqlens must be nondecreasing, got {cu_seqlens}.")
+
+    nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
+    nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
+    return cu[nonduplicate_boundaries]
 
 
-def _validate_thd_route_partitioning(cu: List[int], cp_size: int) -> None:
-    total_tokens = cu[-1]
+def _validate_thd_route_partitioning(cu: torch.Tensor, cp_size: int) -> None:
+    total_tokens = int(cu[-1].item())
     if total_tokens % cp_size != 0:
         raise ValueError(
             f"Contiguous CP partitioning requires total_tokens={total_tokens} "
@@ -290,93 +284,137 @@ def _validate_thd_route_partitioning(cu: List[int], cp_size: int) -> None:
         )
 
     chunk_divisor = 2 * cp_size
-    bad_seq_lens = [
-        seq_end - seq_start
-        for seq_start, seq_end in zip(cu[:-1], cu[1:])
-        if (seq_end - seq_start) % chunk_divisor != 0
-    ]
-    if bad_seq_lens:
+    seq_lens = torch.diff(cu)
+    if torch.any(seq_lens % chunk_divisor != 0):
         raise ValueError(
             "All packed sequence lengths must be divisible by "
             f"2 * cp_size ({chunk_divisor}) for zigzag CP layout conversion, "
-            f"got {bad_seq_lens}."
+            f"got {seq_lens}."
         )
 
 
-def _build_thd_layout_segments(
-    cu: List[int],
+def _empty_thd_route_tensors(device: torch.device) -> Tuple[torch.Tensor, ...]:
+    empty = torch.empty(0, device=device, dtype=torch.long)
+    return empty, empty, empty, empty
+
+
+def _build_thd_layout_segment_tensors(
+    cu: torch.Tensor,
     cp_size: int,
-    cp_rank: int,
+    ranks: torch.Tensor,
     cp_partition_mode: CpPartitionMode,
-) -> Tuple[List[_ThdLayoutSegment], int]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     total_tokens = cu[-1]
     if cp_partition_mode == "contiguous":
         part_len = total_tokens // cp_size
-        if part_len == 0:
-            return [], 0
-        return [(cp_rank * part_len, part_len, 0)], part_len
+        if part_len.item() == 0 or ranks.numel() == 0:
+            return _empty_thd_route_tensors(cu.device)
+        global_start = ranks * part_len
+        global_end = global_start + part_len
+        local_start = torch.zeros_like(ranks)
+        return global_start, global_end, local_start, ranks
 
     if cp_partition_mode != "zigzag":
         raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
 
-    segments: List[_ThdLayoutSegment] = []
-    local_start = 0
-    for seq_start, seq_end in zip(cu[:-1], cu[1:]):
-        seq_len = seq_end - seq_start
-        chunk_len = seq_len // (2 * cp_size)
-        first_chunk = cp_rank
-        second_chunk = 2 * cp_size - cp_rank - 1
-        segments.append((seq_start + first_chunk * chunk_len, chunk_len, local_start))
-        segments.append((seq_start + second_chunk * chunk_len, chunk_len, local_start + chunk_len))
-        local_start += 2 * chunk_len
+    seq_start = cu[:-1]
+    if seq_start.numel() == 0 or ranks.numel() == 0:
+        return _empty_thd_route_tensors(cu.device)
 
-    return segments, local_start
+    seq_lens = torch.diff(cu)
+    chunk_lens = seq_lens // (2 * cp_size)
+    rank_grid = ranks.unsqueeze(0).expand(seq_start.numel(), ranks.numel())
+    seq_start_grid = seq_start.unsqueeze(1)
+    chunk_len_grid = chunk_lens.unsqueeze(1)
 
+    first_chunk = rank_grid
+    second_chunk = 2 * cp_size - rank_grid - 1
+    first_global_start = seq_start_grid + first_chunk * chunk_len_grid
+    second_global_start = seq_start_grid + second_chunk * chunk_len_grid
 
-def _intersect_thd_layout_segments(
-    source_segments: List[_ThdLayoutSegment],
-    target_segments: List[_ThdLayoutSegment],
-) -> List[Tuple[int, int, int]]:
-    intersections: List[Tuple[int, int, int]] = []
-    source_index = 0
-    target_index = 0
-    while source_index < len(source_segments) and target_index < len(target_segments):
-        source_global_start, source_len, source_local_start = source_segments[source_index]
-        target_global_start, target_len, target_local_start = target_segments[target_index]
-        source_global_end = source_global_start + source_len
-        target_global_end = target_global_start + target_len
+    first_global_end = first_global_start + chunk_len_grid
+    second_global_end = second_global_start + chunk_len_grid
 
-        overlap_start = max(source_global_start, target_global_start)
-        overlap_end = min(source_global_end, target_global_end)
-        if overlap_start < overlap_end:
-            intersections.append(
-                (
-                    source_local_start + overlap_start - source_global_start,
-                    target_local_start + overlap_start - target_global_start,
-                    overlap_end - overlap_start,
-                )
-            )
+    local_base = seq_start_grid // cp_size
+    first_local_start = local_base.expand_as(first_global_start)
+    second_local_start = first_local_start + chunk_len_grid
 
-        if source_global_end <= target_global_end:
-            source_index += 1
-        else:
-            target_index += 1
-
-    return intersections
+    return (
+        torch.cat((first_global_start.flatten(), second_global_start.flatten())),
+        torch.cat((first_global_end.flatten(), second_global_end.flatten())),
+        torch.cat((first_local_start.flatten(), second_local_start.flatten())),
+        torch.cat((rank_grid.flatten(), rank_grid.flatten())),
+    )
 
 
-def _append_range(rows: List[int], start: int, length: int) -> None:
-    rows.extend(range(start, start + length))
+def _intersect_thd_layout_segment_tensors(
+    source_segments: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    target_segments: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    source_global_start, source_global_end, source_local_start, source_rank = source_segments
+    target_global_start, target_global_end, target_local_start, target_rank = target_segments
+    if source_global_start.numel() == 0 or target_global_start.numel() == 0:
+        empty = torch.empty(0, device=source_global_start.device, dtype=torch.long)
+        return empty, empty, empty, empty, empty
+
+    overlap_start = torch.maximum(source_global_start[:, None], target_global_start[None, :])
+    overlap_end = torch.minimum(source_global_end[:, None], target_global_end[None, :])
+    overlap_len = overlap_end - overlap_start
+    source_idx, target_idx = torch.nonzero(overlap_len > 0, as_tuple=True)
+    if source_idx.numel() == 0:
+        empty = torch.empty(0, device=source_global_start.device, dtype=torch.long)
+        return empty, empty, empty, empty, empty
+
+    overlap_start = overlap_start[source_idx, target_idx]
+    lengths = overlap_len[source_idx, target_idx]
+    source_rows = (
+        source_local_start[source_idx] + overlap_start - source_global_start[source_idx]
+    )
+    target_rows = (
+        target_local_start[target_idx] + overlap_start - target_global_start[target_idx]
+    )
+    return source_rows, source_rank[source_idx], target_rows, target_rank[target_idx], lengths
 
 
-def _row_list_is_identity(rows: List[int]) -> bool:
-    return all(row == index for index, row in enumerate(rows))
+def _sort_thd_range_route(
+    primary_rank: torch.Tensor,
+    target_rows: torch.Tensor,
+    sort_stride: int,
+    *values: torch.Tensor,
+) -> Tuple[torch.Tensor, ...]:
+    if primary_rank.numel() == 0:
+        return values
+    order = torch.argsort(primary_rank * sort_stride + target_rows)
+    return tuple(value[order] for value in values)
 
 
-def _row_list_to_tensor(rows: List[int], device: torch.device) -> torch.Tensor:
-    if not rows:
-        return torch.empty(0, device=device, dtype=torch.long)
-    return torch.tensor(rows, device=device, dtype=torch.long)
+def _thd_split_sizes_from_ranges(
+    ranks: torch.Tensor, lengths: torch.Tensor, cp_size: int
+) -> List[int]:
+    split_sizes = torch.zeros(cp_size, device=lengths.device, dtype=torch.long)
+    if lengths.numel() > 0:
+        split_sizes.scatter_add_(0, ranks, lengths)
+    return split_sizes.cpu().tolist()
+
+
+def _materialize_thd_range_rows(starts: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    if lengths.numel() == 0:
+        return torch.empty(0, device=starts.device, dtype=torch.long)
+    total_length = int(lengths.sum().item())
+    if total_length == 0:
+        return torch.empty(0, device=starts.device, dtype=torch.long)
+    range_offsets = torch.cumsum(lengths, dim=0) - lengths
+    row_offsets = torch.repeat_interleave(
+        starts - range_offsets, lengths, output_size=total_length
+    )
+    return row_offsets + torch.arange(total_length, device=starts.device, dtype=torch.long)
+
+
+def _thd_range_rows_are_identity(starts: torch.Tensor, lengths: torch.Tensor) -> bool:
+    if starts.numel() == 0:
+        return True
+    range_offsets = torch.cumsum(lengths, dim=0) - lengths
+    return bool(torch.all(starts == range_offsets).item())
 
 
 def build_thd_cp_partition_route(
@@ -406,75 +444,95 @@ def build_thd_cp_partition_route(
         raise ValueError("A THD CP partition route is only needed when partition modes differ.")
     if device is None:
         device = cu_seqlens.device
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}.")
 
     with _cp_layout_nvtx_range(
         f"cp_layout/build_thd_route/{source_partition_mode}_to_{target_partition_mode}"
     ):
-        cu = _compact_thd_cu_seqlens_to_list(cu_seqlens)
+        cu = _compact_thd_cu_seqlens(cu_seqlens, device)
         _validate_thd_route_partitioning(cu, cp_size)
 
-        source_segments_by_rank: List[List[_ThdLayoutSegment]] = []
-        source_lengths: List[int] = []
-        target_segments_by_rank: List[List[_ThdLayoutSegment]] = []
-        target_lengths: List[int] = []
-        for rank in range(cp_size):
-            source_segments, source_length = _build_thd_layout_segments(
-                cu, cp_size, rank, source_partition_mode
-            )
-            target_segments, target_length = _build_thd_layout_segments(
-                cu, cp_size, rank, target_partition_mode
-            )
-            source_segments_by_rank.append(source_segments)
-            source_lengths.append(source_length)
-            target_segments_by_rank.append(target_segments)
-            target_lengths.append(target_length)
+        all_ranks = torch.arange(cp_size, device=device, dtype=torch.long)
+        local_rank = torch.tensor([cp_rank], device=device, dtype=torch.long)
+        local_source_segments = _build_thd_layout_segment_tensors(
+            cu, cp_size, local_rank, source_partition_mode
+        )
+        all_source_segments = _build_thd_layout_segment_tensors(
+            cu, cp_size, all_ranks, source_partition_mode
+        )
+        local_target_segments = _build_thd_layout_segment_tensors(
+            cu, cp_size, local_rank, target_partition_mode
+        )
+        all_target_segments = _build_thd_layout_segment_tensors(
+            cu, cp_size, all_ranks, target_partition_mode
+        )
 
-        local_source_segments = source_segments_by_rank[cp_rank]
-        local_target_segments = target_segments_by_rank[cp_rank]
+        total_tokens = int(cu[-1].item())
+        local_length = total_tokens // cp_size
+        sort_stride = local_length + 1
 
-        send_rows_list: List[int] = []
-        input_split_sizes: List[int] = []
-        for dst_rank in range(cp_size):
-            intersections = _intersect_thd_layout_segments(
-                local_source_segments, target_segments_by_rank[dst_rank]
-            )
-            intersections.sort(key=lambda item: item[1])
-            input_split_size = 0
-            for source_row, _, length in intersections:
-                _append_range(send_rows_list, source_row, length)
-                input_split_size += length
-            input_split_sizes.append(input_split_size)
+        (
+            send_source_rows,
+            _,
+            send_target_rows,
+            send_target_ranks,
+            send_lengths,
+        ) = _intersect_thd_layout_segment_tensors(local_source_segments, all_target_segments)
+        send_source_rows, send_target_ranks, send_lengths = _sort_thd_range_route(
+            send_target_ranks,
+            send_target_rows,
+            sort_stride,
+            send_source_rows,
+            send_target_ranks,
+            send_lengths,
+        )
+        input_split_sizes = _thd_split_sizes_from_ranges(
+            send_target_ranks, send_lengths, cp_size
+        )
+        send_rows = _materialize_thd_range_rows(send_source_rows, send_lengths)
 
-        recv_rows_list: List[int] = []
-        output_split_sizes: List[int] = []
-        for src_rank in range(cp_size):
-            intersections = _intersect_thd_layout_segments(
-                source_segments_by_rank[src_rank], local_target_segments
-            )
-            intersections.sort(key=lambda item: item[1])
-            output_split_size = 0
-            for _, target_row, length in intersections:
-                _append_range(recv_rows_list, target_row, length)
-                output_split_size += length
-            output_split_sizes.append(output_split_size)
+        (
+            _,
+            recv_source_ranks,
+            recv_target_rows,
+            _,
+            recv_lengths,
+        ) = _intersect_thd_layout_segment_tensors(all_source_segments, local_target_segments)
+        recv_target_rows, recv_source_ranks, recv_lengths = _sort_thd_range_route(
+            recv_source_ranks,
+            recv_target_rows,
+            sort_stride,
+            recv_target_rows,
+            recv_source_ranks,
+            recv_lengths,
+        )
+        output_split_sizes = _thd_split_sizes_from_ranges(
+            recv_source_ranks, recv_lengths, cp_size
+        )
+        recv_rows = _materialize_thd_range_rows(recv_target_rows, recv_lengths)
 
-        assert len(send_rows_list) == source_lengths[cp_rank]
-        assert len(recv_rows_list) == target_lengths[cp_rank]
-        send_rows = _row_list_to_tensor(send_rows_list, device)
-        recv_rows = _row_list_to_tensor(recv_rows_list, device)
+        assert send_rows.numel() == local_length
+        assert recv_rows.numel() == local_length
         return ThdCPPartitionRoute(
             source_partition_mode=source_partition_mode,
             target_partition_mode=target_partition_mode,
             cp_size=cp_size,
             cp_rank=cp_rank,
-            local_source_length=source_lengths[cp_rank],
-            local_target_length=target_lengths[cp_rank],
+            local_source_length=local_length,
+            local_target_length=local_length,
             send_rows=send_rows,
             recv_rows=recv_rows,
             input_split_sizes=input_split_sizes,
             output_split_sizes=output_split_sizes,
-            send_rows_are_identity=_row_list_is_identity(send_rows_list),
-            recv_rows_are_identity=_row_list_is_identity(recv_rows_list),
+            send_rows_are_identity=_thd_range_rows_are_identity(
+                send_source_rows, send_lengths
+            ),
+            recv_rows_are_identity=_thd_range_rows_are_identity(
+                recv_target_rows, recv_lengths
+            ),
         )
 
 
