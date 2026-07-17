@@ -301,13 +301,13 @@ def _empty_thd_route_tensors(device: torch.device) -> Tuple[torch.Tensor, ...]:
 def _build_thd_layout_segment_tensors(
     cu: torch.Tensor,
     cp_size: int,
-    ranks: torch.Tensor,
     cp_partition_mode: CpPartitionMode,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     total_tokens = cu[-1]
+    ranks = torch.arange(cp_size, device=cu.device, dtype=torch.long)
     if cp_partition_mode == "contiguous":
         part_len = total_tokens // cp_size
-        if part_len.item() == 0 or ranks.numel() == 0:
+        if part_len.item() == 0:
             return _empty_thd_route_tensors(cu.device)
         global_start = ranks * part_len
         global_end = global_start + part_len
@@ -318,14 +318,14 @@ def _build_thd_layout_segment_tensors(
         raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
 
     seq_start = cu[:-1]
-    if seq_start.numel() == 0 or ranks.numel() == 0:
+    if seq_start.numel() == 0:
         return _empty_thd_route_tensors(cu.device)
 
     seq_lens = torch.diff(cu)
     chunk_lens = seq_lens // (2 * cp_size)
-    rank_grid = ranks.unsqueeze(0).expand(seq_start.numel(), ranks.numel())
-    seq_start_grid = seq_start.unsqueeze(1)
-    chunk_len_grid = chunk_lens.unsqueeze(1)
+    rank_grid = ranks.unsqueeze(1).expand(ranks.numel(), seq_start.numel())
+    seq_start_grid = seq_start.unsqueeze(0)
+    chunk_len_grid = chunk_lens.unsqueeze(0)
 
     first_chunk = rank_grid
     second_chunk = 2 * cp_size - rank_grid - 1
@@ -339,53 +339,74 @@ def _build_thd_layout_segment_tensors(
     first_local_start = local_base.expand_as(first_global_start)
     second_local_start = first_local_start + chunk_len_grid
 
+    # Keep segments rank-major, then local-row-major within each rank.  The route builder
+    # relies on this order to group all-to-all ranges by peer rank without a separate sort.
+    rank_segments = torch.stack((rank_grid, rank_grid), dim=2)
     return (
-        torch.cat((first_global_start.flatten(), second_global_start.flatten())),
-        torch.cat((first_global_end.flatten(), second_global_end.flatten())),
-        torch.cat((first_local_start.flatten(), second_local_start.flatten())),
-        torch.cat((rank_grid.flatten(), rank_grid.flatten())),
+        torch.stack((first_global_start, second_global_start), dim=2).flatten(),
+        torch.stack((first_global_end, second_global_end), dim=2).flatten(),
+        torch.stack((first_local_start, second_local_start), dim=2).flatten(),
+        rank_segments.flatten(),
     )
+
+
+def _select_thd_layout_rank_segments(
+    segments: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    cp_size: int,
+    cp_rank: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    segment_count = segments[0].numel()
+    if segment_count == 0:
+        return segments
+    segments_per_rank = segment_count // cp_size
+    segment_start = cp_rank * segments_per_rank
+    segment_end = segment_start + segments_per_rank
+    return tuple(segment[segment_start:segment_end] for segment in segments)
 
 
 def _intersect_thd_layout_segment_tensors(
-    source_segments: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    target_segments: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    primary_segments: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    secondary_segments: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    source_global_start, source_global_end, source_local_start, source_rank = source_segments
-    target_global_start, target_global_end, target_local_start, target_rank = target_segments
-    if source_global_start.numel() == 0 or target_global_start.numel() == 0:
-        empty = torch.empty(0, device=source_global_start.device, dtype=torch.long)
+    primary_global_start, primary_global_end, primary_local_start, primary_rank = (
+        primary_segments
+    )
+    secondary_global_start, secondary_global_end, secondary_local_start, secondary_rank = (
+        secondary_segments
+    )
+    if primary_global_start.numel() == 0 or secondary_global_start.numel() == 0:
+        empty = torch.empty(0, device=primary_global_start.device, dtype=torch.long)
         return empty, empty, empty, empty, empty
 
-    overlap_start = torch.maximum(source_global_start[:, None], target_global_start[None, :])
-    overlap_end = torch.minimum(source_global_end[:, None], target_global_end[None, :])
+    overlap_start = torch.maximum(
+        primary_global_start[:, None], secondary_global_start[None, :]
+    )
+    overlap_end = torch.minimum(primary_global_end[:, None], secondary_global_end[None, :])
     overlap_len = overlap_end - overlap_start
-    source_idx, target_idx = torch.nonzero(overlap_len > 0, as_tuple=True)
-    if source_idx.numel() == 0:
-        empty = torch.empty(0, device=source_global_start.device, dtype=torch.long)
+    # torch.nonzero returns indices in row-major order.  Since primary segments are
+    # rank-major/local-row-major, intersections inherit the all-to-all ordering we need.
+    primary_idx, secondary_idx = torch.nonzero(overlap_len > 0, as_tuple=True)
+    if primary_idx.numel() == 0:
+        empty = torch.empty(0, device=primary_global_start.device, dtype=torch.long)
         return empty, empty, empty, empty, empty
 
-    overlap_start = overlap_start[source_idx, target_idx]
-    lengths = overlap_len[source_idx, target_idx]
-    source_rows = (
-        source_local_start[source_idx] + overlap_start - source_global_start[source_idx]
+    overlap_start = overlap_start[primary_idx, secondary_idx]
+    lengths = overlap_len[primary_idx, secondary_idx]
+    primary_rows = (
+        primary_local_start[primary_idx] + overlap_start - primary_global_start[primary_idx]
     )
-    target_rows = (
-        target_local_start[target_idx] + overlap_start - target_global_start[target_idx]
+    secondary_rows = (
+        secondary_local_start[secondary_idx]
+        + overlap_start
+        - secondary_global_start[secondary_idx]
     )
-    return source_rows, source_rank[source_idx], target_rows, target_rank[target_idx], lengths
-
-
-def _sort_thd_range_route(
-    primary_rank: torch.Tensor,
-    target_rows: torch.Tensor,
-    sort_stride: int,
-    *values: torch.Tensor,
-) -> Tuple[torch.Tensor, ...]:
-    if primary_rank.numel() == 0:
-        return values
-    order = torch.argsort(primary_rank * sort_stride + target_rows)
-    return tuple(value[order] for value in values)
+    return (
+        primary_rows,
+        primary_rank[primary_idx],
+        secondary_rows,
+        secondary_rank[secondary_idx],
+        lengths,
+    )
 
 
 def _thd_split_sizes_from_ranges(
@@ -455,40 +476,29 @@ def build_thd_cp_partition_route(
         cu = _compact_thd_cu_seqlens(cu_seqlens, device)
         _validate_thd_route_partitioning(cu, cp_size)
 
-        all_ranks = torch.arange(cp_size, device=device, dtype=torch.long)
-        local_rank = torch.tensor([cp_rank], device=device, dtype=torch.long)
-        local_source_segments = _build_thd_layout_segment_tensors(
-            cu, cp_size, local_rank, source_partition_mode
-        )
         all_source_segments = _build_thd_layout_segment_tensors(
-            cu, cp_size, all_ranks, source_partition_mode
-        )
-        local_target_segments = _build_thd_layout_segment_tensors(
-            cu, cp_size, local_rank, target_partition_mode
+            cu, cp_size, source_partition_mode
         )
         all_target_segments = _build_thd_layout_segment_tensors(
-            cu, cp_size, all_ranks, target_partition_mode
+            cu, cp_size, target_partition_mode
+        )
+        local_source_segments = _select_thd_layout_rank_segments(
+            all_source_segments, cp_size, cp_rank
+        )
+        local_target_segments = _select_thd_layout_rank_segments(
+            all_target_segments, cp_size, cp_rank
         )
 
         total_tokens = int(cu[-1].item())
         local_length = total_tokens // cp_size
-        sort_stride = local_length + 1
 
         (
+            _,
+            send_target_ranks,
             send_source_rows,
             _,
-            send_target_rows,
-            send_target_ranks,
             send_lengths,
-        ) = _intersect_thd_layout_segment_tensors(local_source_segments, all_target_segments)
-        send_source_rows, send_target_ranks, send_lengths = _sort_thd_range_route(
-            send_target_ranks,
-            send_target_rows,
-            sort_stride,
-            send_source_rows,
-            send_target_ranks,
-            send_lengths,
-        )
+        ) = _intersect_thd_layout_segment_tensors(all_target_segments, local_source_segments)
         input_split_sizes = _thd_split_sizes_from_ranges(
             send_target_ranks, send_lengths, cp_size
         )
@@ -501,14 +511,6 @@ def build_thd_cp_partition_route(
             _,
             recv_lengths,
         ) = _intersect_thd_layout_segment_tensors(all_source_segments, local_target_segments)
-        recv_target_rows, recv_source_ranks, recv_lengths = _sort_thd_range_route(
-            recv_source_ranks,
-            recv_target_rows,
-            sort_stride,
-            recv_target_rows,
-            recv_source_ranks,
-            recv_lengths,
-        )
         output_split_sizes = _thd_split_sizes_from_ranges(
             recv_source_ranks, recv_lengths, cp_size
         )
