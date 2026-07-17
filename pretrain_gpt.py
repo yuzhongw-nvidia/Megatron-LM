@@ -175,20 +175,21 @@ def get_batch(
     # For middle pipeline stages with packed sequences, only cu_seqlens and
     # max_seqlen are needed (for attention masking); skip the full batch.
     if not is_first_or_last_pipeline_stage(vp_stage) and is_packed_sequence:
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=int(max_seqlen[0].item()),
+            max_seqlen_kv=int(max_seqlen[0].item()),
+            qkv_format='thd',
+            cp_partition_mode=cp_partition_mode,
+        )
         return (
             None,
             None,
             None,
             None,
             None,
-            PackedSeqParams(
-                cu_seqlens_q=cu_seqlens,
-                cu_seqlens_kv=cu_seqlens,
-                max_seqlen_q=int(max_seqlen[0].item()),
-                max_seqlen_kv=int(max_seqlen[0].item()),
-                qkv_format='thd',
-                cp_partition_mode=cp_partition_mode,
-            ),
+            packed_seq_params,
             None,
         )
 

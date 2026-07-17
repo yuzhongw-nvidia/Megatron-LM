@@ -13,6 +13,7 @@ from megatron.core.context_parallel_layout import (
     convert_cp_partition_mode_nested,
     get_or_build_thd_cp_partition_route,
     get_packed_seq_params_cp_partition_cu_seqlens,
+    prebuild_thd_cp_partition_route_cache,
     replace_packed_seq_params_cp_partition_mode,
 )
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -462,6 +463,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.preprocess_for_paged_stash()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        prebuild_thd_cp_partition_route_cache(
+            packed_seq_params, resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        )
 
         in_inference_mode = InferenceMode.is_active()
 

@@ -806,11 +806,13 @@ def get_batch_on_this_rank_for_sequence_packing(
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
     local_cp_size = batch['local_cp_size'].item() if dynamic_cp else None
-    cp_group = (
-        parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
-        if dynamic_cp
-        else None
-    )
+    # After TP broadcast, every rank knows local_cp_size.  From here on,
+    # cp_group is the effective group for this packed microbatch.
+    if dynamic_cp:
+        cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
+            group_size=local_cp_size
+        )
+    packed_seq_params_cp_group_override = cp_group if dynamic_cp else None
 
     # cu_seqlens_q/kv hold the original (unpadded) boundaries so downstream
     # loss paths (e.g. CSA indexer KL) can identify padding rows.
@@ -825,7 +827,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
-        cp_group=cp_group,
+        cp_group=packed_seq_params_cp_group_override,
         cp_partition_mode=cp_partition_mode,
         pad_between_seqs=False,
     )

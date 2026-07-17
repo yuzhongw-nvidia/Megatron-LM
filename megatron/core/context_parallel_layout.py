@@ -555,6 +555,43 @@ def get_or_build_thd_cp_partition_route(
     return route
 
 
+def prebuild_thd_cp_partition_route_cache(
+    packed_seq_params: Optional[Any],
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    device: Optional[torch.device] = None,
+) -> None:
+    """Best-effort prebuild of THD CP layout routes for a packed microbatch.
+
+    ``get_or_build_thd_cp_partition_route`` remains the authoritative lazy
+    lookup used by model blocks.  This helper lets model forward paths move the
+    first CPU route construction before the first layout conversion.
+    """
+    if packed_seq_params is None or getattr(packed_seq_params, "qkv_format", None) != "thd":
+        return
+    if cp_group is None:
+        cp_group = getattr(packed_seq_params, "cp_group", None)
+    if cp_group is None or cp_group.size() <= 1:
+        return
+
+    for source_partition_mode, target_partition_mode in (
+        ("zigzag", "contiguous"),
+        ("contiguous", "zigzag"),
+    ):
+        try:
+            get_or_build_thd_cp_partition_route(
+                packed_seq_params,
+                cp_group,
+                source_partition_mode,
+                target_partition_mode,
+                device=device,
+            )
+        except ValueError:
+            # Some batches/layouts may never need the opposite route.  Preserve
+            # lazy block-time validation for the path that actually uses it.
+            continue
+
+
 def zigzag_to_contiguous_chunks(
     x: torch.Tensor,
     cp_group: torch.distributed.ProcessGroup,

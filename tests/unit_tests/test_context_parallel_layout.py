@@ -14,6 +14,7 @@ from megatron.core.context_parallel_layout import (
     get_or_build_thd_cp_partition_route,
     get_required_cp_partition_mode_for_layer,
     get_thd_context_parallel_rank_indices,
+    prebuild_thd_cp_partition_route_cache,
 )
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_stage_input_cp_partition_mode,
@@ -193,6 +194,43 @@ def test_thd_cp_partition_route_cache_reuses_same_microbatch_route():
     assert same_route is route
     assert reverse_route is not route
     assert len(packed_seq_params.cp_partition_route_cache) == 2
+
+
+def test_prebuild_thd_cp_partition_route_cache_populates_lazy_lookup():
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor([0, 16, 40]),
+        cu_seqlens_q_padded=None,
+        cp_partition_route_cache=None,
+    )
+    cp_group = _FakeGroup(size=2, rank=0)
+
+    prebuild_thd_cp_partition_route_cache(packed_seq_params, cp_group)
+
+    assert len(packed_seq_params.cp_partition_route_cache) == 2
+    route = get_or_build_thd_cp_partition_route(
+        packed_seq_params, cp_group, "zigzag", "contiguous"
+    )
+    assert route is next(
+        route
+        for route in packed_seq_params.cp_partition_route_cache.values()
+        if route.source_partition_mode == "zigzag"
+        and route.target_partition_mode == "contiguous"
+    )
+
+
+def test_prebuild_thd_cp_partition_route_cache_is_best_effort():
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor([0, 10, 18]),
+        cu_seqlens_q_padded=None,
+        cp_partition_route_cache=None,
+    )
+    cp_group = _FakeGroup(size=2, rank=0)
+
+    prebuild_thd_cp_partition_route_cache(packed_seq_params, cp_group)
+
+    assert packed_seq_params.cp_partition_route_cache == {}
 
 
 def test_thd_context_parallel_rank_indices_reject_decreasing_boundaries():
