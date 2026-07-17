@@ -438,6 +438,84 @@ def _thd_range_rows_are_identity(starts: torch.Tensor, lengths: torch.Tensor) ->
     return bool(torch.all(starts == range_offsets).item())
 
 
+def _try_build_fused_thd_cp_partition_route(
+    cu: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    source_partition_mode: CpPartitionMode,
+    target_partition_mode: CpPartitionMode,
+    *,
+    device: torch.device,
+) -> Optional[ThdCPPartitionRoute]:
+    from megatron.core.fusions.fused_thd_cp_route import build_fused_thd_cp_partition_route
+
+    return build_fused_thd_cp_partition_route(
+        cu,
+        cp_size,
+        cp_rank,
+        source_partition_mode,
+        target_partition_mode,
+        device=device,
+    )
+
+
+def _build_thd_cp_partition_route_eager(
+    cu: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    source_partition_mode: CpPartitionMode,
+    target_partition_mode: CpPartitionMode,
+) -> ThdCPPartitionRoute:
+    all_source_segments = _build_thd_layout_segment_tensors(cu, cp_size, source_partition_mode)
+    all_target_segments = _build_thd_layout_segment_tensors(cu, cp_size, target_partition_mode)
+    local_source_segments = _select_thd_layout_rank_segments(
+        all_source_segments, cp_size, cp_rank
+    )
+    local_target_segments = _select_thd_layout_rank_segments(
+        all_target_segments, cp_size, cp_rank
+    )
+
+    total_tokens = int(cu[-1].item())
+    local_length = total_tokens // cp_size
+
+    (
+        _,
+        send_target_ranks,
+        send_source_rows,
+        _,
+        send_lengths,
+    ) = _intersect_thd_layout_segment_tensors(all_target_segments, local_source_segments)
+    input_split_sizes = _thd_split_sizes_from_ranges(send_target_ranks, send_lengths, cp_size)
+    send_rows = _materialize_thd_range_rows(send_source_rows, send_lengths)
+
+    (
+        _,
+        recv_source_ranks,
+        recv_target_rows,
+        _,
+        recv_lengths,
+    ) = _intersect_thd_layout_segment_tensors(all_source_segments, local_target_segments)
+    output_split_sizes = _thd_split_sizes_from_ranges(recv_source_ranks, recv_lengths, cp_size)
+    recv_rows = _materialize_thd_range_rows(recv_target_rows, recv_lengths)
+
+    assert send_rows.numel() == local_length
+    assert recv_rows.numel() == local_length
+    return ThdCPPartitionRoute(
+        source_partition_mode=source_partition_mode,
+        target_partition_mode=target_partition_mode,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        local_source_length=local_length,
+        local_target_length=local_length,
+        send_rows=send_rows,
+        recv_rows=recv_rows,
+        input_split_sizes=input_split_sizes,
+        output_split_sizes=output_split_sizes,
+        send_rows_are_identity=_thd_range_rows_are_identity(send_source_rows, send_lengths),
+        recv_rows_are_identity=_thd_range_rows_are_identity(recv_target_rows, recv_lengths),
+    )
+
+
 def build_thd_cp_partition_route(
     cu_seqlens: torch.Tensor,
     cp_size: int,
@@ -476,65 +554,19 @@ def build_thd_cp_partition_route(
         cu = _compact_thd_cu_seqlens(cu_seqlens, device)
         _validate_thd_route_partitioning(cu, cp_size)
 
-        all_source_segments = _build_thd_layout_segment_tensors(
-            cu, cp_size, source_partition_mode
+        fused_route = _try_build_fused_thd_cp_partition_route(
+            cu,
+            cp_size,
+            cp_rank,
+            source_partition_mode,
+            target_partition_mode,
+            device=device,
         )
-        all_target_segments = _build_thd_layout_segment_tensors(
-            cu, cp_size, target_partition_mode
-        )
-        local_source_segments = _select_thd_layout_rank_segments(
-            all_source_segments, cp_size, cp_rank
-        )
-        local_target_segments = _select_thd_layout_rank_segments(
-            all_target_segments, cp_size, cp_rank
-        )
+        if fused_route is not None:
+            return fused_route
 
-        total_tokens = int(cu[-1].item())
-        local_length = total_tokens // cp_size
-
-        (
-            _,
-            send_target_ranks,
-            send_source_rows,
-            _,
-            send_lengths,
-        ) = _intersect_thd_layout_segment_tensors(all_target_segments, local_source_segments)
-        input_split_sizes = _thd_split_sizes_from_ranges(
-            send_target_ranks, send_lengths, cp_size
-        )
-        send_rows = _materialize_thd_range_rows(send_source_rows, send_lengths)
-
-        (
-            _,
-            recv_source_ranks,
-            recv_target_rows,
-            _,
-            recv_lengths,
-        ) = _intersect_thd_layout_segment_tensors(all_source_segments, local_target_segments)
-        output_split_sizes = _thd_split_sizes_from_ranges(
-            recv_source_ranks, recv_lengths, cp_size
-        )
-        recv_rows = _materialize_thd_range_rows(recv_target_rows, recv_lengths)
-
-        assert send_rows.numel() == local_length
-        assert recv_rows.numel() == local_length
-        return ThdCPPartitionRoute(
-            source_partition_mode=source_partition_mode,
-            target_partition_mode=target_partition_mode,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-            local_source_length=local_length,
-            local_target_length=local_length,
-            send_rows=send_rows,
-            recv_rows=recv_rows,
-            input_split_sizes=input_split_sizes,
-            output_split_sizes=output_split_sizes,
-            send_rows_are_identity=_thd_range_rows_are_identity(
-                send_source_rows, send_lengths
-            ),
-            recv_rows_are_identity=_thd_range_rows_are_identity(
-                recv_target_rows, recv_lengths
-            ),
+        return _build_thd_cp_partition_route_eager(
+            cu, cp_size, cp_rank, source_partition_mode, target_partition_mode
         )
 
 

@@ -393,6 +393,142 @@ def test_thd_cp_partition_route_matches_cpu_range_oracle(
         assert torch.equal(actual.recv_rows.cpu(), expected.recv_rows)
 
 
+def test_fused_thd_cp_partition_route_returns_none_for_cpu_input():
+    from megatron.core.fusions.fused_thd_cp_route import build_fused_thd_cp_partition_route
+
+    cu_seqlens = torch.tensor([0, 16, 40])
+
+    assert (
+        build_fused_thd_cp_partition_route(
+            cu_seqlens,
+            2,
+            0,
+            "zigzag",
+            "contiguous",
+            device=cu_seqlens.device,
+        )
+        is None
+    )
+
+
+def test_thd_cp_partition_route_rejects_uneven_zigzag_chunks():
+    with pytest.raises(ValueError, match="divisible"):
+        build_thd_cp_partition_route(torch.tensor([0, 10]), 2, 0, "zigzag", "contiguous")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+)
+@pytest.mark.parametrize(
+    ("cu_seqlens", "cp_size"),
+    [
+        (torch.tensor([0, 16, 40]), 2),
+        (torch.tensor([0, 32, 96, 128]), 4),
+        (torch.tensor([0, 64, 192, 256]), 8),
+    ],
+)
+def test_fused_thd_cp_partition_route_matches_cpu_range_oracle(
+    source_layout, target_layout, cu_seqlens, cp_size
+):
+    from megatron.core.fusions.fused_thd_cp_route import (
+        HAVE_TRITON,
+        build_fused_thd_cp_partition_route,
+    )
+
+    if not HAVE_TRITON:
+        pytest.skip("Triton is not available")
+
+    cu_seqlens_cuda = cu_seqlens.cuda()
+    for rank in range(cp_size):
+        actual = build_fused_thd_cp_partition_route(
+            cu_seqlens_cuda,
+            cp_size,
+            rank,
+            source_layout,
+            target_layout,
+            device=cu_seqlens_cuda.device,
+        )
+        expected = _cpu_build_thd_cp_partition_route(
+            cu_seqlens, cp_size, rank, source_layout, target_layout
+        )
+
+        assert actual is not None
+        assert actual.local_source_length == expected.local_source_length
+        assert actual.local_target_length == expected.local_target_length
+        assert actual.input_split_sizes == expected.input_split_sizes
+        assert actual.output_split_sizes == expected.output_split_sizes
+        assert actual.send_rows_are_identity == expected.send_rows_are_identity
+        assert actual.recv_rows_are_identity == expected.recv_rows_are_identity
+        assert torch.equal(actual.send_rows.cpu(), expected.send_rows)
+        assert torch.equal(actual.recv_rows.cpu(), expected.recv_rows)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_thd_cp_partition_route_cuda_path_handles_duplicate_boundaries():
+    cu_seqlens = torch.tensor([0, 32, 96, 128, 128, 128])
+    cu_seqlens_cuda = cu_seqlens.cuda()
+    cp_size = 4
+
+    for source_layout, target_layout in [
+        ("zigzag", "contiguous"),
+        ("contiguous", "zigzag"),
+    ]:
+        for rank in range(cp_size):
+            actual = build_thd_cp_partition_route(
+                cu_seqlens_cuda, cp_size, rank, source_layout, target_layout
+            )
+            expected = _cpu_build_thd_cp_partition_route(
+                cu_seqlens, cp_size, rank, source_layout, target_layout
+            )
+
+            assert actual.input_split_sizes == expected.input_split_sizes
+            assert actual.output_split_sizes == expected.output_split_sizes
+            assert actual.send_rows_are_identity == expected.send_rows_are_identity
+            assert actual.recv_rows_are_identity == expected.recv_rows_are_identity
+            assert torch.equal(actual.send_rows.cpu(), expected.send_rows)
+            assert torch.equal(actual.recv_rows.cpu(), expected.recv_rows)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_fused_thd_cp_partition_route_returns_none_for_unsupported_cuda_inputs():
+    from megatron.core.fusions.fused_thd_cp_route import (
+        FUSED_THD_CP_ROUTE_MAX_LOCAL_LENGTH,
+        HAVE_TRITON,
+        build_fused_thd_cp_partition_route,
+    )
+
+    if not HAVE_TRITON:
+        pytest.skip("Triton is not available")
+
+    unsupported_cp_size_cu = torch.tensor([0, 18], device="cuda")
+    assert (
+        build_fused_thd_cp_partition_route(
+            unsupported_cp_size_cu,
+            3,
+            0,
+            "zigzag",
+            "contiguous",
+            device=unsupported_cp_size_cu.device,
+        )
+        is None
+    )
+
+    over_cap_chunk_len = FUSED_THD_CP_ROUTE_MAX_LOCAL_LENGTH // 2 + 1
+    over_cap_cu = torch.tensor([0, 4 * over_cap_chunk_len], device="cuda")
+    assert (
+        build_fused_thd_cp_partition_route(
+            over_cap_cu,
+            2,
+            0,
+            "zigzag",
+            "contiguous",
+            device=over_cap_cu.device,
+        )
+        is None
+    )
+
+
 def test_thd_cp_partition_route_cache_reuses_same_microbatch_route():
     packed_seq_params = SimpleNamespace(
         qkv_format="thd",
