@@ -400,7 +400,7 @@ def apply_rotary_pos_emb(
                 raise ValueError(
                     "cp_partition_mode must be provided for THD RoPE under context parallelism."
                 )
-            if cp_size == 1 or cp_partition_mode in (None, "zigzag"):
+            if cp_partition_mode in (None, "zigzag"):
                 assert (
                     fused_apply_rotary_pos_emb_thd is not None
                 ), "apply_rope_fusion is not available."
@@ -417,7 +417,7 @@ def apply_rotary_pos_emb(
                     f"Unsupported context-parallel partition mode {cp_partition_mode!r}."
                 )
             warnings.warn(
-                "TE fused THD RoPE assumes zigzag context-parallel layout under CP>1. "
+                "TE fused THD RoPE assumes zigzag context-parallel layout. "
                 "Using unfused RoPE for the requested CP partition mode."
             )
     # use unfused implementation
