@@ -18,16 +18,9 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.context_parallel_layout import (
-    CpPartitionMode,
-    convert_cp_partition_mode,
-    get_or_build_thd_cp_partition_route,
-    get_packed_seq_params_cp_partition_cu_seqlens,
-    get_required_cp_partition_mode_for_layer,
-    replace_packed_seq_params_cp_partition_mode,
-)
+from megatron.core.context_parallel_layout import get_required_cp_partition_mode_for_layer
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup, make_weakref
 from megatron.core.transformer.enums import (
@@ -846,86 +839,6 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def _convert_moe_cp_partition_mode(
-        self,
-        *,
-        hidden_states: Tensor,
-        padding_mask: Optional[Tensor],
-        input_ids: Optional[Tensor],
-        packed_seq_params: Optional[PackedSeqParams],
-        source_partition_mode: CpPartitionMode,
-        target_partition_mode: CpPartitionMode,
-    ):
-        """Convert per-token tensors at the internal attention-to-MoE boundary."""
-        if source_partition_mode == target_partition_mode:
-            return hidden_states, padding_mask, input_ids, packed_seq_params
-
-        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
-        cu_seqlens = get_packed_seq_params_cp_partition_cu_seqlens(packed_seq_params)
-        thd_cp_partition_route = get_or_build_thd_cp_partition_route(
-            packed_seq_params,
-            cp_group,
-            source_partition_mode,
-            target_partition_mode,
-            cu_seqlens=cu_seqlens,
-            device=hidden_states.device,
-        )
-        hidden_states = convert_cp_partition_mode(
-            hidden_states,
-            cp_group,
-            source_partition_mode=source_partition_mode,
-            target_partition_mode=target_partition_mode,
-            seq_dim=0,
-            cu_seqlens=cu_seqlens,
-            sequence_parallel=self.config.sequence_parallel,
-            tp_group=self.pg_collection.tp,
-            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
-            thd_cp_partition_route=thd_cp_partition_route,
-        )
-        if padding_mask is not None:
-            padding_mask = convert_cp_partition_mode(
-                padding_mask,
-                cp_group,
-                source_partition_mode=source_partition_mode,
-                target_partition_mode=target_partition_mode,
-                seq_dim=1,
-                cu_seqlens=cu_seqlens,
-                sequence_parallel=self.config.sequence_parallel,
-                tp_group=self.pg_collection.tp,
-                tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
-                thd_cp_partition_route=thd_cp_partition_route,
-            )
-        if input_ids is not None:
-            input_ids = convert_cp_partition_mode(
-                input_ids,
-                cp_group,
-                source_partition_mode=source_partition_mode,
-                target_partition_mode=target_partition_mode,
-                seq_dim=1,
-                cu_seqlens=cu_seqlens,
-                thd_cp_partition_route=thd_cp_partition_route,
-            )
-        packed_seq_params = replace_packed_seq_params_cp_partition_mode(
-            packed_seq_params, target_partition_mode
-        )
-        return hidden_states, padding_mask, input_ids, packed_seq_params
-
-    def get_output_cp_partition_mode(
-        self, input_partition_mode: Optional[CpPartitionMode]
-    ) -> Optional[CpPartitionMode]:
-        """Return this layer's output CP partition mode for a given input mode."""
-        if (
-            self.is_moe_layer
-            and input_partition_mode is not None
-            and input_partition_mode != "zigzag"
-            and (
-                self.config.context_parallel_size > 1
-                or getattr(self.config, "dynamic_context_parallel", False)
-            )
-        ):
-            return "zigzag"
-        return input_partition_mode
-
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):
         """
@@ -946,39 +859,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "stacks."
             )
         hidden_states, context = self._forward_attention(*args, **kwargs)
-        layer_partition_mode = get_required_cp_partition_mode_for_layer(
-            self.self_attention, self.config
-        )
-        moe_partition_mode = "zigzag"
-        convert_moe_partition_mode = (
-            self.is_moe_layer
-            and layer_partition_mode is not None
-            and layer_partition_mode != moe_partition_mode
-            and (
-                self.config.context_parallel_size > 1
-                or getattr(self.config, "dynamic_context_parallel", False)
-            )
-        )
-        padding_mask = kwargs.get("padding_mask", None)
-        input_ids = kwargs.get("input_ids", None)
-        packed_seq_params = kwargs.get("packed_seq_params", None)
-        if convert_moe_partition_mode:
-            hidden_states, padding_mask, input_ids, packed_seq_params = (
-                self._convert_moe_cp_partition_mode(
-                    hidden_states=hidden_states,
-                    padding_mask=padding_mask,
-                    input_ids=input_ids,
-                    packed_seq_params=packed_seq_params,
-                    source_partition_mode=layer_partition_mode,
-                    target_partition_mode=moe_partition_mode,
-                )
-            )
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
-            padding_mask=padding_mask,
-            input_ids=input_ids,
-            packed_seq_params=packed_seq_params,
+            padding_mask=kwargs.get("padding_mask", None),
+            input_ids=kwargs.get("input_ids", None),
+            packed_seq_params=kwargs.get("packed_seq_params", None),
         )
         return output, context
 
