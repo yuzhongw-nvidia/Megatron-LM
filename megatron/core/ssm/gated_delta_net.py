@@ -393,14 +393,14 @@ class GatedDeltaNet(MegatronModule):
                 packed_seq_params.cu_seqlens_q,
                 seq_len_global,
                 "cu_seqlens_q",
-                cp_size=self.cp_size,
+                cp_size=cp_size_chunkwise,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
                 seq_len_global,
                 "cu_seqlens_kv",
-                cp_size=self.cp_size,
+                cp_size=cp_size_chunkwise,
             )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
