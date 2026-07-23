@@ -1241,6 +1241,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             mhc_recompute_manager=mhc_manager,
                             input_ids=input_ids,
                         )
+                    if hasattr(layer, "get_output_cp_partition_mode"):
+                        current_partition_mode = layer.get_output_cp_partition_mode(
+                            current_partition_mode
+                        )
+                        packed_seq_params = self._replace_packed_seq_params_cp_partition_mode(
+                            packed_seq_params, current_partition_mode
+                        )
                     self._finalize_mhc_recompute_layer(
                         mhc_manager=mhc_manager,
                         hidden_states=hidden_states,
