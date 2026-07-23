@@ -13,7 +13,6 @@ from megatron.core.datasets.data_schedule import (
     DefaultDynamicCPScheduler,
     _build_thd_padding_mask,
     _get_scheduler_max_real_num_seqs,
-    _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
@@ -62,21 +61,23 @@ def test_scheduler_thd_padding_mask_from_cu_seqlens():
     )
 
 
-def test_scheduler_sanitizes_thd_padding_values():
-    padding_mask = torch.tensor([False, False, True, False, True])
+def test_scheduler_thd_padding_mask_does_not_mutate_token_values():
+    """Padding-mask construction must not rewrite packed token-like values."""
+    cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor([0, 3, 6], dtype=torch.int32)
     batch = {
-        'tokens': torch.tensor([11, 12, -1, 21, -1], dtype=torch.int64),
-        'labels': torch.tensor([12, 13, -1, 22, -1], dtype=torch.int64),
-        'loss_mask': torch.ones(5, dtype=torch.float32),
-        'position_ids': torch.tensor([0, 1, 2, 0, 1], dtype=torch.int64),
+        'tokens': torch.tensor([11, 12, 99, 21, 22, 98], dtype=torch.int64),
+        'labels': torch.tensor([12, 13, 97, 22, 23, 96], dtype=torch.int64),
+        'loss_mask': torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 0.0], dtype=torch.float32),
+        'position_ids': torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int64),
     }
+    expected = {key: value.clone() for key, value in batch.items()}
 
-    _sanitize_thd_padding_values(batch, padding_mask)
+    padding_mask = _build_thd_padding_mask(cu_seqlens, cu_seqlens_padded)
 
-    assert torch.equal(batch['tokens'], torch.tensor([11, 12, 0, 21, 0]))
-    assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 0]))
-    assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 0.0]))
-    assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 0]))
+    assert torch.equal(padding_mask, torch.tensor([False, False, True, False, False, True]))
+    for key, value in expected.items():
+        assert torch.equal(batch[key], value), f"{key} should not be mutated by mask construction"
 
 
 class MockVariableLengthSequencePackingDataIterator:
