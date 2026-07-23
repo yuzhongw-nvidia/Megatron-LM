@@ -289,7 +289,7 @@ def _apply_rotary_pos_emb_thd(
     exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
 
     if cp_partition_mode == "contiguous":
-        # THD contiguous layout partitions the flattened packed buffer into
+        # DSv4 THD contiguous layout partitions the flattened packed buffer into
         # rank-contiguous spans. Compute absolute packed positions first, then
         # map them back to sequence-local RoPE positions when needed.
         if cp_size > 1:
@@ -301,6 +301,10 @@ def _apply_rotary_pos_emb_thd(
         seq_idx = seq_idx.clamp(min=0, max=cu_seqlens.shape[0] - 2)
         global_seq_start = cu_seqlens_i64[seq_idx]
         freq_pos = global_token_pos - global_seq_start
+    elif cp_partition_mode == "contiguous_per_sequence":
+        # THD contiguous CP mirrors SBHD contiguous CP: each rank owns one
+        # contiguous span from every packed sequence, concatenated in packed order.
+        freq_pos = cp_rank * local_seq_len + local_pos
     elif cp_partition_mode == "zigzag" and cp_size > 1:
         cp_seg = local_seq_len // 2
         full_seqlen = local_seq_len * cp_size
@@ -412,7 +416,7 @@ def apply_rotary_pos_emb(
                     cp_rank=cp_group.rank(),
                     interleaved=config.rotary_interleaved,
                 )
-            if cp_partition_mode != "contiguous":
+            if cp_partition_mode not in ("contiguous", "contiguous_per_sequence"):
                 raise ValueError(
                     f"Unsupported context-parallel partition mode {cp_partition_mode!r}."
                 )

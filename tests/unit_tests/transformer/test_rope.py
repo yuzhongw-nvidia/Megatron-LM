@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
     RotaryEmbedding,
@@ -19,6 +20,51 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 from tests.unit_tests.test_utilities import Utils
+
+
+class _FakeCPGroup:
+
+    def __init__(self, size, rank):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
+def test_thd_contiguous_per_sequence_rope_uses_per_sequence_positions(monkeypatch):
+    captured = {}
+
+    def fake_apply_rotary_pos_emb_bshd(t, freqs, **_kwargs):
+        captured["freqs"] = freqs[:, 0, 0, 0].clone()
+        return t
+
+    monkeypatch.setattr(
+        rope_utils, "_apply_rotary_pos_emb_bshd", fake_apply_rotary_pos_emb_bshd
+    )
+    config = TransformerConfig(
+        num_attention_heads=1,
+        num_layers=1,
+        apply_rope_fusion=False,
+    )
+    t = torch.zeros(8, 1, 2)
+    cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
+    freqs = torch.arange(8, dtype=torch.float32).view(8, 1, 1, 1)
+
+    rope_utils.apply_rotary_pos_emb(
+        t,
+        freqs,
+        config,
+        cu_seqlens=cu_seqlens,
+        cp_group=_FakeCPGroup(size=2, rank=1),
+        cp_partition_mode="contiguous_per_sequence",
+        max_seqlen=8,
+    )
+
+    assert torch.equal(captured["freqs"], torch.tensor([4, 5, 6, 7, 4, 5, 6, 7]).float())
 
 
 class TestMultimodalRotaryEmbedding:

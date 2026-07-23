@@ -2355,7 +2355,7 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
                 cp_size,
                 cp_rank,
             )
-        elif cp_partition_mode == "contiguous":
+        elif cp_partition_mode in ("contiguous", "contiguous_per_sequence"):
             index = get_thd_context_parallel_rank_indices(
                 cu_seqlens_for_te, cp_size, cp_rank, cp_partition_mode
             )
@@ -2638,7 +2638,7 @@ def get_thd_batch_on_this_cp_rank(
             index = tex.thd_get_partitioned_indices(
                 cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
             )
-        elif cp_partition_mode == "contiguous":
+        elif cp_partition_mode in ("contiguous", "contiguous_per_sequence"):
             index = get_thd_context_parallel_rank_indices(
                 cu_seqlens_padded, cp_size, cp_rank, cp_partition_mode
             )

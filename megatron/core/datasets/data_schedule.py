@@ -654,7 +654,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     if (
         is_tp_rank_0
         and cp_group.size() > 1
-        and cp_partition_mode == "contiguous"
+        and cp_partition_mode in ("contiguous", "contiguous_per_sequence")
         and pad_alignment is not None
     ):
         if target_len is not None:

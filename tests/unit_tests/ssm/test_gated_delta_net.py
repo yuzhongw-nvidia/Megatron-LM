@@ -1579,7 +1579,7 @@ def test_mixed_gdn_sdpa_gpt_model_cp_boundary_accumulated_backward_correctness(
 
         cp_group = parallel_state.get_context_parallel_group()
         input_partition_mode = parallel_model[0].get_input_cp_partition_mode()
-        assert input_partition_mode in ("contiguous", "zigzag")
+        assert input_partition_mode in ("contiguous", "contiguous_per_sequence", "zigzag")
 
         local_position_ids = get_tensor_on_this_cp_rank(
             position_ids, 1, cp_group, cp_partition_mode=input_partition_mode

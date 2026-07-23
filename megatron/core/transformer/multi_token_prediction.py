@@ -293,6 +293,11 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
             tensor, dims, cu_seqlens, cp_group, fill_value=fill_value
         )
         return rolled_tensor, rolled_tensor.sum()
+    if cp_partition_mode == 'contiguous_per_sequence':
+        rolled_tensor = _roll_tensor_packed_seq_contiguous_per_sequence_cp(
+            tensor, dims, cu_seqlens, cp_group, fill_value=fill_value
+        )
+        return rolled_tensor, rolled_tensor.sum()
     raise ValueError(f"Unsupported packed sequence CP partition mode: {cp_partition_mode}")
 
 
@@ -420,6 +425,65 @@ def _roll_tensor_packed_seq_contiguous_cp(tensor, dims, cu_seqlens, cp_group, fi
     if local_rank < cp_size - 1:
         last = rolled_tensor.select(dims, -1)
         last.copy_(torch.where(valid_next[-1], recv_next_first, last))
+
+    return rolled_tensor
+
+
+def _roll_tensor_packed_seq_contiguous_per_sequence_cp(
+    tensor, dims, cu_seqlens, cp_group, fill_value=0
+):
+    """Roll a per-sequence-contiguous CP THD shard without crossing sequence boundaries."""
+    local_total_len = tensor.size(dims)
+    rolled_tensor = torch.roll(tensor, shifts=-1, dims=dims)
+    if local_total_len == 0:
+        return rolled_tensor
+
+    cp_size = cp_group.size()
+    local_rank = torch.distributed.get_rank(group=cp_group)
+    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
+
+    cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
+    if cu.numel() > 1:
+        nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
+        nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
+        cu = cu[nonduplicate_boundaries]
+    if cu.numel() <= 1:
+        rolled_tensor.fill_(fill_value)
+        return rolled_tensor
+
+    seq_lens = cu[1:] - cu[:-1]
+    if (seq_lens % cp_size != 0).any():
+        raise ValueError(
+            f"Contiguous CP packed roll requires all packed sequence lengths to be divisible by "
+            f"cp_size={cp_size}, got {seq_lens.tolist()}."
+        )
+    local_seq_lens = seq_lens // cp_size
+    local_cu = torch.zeros_like(cu)
+    local_cu[1:] = torch.cumsum(local_seq_lens, dim=0)
+    if int(local_cu[-1].item()) != local_total_len:
+        raise ValueError(
+            f"Local contiguous-CP THD length {local_total_len} does not match packed sequence "
+            f"metadata length {int(local_cu[-1].item())}."
+        )
+
+    first_indices = local_cu[:-1]
+    last_indices = local_cu[1:] - 1
+    send_first = tensor.index_select(dims, first_indices).contiguous()
+    recv_next_first = torch.empty_like(send_first)
+    ops = []
+    if local_rank < cp_size - 1:
+        next_rank = global_ranks[local_rank + 1]
+        ops.append(torch.distributed.irecv(tensor=recv_next_first, src=next_rank))
+    if local_rank > 0:
+        prev_rank = global_ranks[local_rank - 1]
+        ops.append(torch.distributed.isend(tensor=send_first, dst=prev_rank))
+    for op in ops:
+        op.wait()
+
+    if local_rank < cp_size - 1:
+        rolled_tensor.index_copy_(dims, last_indices, recv_next_first)
+    else:
+        rolled_tensor.index_fill_(dims, last_indices, fill_value)
 
     return rolled_tensor
 

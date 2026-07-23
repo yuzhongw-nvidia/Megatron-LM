@@ -308,7 +308,7 @@ class TransformerConfig(ModelParallelConfig):
     )
     """Type of attention variant to use. Currently support gated_delta_net, dsa, and dsv4_hybrid."""
 
-    cp_partition_mode: Optional[Literal["zigzag", "contiguous"]] = None
+    cp_partition_mode: Optional[Literal["zigzag", "contiguous", "contiguous_per_sequence"]] = None
     """DEPRECATED. CP partition mode is inferred from the model's layer layout.
 
     This compatibility field is ignored by model-level CP layout planning. Pass
@@ -1533,7 +1533,7 @@ class TransformerConfig(ModelParallelConfig):
             self.linear_attention_type = None
 
         if self.cp_partition_mode is not None:
-            if self.cp_partition_mode not in ("zigzag", "contiguous"):
+            if self.cp_partition_mode not in ("zigzag", "contiguous", "contiguous_per_sequence"):
                 raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
             warnings.warn(
                 "TransformerConfig.cp_partition_mode is deprecated and ignored by "

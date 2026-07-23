@@ -95,7 +95,18 @@ def test_thd_context_parallel_rank_indices_match_per_sequence_chunk_order():
     )
 
 
-@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+def test_thd_contiguous_rank_indices_use_per_sequence_chunks():
+    cu_seqlens = torch.tensor([0, 8, 16, 24])
+
+    assert get_thd_context_parallel_rank_indices(
+        cu_seqlens, 4, 0, "contiguous_per_sequence"
+    ).tolist() == _token_ranges((0, 2), (8, 10), (16, 18))
+    assert get_thd_context_parallel_rank_indices(
+        cu_seqlens, 4, 2, "contiguous_per_sequence"
+    ).tolist() == _token_ranges((4, 6), (12, 14), (20, 22))
+
+
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous", "contiguous_per_sequence"])
 def test_thd_context_parallel_rank_indices_cover_all_tokens_once(layout):
     cu_seqlens = torch.tensor([0, 32, 96, 128])
     cp_size = 4
@@ -109,7 +120,7 @@ def test_thd_context_parallel_rank_indices_cover_all_tokens_once(layout):
     assert torch.cat(rank_indices).sort().values.tolist() == list(range(128))
 
 
-@pytest.mark.parametrize("layout", ["zigzag", "contiguous"])
+@pytest.mark.parametrize("layout", ["zigzag", "contiguous", "contiguous_per_sequence"])
 def test_thd_context_parallel_rank_indices_ignore_duplicate_boundaries(layout):
     compact_cu_seqlens = torch.tensor([0, 16, 40])
     padded_cu_seqlens = torch.tensor([0, 16, 40, 40, 40])
@@ -126,7 +137,7 @@ def test_thd_context_parallel_rank_indices_reject_uneven_chunks():
         get_thd_context_parallel_rank_indices(torch.tensor([0, 10]), 2, 0, "zigzag")
 
 
-def test_thd_contiguous_rank_indices_allow_uneven_sequence_lengths():
+def test_thd_contiguous_rank_indices_allow_different_sequence_lengths():
     cu_seqlens = torch.tensor([0, 10, 18])
 
     assert get_thd_context_parallel_rank_indices(cu_seqlens, 2, 0, "contiguous").tolist() == list(
@@ -135,10 +146,31 @@ def test_thd_contiguous_rank_indices_allow_uneven_sequence_lengths():
     assert get_thd_context_parallel_rank_indices(cu_seqlens, 2, 1, "contiguous").tolist() == list(
         range(9, 18)
     )
+    assert get_thd_context_parallel_rank_indices(
+        cu_seqlens, 2, 0, "contiguous_per_sequence"
+    ).tolist() == _token_ranges((0, 5), (10, 14))
+    assert get_thd_context_parallel_rank_indices(
+        cu_seqlens, 2, 1, "contiguous_per_sequence"
+    ).tolist() == _token_ranges((5, 10), (14, 18))
+
+
+def test_thd_contiguous_rank_indices_reject_per_sequence_uneven_cp_split():
+    with pytest.raises(ValueError, match="divisible"):
+        get_thd_context_parallel_rank_indices(
+            torch.tensor([0, 10, 19]), 2, 0, "contiguous_per_sequence"
+        )
 
 
 @pytest.mark.parametrize(
-    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+    ("source_layout", "target_layout"),
+    [
+        ("zigzag", "contiguous"),
+        ("contiguous", "zigzag"),
+        ("zigzag", "contiguous_per_sequence"),
+        ("contiguous_per_sequence", "zigzag"),
+        ("contiguous", "contiguous_per_sequence"),
+        ("contiguous_per_sequence", "contiguous"),
+    ],
 )
 @pytest.mark.parametrize(
     ("cu_seqlens", "cp_size"),
@@ -311,7 +343,7 @@ def test_prebuild_thd_cp_partition_route_cache_populates_lazy_lookup():
 
     prebuild_thd_cp_partition_route_cache(packed_seq_params, cp_group)
 
-    assert len(packed_seq_params.cp_partition_route_cache) == 2
+    assert len(packed_seq_params.cp_partition_route_cache) == 6
     route = get_or_build_thd_cp_partition_route(
         packed_seq_params, cp_group, "zigzag", "contiguous"
     )
@@ -326,7 +358,7 @@ def test_prebuild_thd_cp_partition_route_cache_populates_lazy_lookup():
 def test_prebuild_thd_cp_partition_route_cache_is_best_effort():
     packed_seq_params = SimpleNamespace(
         qkv_format="thd",
-        cu_seqlens_q=torch.tensor([0, 10, 18]),
+        cu_seqlens_q=torch.tensor([0, 10, 19]),
         cu_seqlens_q_padded=None,
         cp_partition_route_cache=None,
     )

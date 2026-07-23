@@ -502,6 +502,7 @@ class TestMultiTokenPrediction:
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
+            cp_stage_entry_partition_mode="zigzag" if args.context_parallel_size > 1 else None,
         )
 
         return model
@@ -578,7 +579,7 @@ class TestMultiTokenPrediction:
         }
         return batch
 
-    def get_packed_batch(self, seq_lengths, micro_batch_size):
+    def get_packed_batch(self, seq_lengths, micro_batch_size, cp_partition_mode=None):
         """
         Create a packed sequence batch with multiple sequences of varying lengths.
 
@@ -626,6 +627,7 @@ class TestMultiTokenPrediction:
             max_seqlen_q=max(seq_lengths),
             max_seqlen_kv=max(seq_lengths),
             qkv_format='thd',
+            cp_partition_mode=cp_partition_mode,
         )
 
         batch = {
@@ -828,7 +830,9 @@ class TestMultiTokenPrediction:
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
 
         # Get packed batch
-        batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
+        batch = self.get_packed_batch(
+            seq_lengths, micro_batch_size=1, cp_partition_mode="zigzag" if cp > 1 else None
+        )
         tokens = batch['tokens']
         labels = batch['labels']
         loss_mask = batch['loss_mask']
@@ -1101,6 +1105,7 @@ class TestMultiTokenPrediction:
                 max_seqlen_q=6,  # max(4, 6) - max local seq length per sequence
                 max_seqlen_kv=6,
                 qkv_format='thd',
+                cp_partition_mode='zigzag',
             )
 
             # Roll by -1 (shift left) with CP communication
@@ -1122,7 +1127,7 @@ class TestMultiTokenPrediction:
         Utils.destroy_model_parallel()
 
     def test_roll_tensor_with_packed_sequences_contiguous_cp(self):
-        """Contiguous THD CP rolls across rank boundaries without crossing sequence boundaries."""
+        """Flat contiguous THD CP rolls across rank boundaries without crossing sequence boundaries."""
         cp = 2
         Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
         cp_group = get_context_parallel_group()
@@ -1131,7 +1136,7 @@ class TestMultiTokenPrediction:
         # Full padded layout:
         #   seq1: [1,2,3,4,5,6,7,0]
         #   seq2: [11,12,13,14,15,16,17,18,19,20,21,0]
-        # Contiguous CP rank 0 owns global rows [0, 10), rank 1 owns [10, 20).
+        # Flat contiguous CP rank 0 owns global rows [0, 10), rank 1 owns [10, 20).
         if cp_rank == 0:
             tensor = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 0, 11, 12]], dtype=torch.float32).cuda()
             expected = torch.tensor([[2, 3, 4, 5, 6, 7, 0, 0, 12, 13]], dtype=torch.float32).cuda()
@@ -1166,6 +1171,81 @@ class TestMultiTokenPrediction:
             max_seqlen_kv=11,
             qkv_format='thd',
             cp_partition_mode='contiguous',
+        )
+
+        rolled, sum_val = roll_tensor(
+            tensor, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        rolled_padding_mask, _ = roll_tensor(
+            padding_mask,
+            shifts=-1,
+            dims=-1,
+            cp_group=cp_group,
+            packed_seq_params=packed_seq_params,
+            fill_value=True,
+        )
+
+        assert torch.equal(rolled, expected), (
+            f"CP Rank {cp_rank}: Expected\n{expected}\nbut got\n{rolled}\nDiff:\n"
+            f"{rolled - expected}"
+        )
+        assert torch.equal(rolled_padding_mask, expected_padding_mask), (
+            f"CP Rank {cp_rank}: Expected padding mask\n{expected_padding_mask}\nbut got\n"
+            f"{rolled_padding_mask}"
+        )
+        assert sum_val.numel() == 1, "Sum should be a scalar"
+
+        Utils.destroy_model_parallel()
+
+    def test_roll_tensor_with_packed_sequences_contiguous_per_sequence_cp(self):
+        """Per-sequence contiguous THD CP rolls across rank boundaries per sequence."""
+        cp = 2
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+
+        # Full padded layout:
+        #   seq1: [1,2,3,4,5,6,7,0]
+        #   seq2: [11,12,13,14,15,16,17,18,19,20,21,0]
+        # Contiguous CP takes one contiguous span per packed sequence on each rank.
+        if cp_rank == 0:
+            tensor = torch.tensor(
+                [[1, 2, 3, 4, 11, 12, 13, 14, 15, 16]], dtype=torch.float32
+            ).cuda()
+            expected = torch.tensor(
+                [[2, 3, 4, 5, 12, 13, 14, 15, 16, 17]], dtype=torch.float32
+            ).cuda()
+            padding_mask = torch.tensor(
+                [[False, False, False, False, False, False, False, False, False, False]]
+            ).cuda()
+            expected_padding_mask = torch.tensor(
+                [[False, False, False, False, False, False, False, False, False, False]]
+            ).cuda()
+        else:
+            tensor = torch.tensor(
+                [[5, 6, 7, 0, 17, 18, 19, 20, 21, 0]], dtype=torch.float32
+            ).cuda()
+            expected = torch.tensor(
+                [[6, 7, 0, 0, 18, 19, 20, 21, 0, 0]], dtype=torch.float32
+            ).cuda()
+            padding_mask = torch.tensor(
+                [[False, False, False, True, False, False, False, False, False, True]]
+            ).cuda()
+            expected_padding_mask = torch.tensor(
+                [[False, False, True, True, False, False, False, False, True, True]]
+            ).cuda()
+
+        cu_seqlens = torch.tensor([0, 7, 18], dtype=torch.int32).cuda()
+        cu_seqlens_padded = torch.tensor([0, 8, 20], dtype=torch.int32).cuda()
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=11,
+            max_seqlen_kv=11,
+            qkv_format='thd',
+            cp_partition_mode='contiguous_per_sequence',
         )
 
         rolled, sum_val = roll_tensor(
@@ -1273,6 +1353,7 @@ class TestMultiTokenPrediction:
                 max_seqlen_q=11,
                 max_seqlen_kv=11,
                 qkv_format='thd',
+                cp_partition_mode='zigzag',
             )
 
             rolled, sum_val = roll_tensor(
@@ -2103,6 +2184,7 @@ class TestMHCMTPIntegration:
                 rotary_percent=a.rotary_percent,
                 pg_collection=pg_collection,
                 vp_stage=vp_stage,
+                cp_stage_entry_partition_mode="zigzag" if a.context_parallel_size > 1 else None,
             )
 
         gpt_model, _, _ = setup_model_and_optimizer(ModelType.encoder_or_decoder, model_provider)

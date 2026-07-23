@@ -215,6 +215,57 @@ def test_dsv4_thd_cp_slice_uses_static_partition_total():
     assert torch.equal(batch["cu_seqlens_padded"], torch.tensor([0, 12], dtype=torch.int32))
 
 
+def test_thd_contiguous_cp_slice_uses_per_sequence_chunks():
+    from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
+
+    batch = {
+        "tokens": torch.arange(24, dtype=torch.int64),
+        "position_ids": torch.arange(24, dtype=torch.int64),
+        "labels": torch.arange(100, 124, dtype=torch.int64),
+        "loss_mask": torch.ones(24, dtype=torch.float32),
+        "cu_seqlens": torch.tensor([0, 8, 16, 24], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 8, 16, 24], dtype=torch.int32),
+        "max_seqlen": torch.tensor([8], dtype=torch.int32),
+    }
+
+    get_cp_slice_for_thd(
+        batch,
+        _MockCPGroup(size=4, rank=2),
+        cp_partition_mode="contiguous_per_sequence",
+    )
+
+    assert torch.equal(batch["tokens"], torch.tensor([4, 5, 12, 13, 20, 21]))
+    assert torch.equal(batch["position_ids"], torch.tensor([4, 5, 12, 13, 20, 21]))
+    assert torch.equal(batch["labels"], torch.tensor([104, 105, 112, 113, 120, 121]))
+    assert torch.equal(batch["loss_mask"], torch.ones(6, dtype=torch.float32))
+
+
+def test_thd_contiguous_per_sequence_cp_slice_uses_dummy_sequence_for_tail_padding():
+    from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
+
+    batch = {
+        "tokens": torch.arange(12, dtype=torch.int64),
+        "position_ids": torch.arange(12, dtype=torch.int64),
+        "labels": torch.arange(100, 112, dtype=torch.int64),
+        "loss_mask": torch.ones(12, dtype=torch.float32),
+        "cu_seqlens": torch.tensor([0, 12], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 12], dtype=torch.int32),
+        "max_seqlen": torch.tensor([12], dtype=torch.int32),
+    }
+
+    get_cp_slice_for_thd(
+        batch,
+        _MockCPGroup(size=4, rank=2),
+        cp_partition_mode="contiguous_per_sequence",
+        partition_total_tokens=16,
+    )
+
+    assert torch.equal(batch["tokens"], torch.tensor([6, 7, 8, 0], dtype=torch.int64))
+    assert torch.equal(batch["position_ids"], torch.tensor([6, 7, 8, 0], dtype=torch.int64))
+    assert torch.equal(batch["labels"], torch.tensor([106, 107, 108, 0], dtype=torch.int64))
+    assert torch.equal(batch["loss_mask"], torch.tensor([1, 1, 1, 0], dtype=torch.float32))
+
+
 @pytest.mark.parametrize(
     ("alignment", "cuda_graph_impl", "local_cp_size", "total_tokens", "local_target"),
     [(4, "none", 2, 10, 8), (8, "transformer_engine", 2, 10, 8)],
@@ -297,8 +348,8 @@ def test_dsv4_thd_dynamic_cp_pads_before_slicing(
     )
 
     local_tokens, _, _, _, _, packed_seq_params, padding_mask = result
-    global_start = cp_rank * local_target
     expected = torch.zeros(local_target, dtype=torch.int64)
+    global_start = cp_rank * local_target
     copied = max(0, min(total_tokens - global_start, local_target))
     if copied:
         expected[:copied] = torch.arange(
@@ -406,12 +457,15 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
     args.pipeline_model_parallel_size = pp
     args.context_parallel_size = cp
     args.virtual_pipeline_model_parallel_size = None
-    args.data_parallel_size = 8 // (tp * pp * cp)
+    world_size = Utils.world_size
+    model_parallel_size = tp * pp * cp
+    if world_size % model_parallel_size != 0:
+        pytest.skip(
+            f"world_size ({world_size}) is not divisible by model parallel size "
+            f"tp*pp*cp ({model_parallel_size})"
+        )
+    args.data_parallel_size = world_size // model_parallel_size
     args.seq_length = 8192
-
-    # Skip invalid configurations
-    if args.data_parallel_size < 1:
-        raise ValueError(f"Invalid config: tp={tp}, pp={pp}, cp={cp} exceeds world size 8")
 
     # Initialize model parallel
     init_kwargs = dict(context_parallel_size=cp)
@@ -448,6 +502,7 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             mtp_on_this_rank=False,
             vp_stage=None,
             dynamic_cp=dynamic_cp,
+            cp_partition_mode="zigzag",
         )
 
         # The helper returns a 7-tuple; scheduler THD always provides padding_mask.
@@ -601,13 +656,16 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
     args.pipeline_model_parallel_size = pp
     args.context_parallel_size = cp
     args.virtual_pipeline_model_parallel_size = None
-    args.data_parallel_size = 8 // (tp * pp * cp)
+    world_size = Utils.world_size
+    model_parallel_size = tp * pp * cp
+    if world_size % model_parallel_size != 0:
+        pytest.skip(
+            f"world_size ({world_size}) is not divisible by model parallel size "
+            f"tp*pp*cp ({model_parallel_size})"
+        )
+    args.data_parallel_size = world_size // model_parallel_size
     args.seq_length = 8192
     args.max_seqlen_per_dp_cp_rank = 8192
-
-    # Skip invalid configurations
-    if args.data_parallel_size < 1:
-        raise ValueError(f"Invalid config: tp={tp}, pp={pp}, cp={cp} exceeds world size 8")
 
     def _create_single_sample(seq_len):
         # hard code the padding size to 16

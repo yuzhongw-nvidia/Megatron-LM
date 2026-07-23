@@ -6,6 +6,7 @@ from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 
+from megatron.core.context_parallel_layout import get_thd_context_parallel_rank_indices
 from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 from megatron.core.rerun_state_machine import RerunDataIterator
 
@@ -16,13 +17,14 @@ def get_cp_slice_for_thd(
     batch,
     cp_group,
     keys: Optional[Sequence[str]] = None,
-    cp_partition_mode: Optional[Literal["zigzag", "contiguous"]] = None,
+    cp_partition_mode: Optional[Literal["zigzag", "contiguous", "contiguous_per_sequence"]] = None,
     partition_total_tokens: Optional[int] = None,
 ):
     """Partition sequence data for context parallelism in THD format.
 
-    ``zigzag`` uses TE's THD partitioned indices. ``contiguous`` splits the flattened rows into
-    ``cp_size`` equal slices and assigns one slice to each rank.
+    ``zigzag`` uses TE's THD partitioned indices. ``contiguous`` keeps the DSv4 flat packed-row
+    split. ``contiguous_per_sequence`` mirrors SBHD contiguous CP by taking one contiguous span
+    from every packed sequence for each rank.
     Only keys present in the batch are sliced.
 
     Args:
@@ -31,7 +33,8 @@ def get_cp_slice_for_thd(
         keys: Sequence data keys to slice. Defaults to the original THD data tensors.
         cp_partition_mode: How to assign packed rows to CP ranks.
         partition_total_tokens: Optional total used to tail-pad tensors selected by ``keys``
-            before slicing. Existing cu_seqlens metadata is left unchanged.
+            before slicing. The extra rows are treated as a dummy packed sequence for slicing;
+            existing cu_seqlens metadata is left unchanged.
     """
     cp_size = cp_group.size()
     if cp_size <= 1:
@@ -65,6 +68,17 @@ def get_cp_slice_for_thd(
             if pad_len > 0:
                 pad_value = True if key == 'padding_mask' else 0
                 batch[key] = torch.cat([batch[key], batch[key].new_full((pad_len,), pad_value)])
+    partition_cu_seqlens = cu_seqlens
+    cu_total_tokens = int(cu_seqlens[-1].item())
+    if total_tokens < cu_total_tokens:
+        raise RuntimeError(
+            f"partition_total_tokens={total_tokens} is smaller than cu_seqlens_padded[-1]="
+            f"{cu_total_tokens}."
+        )
+    if total_tokens > cu_total_tokens:
+        partition_cu_seqlens = torch.cat(
+            [cu_seqlens, cu_seqlens.new_tensor([total_tokens], dtype=cu_seqlens.dtype)]
+        )
     if cp_partition_mode == "contiguous":
         if total_tokens % cp_size != 0:
             raise RuntimeError(
@@ -72,11 +86,19 @@ def get_cp_slice_for_thd(
                 f"cp_size={cp_size}."
             )
         local_rows = total_tokens // cp_size
-        # Rank r takes [r * local_rows, (r + 1) * local_rows).
         row_slice = slice(cp_rank * local_rows, (cp_rank + 1) * local_rows)
         for key in keys:
             if key in batch and batch[key] is not None:
                 batch[key] = batch[key][row_slice]
+        return
+
+    if cp_partition_mode == "contiguous_per_sequence":
+        index = get_thd_context_parallel_rank_indices(
+            partition_cu_seqlens, cp_size, cp_rank, cp_partition_mode
+        )
+        for key in keys:
+            if key in batch and batch[key] is not None:
+                batch[key] = batch[key].index_select(0, index)
         return
 
     if cp_partition_mode != "zigzag":

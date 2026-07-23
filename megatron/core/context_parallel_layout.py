@@ -9,7 +9,7 @@ from typing import Any, Callable, List, Literal, Optional, Tuple, Union
 import torch
 
 
-CpPartitionMode = Literal["zigzag", "contiguous"]
+CpPartitionMode = Literal["zigzag", "contiguous", "contiguous_per_sequence"]
 
 
 @dataclass(frozen=True)
@@ -53,7 +53,7 @@ def get_context_parallel_layout_chunk_indices(
 
     if cp_partition_mode == "zigzag":
         return torch.tensor([cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.long)
-    if cp_partition_mode == "contiguous":
+    if cp_partition_mode in ("contiguous", "contiguous_per_sequence"):
         return torch.tensor([2 * cp_rank, 2 * cp_rank + 1], dtype=torch.long)
     raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
 
@@ -152,7 +152,7 @@ def build_cp_partition_mode_plan(
             f"cp_stage_entry_partition_mode must be provided for {owner_name}. "
             "A block cannot infer its input tensor partition mode from its local layers."
         )
-    if cp_stage_entry_partition_mode not in ("zigzag", "contiguous"):
+    if cp_stage_entry_partition_mode not in ("zigzag", "contiguous", "contiguous_per_sequence"):
         raise ValueError(
             f"Unsupported cp_stage_entry_partition_mode {cp_stage_entry_partition_mode!r}."
         )
@@ -191,11 +191,15 @@ def get_thd_context_parallel_rank_indices(
         cu_seqlens: Global packed-sequence cumulative lengths before CP partitioning.
         cp_size: Context-parallel group size.
         cp_rank: Context-parallel rank.
-        cp_partition_mode: Either ``"zigzag"`` or ``"contiguous"``.
+        cp_partition_mode: ``"zigzag"``, ``"contiguous"``, or
+            ``"contiguous_per_sequence"``.
 
     The returned indices are ordered exactly as the rank-local THD tensor is stored.
-    ``"zigzag"`` follows Megatron's per-sequence load-balanced chunk order; ``"contiguous"``
-    partitions the flattened packed THD buffer into rank-contiguous spans.
+    ``"zigzag"`` follows Megatron's per-sequence load-balanced chunk order.
+    ``"contiguous"`` partitions the flattened packed buffer into rank-contiguous spans.
+    ``"contiguous_per_sequence"`` mirrors SBHD contiguous CP semantics by assigning each
+    rank one contiguous span from every packed sequence, then concatenating those
+    rank-local spans in packed-sequence order.
     """
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
@@ -215,8 +219,8 @@ def get_thd_context_parallel_rank_indices(
     nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
     cu = cu[nonduplicate_boundaries]
 
-    total_tokens = int(cu[-1].item())
     if cp_partition_mode == "contiguous":
+        total_tokens = int(cu[-1].item())
         if total_tokens % cp_size != 0:
             raise ValueError(
                 f"Contiguous CP partitioning requires total_tokens={total_tokens} "
@@ -225,9 +229,32 @@ def get_thd_context_parallel_rank_indices(
         part_len = total_tokens // cp_size
         rank_start = cp_rank * part_len
         return torch.arange(rank_start, rank_start + part_len, device=cu.device, dtype=torch.long)
+
+    if cp_partition_mode == "contiguous_per_sequence":
+        if cu.numel() == 1:
+            return torch.empty(0, device=cu.device, dtype=torch.long)
+
+        seq_lens = torch.diff(cu)
+        if torch.any(seq_lens % cp_size != 0):
+            raise ValueError(
+                "Contiguous CP partitioning requires all packed sequence lengths to be "
+                f"divisible by cp_size={cp_size}, got {seq_lens}."
+            )
+        local_seq_lens = seq_lens // cp_size
+        total_local_tokens = int(local_seq_lens.sum().item())
+        if total_local_tokens == 0:
+            return torch.empty(0, device=cu.device, dtype=torch.long)
+        local_positions = torch.arange(total_local_tokens, device=cu.device, dtype=torch.long)
+        local_cu = torch.zeros(cu.numel(), device=cu.device, dtype=torch.long)
+        local_cu[1:] = torch.cumsum(local_seq_lens, dim=0)
+        seq_idx = torch.bucketize(local_positions, local_cu[1:], right=True)
+        local_offsets = local_positions - local_cu[:-1][seq_idx]
+        global_starts = cu[:-1][seq_idx] + cp_rank * local_seq_lens[seq_idx]
+        return global_starts + local_offsets
     if cp_partition_mode != "zigzag":
         raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
 
+    total_tokens = int(cu[-1].item())
     positions = torch.arange(total_tokens, device=cu.device, dtype=torch.long)
     if total_tokens == 0:
         return positions
@@ -283,13 +310,34 @@ def _compact_thd_cu_seqlens_to_list(cu_seqlens: torch.Tensor) -> List[int]:
     return compact_cu
 
 
-def _validate_thd_route_partitioning(cu: List[int], cp_size: int) -> None:
-    total_tokens = cu[-1]
-    if total_tokens % cp_size != 0:
-        raise ValueError(
-            f"Contiguous CP partitioning requires total_tokens={total_tokens} "
-            f"to be divisible by cp_size={cp_size}."
-        )
+def _validate_thd_route_partitioning(
+    cu: List[int],
+    cp_size: int,
+    source_partition_mode: CpPartitionMode,
+    target_partition_mode: CpPartitionMode,
+) -> None:
+    if "contiguous" in (source_partition_mode, target_partition_mode):
+        total_tokens = cu[-1]
+        if total_tokens % cp_size != 0:
+            raise ValueError(
+                f"Contiguous CP partitioning requires total_tokens={total_tokens} "
+                f"to be divisible by cp_size={cp_size}."
+            )
+
+    if "contiguous_per_sequence" in (source_partition_mode, target_partition_mode):
+        bad_seq_lens = [
+            seq_end - seq_start
+            for seq_start, seq_end in zip(cu[:-1], cu[1:])
+            if (seq_end - seq_start) % cp_size != 0
+        ]
+        if bad_seq_lens:
+            raise ValueError(
+                "Per-sequence contiguous CP partitioning requires all packed sequence lengths "
+                f"to be divisible by cp_size={cp_size}, got {bad_seq_lens}."
+            )
+
+    if "zigzag" not in (source_partition_mode, target_partition_mode):
+        return
 
     chunk_divisor = 2 * cp_size
     bad_seq_lens = [
@@ -311,12 +359,22 @@ def _build_thd_layout_segments(
     cp_rank: int,
     cp_partition_mode: CpPartitionMode,
 ) -> Tuple[List[_ThdLayoutSegment], int]:
-    total_tokens = cu[-1]
     if cp_partition_mode == "contiguous":
+        total_tokens = cu[-1]
         part_len = total_tokens // cp_size
         if part_len == 0:
             return [], 0
         return [(cp_rank * part_len, part_len, 0)], part_len
+
+    if cp_partition_mode == "contiguous_per_sequence":
+        segments: List[_ThdLayoutSegment] = []
+        local_start = 0
+        for seq_start, seq_end in zip(cu[:-1], cu[1:]):
+            seq_len = seq_end - seq_start
+            chunk_len = seq_len // cp_size
+            segments.append((seq_start + cp_rank * chunk_len, chunk_len, local_start))
+            local_start += chunk_len
+        return segments, local_start
 
     if cp_partition_mode != "zigzag":
         raise ValueError(f"Unsupported context-parallel partition mode {cp_partition_mode!r}.")
@@ -396,9 +454,10 @@ def build_thd_cp_partition_route(
     source/target partition modes.  It can be reused for every tensor that has
     the same THD sequence axis in the same microbatch.
     """
-    if source_partition_mode not in ("zigzag", "contiguous") or target_partition_mode not in (
-        "zigzag",
-        "contiguous",
+    supported_partition_modes = ("zigzag", "contiguous", "contiguous_per_sequence")
+    if (
+        source_partition_mode not in supported_partition_modes
+        or target_partition_mode not in supported_partition_modes
     ):
         raise ValueError(
             f"Unsupported CP partition mode conversion "
@@ -413,7 +472,7 @@ def build_thd_cp_partition_route(
         f"cp_layout/build_thd_route/{source_partition_mode}_to_{target_partition_mode}"
     ):
         cu = _compact_thd_cu_seqlens_to_list(cu_seqlens)
-        _validate_thd_route_partitioning(cu, cp_size)
+        _validate_thd_route_partitioning(cu, cp_size, source_partition_mode, target_partition_mode)
 
         source_segments_by_rank: List[List[_ThdLayoutSegment]] = []
         source_lengths: List[int] = []
@@ -579,6 +638,10 @@ def prebuild_thd_cp_partition_route_cache(
     for source_partition_mode, target_partition_mode in (
         ("zigzag", "contiguous"),
         ("contiguous", "zigzag"),
+        ("zigzag", "contiguous_per_sequence"),
+        ("contiguous_per_sequence", "zigzag"),
+        ("contiguous", "contiguous_per_sequence"),
+        ("contiguous_per_sequence", "contiguous"),
     ):
         try:
             get_or_build_thd_cp_partition_route(
@@ -670,9 +733,10 @@ def convert_cp_partition_mode(
     if cp_size == 1:
         return x
 
-    if source_partition_mode not in ("zigzag", "contiguous") or target_partition_mode not in (
-        "zigzag",
-        "contiguous",
+    supported_partition_modes = ("zigzag", "contiguous", "contiguous_per_sequence")
+    if (
+        source_partition_mode not in supported_partition_modes
+        or target_partition_mode not in supported_partition_modes
     ):
         raise ValueError(
             f"Unsupported CP partition mode conversion "
@@ -818,20 +882,41 @@ def _convert_cp_partition_mode_full_sequence(
     thd_cp_partition_route: Optional[ThdCPPartitionRoute] = None,
 ) -> torch.Tensor:
     """Convert a tensor whose sequence dim contains the full CP-local sequence."""
-    if source_partition_mode == "zigzag" and target_partition_mode == "contiguous":
+    if cu_seqlens is not None:
+        return _zigzag_contiguous_thd_swap(
+            x,
+            cp_group,
+            seq_dim,
+            cu_seqlens,
+            source_partition_mode=source_partition_mode,
+            target_partition_mode=target_partition_mode,
+            thd_cp_partition_route=thd_cp_partition_route,
+        )
+
+    sbhd_source_partition_mode = (
+        "contiguous"
+        if source_partition_mode == "contiguous_per_sequence"
+        else source_partition_mode
+    )
+    sbhd_target_partition_mode = (
+        "contiguous"
+        if target_partition_mode == "contiguous_per_sequence"
+        else target_partition_mode
+    )
+    if sbhd_source_partition_mode == sbhd_target_partition_mode:
+        return x
+    if sbhd_source_partition_mode == "zigzag" and sbhd_target_partition_mode == "contiguous":
         return zigzag_to_contiguous_chunks(
             x,
             cp_group,
             seq_dim=seq_dim,
-            cu_seqlens=cu_seqlens,
             thd_cp_partition_route=thd_cp_partition_route,
         )
-    if source_partition_mode == "contiguous" and target_partition_mode == "zigzag":
+    if sbhd_source_partition_mode == "contiguous" and sbhd_target_partition_mode == "zigzag":
         return contiguous_to_zigzag_chunks(
             x,
             cp_group,
             seq_dim=seq_dim,
-            cu_seqlens=cu_seqlens,
             thd_cp_partition_route=thd_cp_partition_route,
         )
     raise ValueError(
