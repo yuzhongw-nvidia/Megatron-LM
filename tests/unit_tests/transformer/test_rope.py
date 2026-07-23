@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+import megatron.core.models.common.embeddings.rope_utils as rope_utils
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
@@ -19,6 +20,48 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 from tests.unit_tests.test_utilities import Utils
+
+
+class DummyCPGroup:
+    def size(self):
+        return 1
+
+    def rank(self):
+        return 0
+
+
+def test_thd_contiguous_cp1_uses_fused_rope(monkeypatch):
+    calls = {}
+
+    def fake_fused_apply_rotary_pos_emb_thd(
+        t, cu_seqlens, freqs, cp_size, cp_rank, interleaved
+    ):
+        calls["cp_size"] = cp_size
+        calls["cp_rank"] = cp_rank
+        calls["interleaved"] = interleaved
+        return t + 1
+
+    monkeypatch.setattr(
+        rope_utils, "fused_apply_rotary_pos_emb_thd", fake_fused_apply_rotary_pos_emb_thd
+    )
+
+    config = TransformerConfig(num_attention_heads=1, num_layers=1, apply_rope_fusion=True)
+    t = torch.zeros(4, 1, 2)
+    freqs = torch.zeros(4, 1, 1, 2)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+
+    out = rope_utils.apply_rotary_pos_emb(
+        t,
+        freqs,
+        config,
+        cu_seqlens=cu_seqlens,
+        cp_group=DummyCPGroup(),
+        cp_partition_mode="contiguous",
+        max_seqlen=4,
+    )
+
+    assert torch.equal(out, t + 1)
+    assert calls == {"cp_size": 1, "cp_rank": 0, "interleaved": False}
 
 
 class TestMultimodalRotaryEmbedding:
