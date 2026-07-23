@@ -207,9 +207,10 @@ def get_batch(
             cp_partition_mode=cp_partition_mode,
         )
 
+    padding_mask = batch.get('padding_mask', None)
+
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
     # additionally pads cu_seqlens tensors to thd_max_packed_sequences + 1 entries.
-    padding_mask = None
     if config.pad_packed_seq_alignment is not None and packed_seq_params is not None:
         tokens = batch.get('tokens', None)
         labels = batch.get('labels', None)

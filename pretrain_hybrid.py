@@ -90,6 +90,7 @@ def get_batch(data_iterator, vp_stage=None, cp_partition_mode="zigzag"):
         "max_seqlen",
         "position_ids",
         "tokens",
+        "padding_mask",
     ]
 
     args = get_args()
@@ -173,6 +174,8 @@ def get_batch(data_iterator, vp_stage=None, cp_partition_mode="zigzag"):
         pipeline_model_parallel_size=args.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+        has_padding_mask=getattr(args, "use_varlen_dataset", False)
+        and getattr(args, "varlen_sbhd_validation", False),
     )
 
     batch = flatten_batch_for_packed_sequences(batch)
@@ -205,7 +208,7 @@ def get_batch(data_iterator, vp_stage=None, cp_partition_mode="zigzag"):
 
     # Return values in a fixed order so callers can unpack them even when
     # dataset wrappers add provenance fields like "dataset_id".
-    return [batch[key] for key in batch_keys] + [None, None]
+    return [batch[key] for key in batch_keys] + [None]
 
 
 # define spiky loss as a loss that's 10x the max loss observed

@@ -569,12 +569,15 @@ def test_getitem_sbhd_pads_to_seq_length_and_masks_tail():
     ds = _make_varlen(["abc"], _make_config(tok, seq_length=8, sbhd=True))
     out = ds[0]
     # SBHD emits fixed [seq_length] samples with no packing metadata.
-    assert set(out) == {"tokens", "labels", "loss_mask", "position_ids"}
+    assert set(out) == {"tokens", "labels", "loss_mask", "position_ids", "padding_mask"}
     assert out["tokens"].numel() == 8
     loss_mask = out["loss_mask"].tolist()
     # tokens=[a,b,c,eod]: valid_len=3 -> first 3 kept (incl. real eod), rest masked.
     assert loss_mask[0:3] == [1.0, 1.0, 1.0]
     assert all(v == 0.0 for v in loss_mask[3:])
+    padding_mask = out["padding_mask"]
+    assert padding_mask.dtype == torch.bool
+    assert padding_mask.tolist() == [False, False, False, True, True, True, True, True]
 
 
 def test_mock_getitem_thd_keys_and_pad_fallback():
@@ -724,6 +727,10 @@ def test_sbhd_validation_dataloader_uses_default_collate():
         assert batch["tokens"].shape == (mbs, seq_len)
         assert batch["labels"].shape == (mbs, seq_len)
         assert batch["loss_mask"].shape == (mbs, seq_len)
+        assert batch["padding_mask"].shape == (mbs, seq_len)
+        assert batch["padding_mask"].dtype == torch.bool
+        assert batch["padding_mask"][:, :11].logical_not().all()
+        assert batch["padding_mask"][:, 11:].all()
     finally:
         destroy_global_vars()
         Utils.destroy_model_parallel()

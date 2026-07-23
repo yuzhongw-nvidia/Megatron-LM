@@ -555,6 +555,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
                 if "attention_mask" not in data
                 else data["attention_mask"].cuda(non_blocking=True)
             ),
+            'padding_mask': (
+                None
+                if "padding_mask" not in data
+                else data["padding_mask"].cuda(non_blocking=True)
+            ),
             'position_ids': data["position_ids"].cuda(non_blocking=True),
             'cu_seqlens': (
                 None if "cu_seqlens" not in data else data["cu_seqlens"].cuda(non_blocking=True)
@@ -600,6 +605,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
+            _broadcast(batch['padding_mask'])
             _broadcast(batch['position_ids'])
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
@@ -608,6 +614,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         elif mpu.is_pipeline_first_stage():
             _broadcast(batch['tokens'])
             _broadcast(batch['attention_mask'])
+            _broadcast(batch['padding_mask'])
             _broadcast(batch['position_ids'])
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
@@ -619,6 +626,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
+            _broadcast(batch['padding_mask'])
 
     else:
         if args.dynamic_context_parallel:
@@ -642,6 +650,12 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             )
         else:
             attention_mask = None
+        padding_mask = (
+            torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
+            if getattr(args, "use_varlen_dataset", False)
+            and getattr(args, "varlen_sbhd_validation", False)
+            else None
+        )
         position_ids = torch.empty(shape, dtype=torch.int64, device=torch.cuda.current_device())
         cu_seqlens = None
         if args.dynamic_context_parallel or args.sft:
@@ -677,6 +691,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)
+            _broadcast(padding_mask)
             _broadcast(position_ids)
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
@@ -688,6 +703,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
             _broadcast(tokens)
             _broadcast(attention_mask)
+            _broadcast(padding_mask)
             _broadcast(position_ids)
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
@@ -704,12 +720,14 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(attention_mask)
+            _broadcast(padding_mask)
 
         batch = {
             'tokens': tokens,
             'labels': labels,
             'loss_mask': loss_mask,
             'attention_mask': attention_mask,
+            'padding_mask': padding_mask,
             'position_ids': position_ids,
             'cu_seqlens': cu_seqlens,
             'max_seqlen': max_seqlen,

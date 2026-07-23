@@ -406,11 +406,14 @@ class VarlenDataset(SFTDataset):
             loss_mask = torch.ones(max_len, dtype=torch.float32)
             loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
             loss_mask[labels == IGNORE_INDEX] = 0.0
+            padding_mask = torch.zeros(max_len, dtype=torch.bool)
+            padding_mask[valid_len:] = True
             return {
                 'tokens': input_ids,
                 'labels': labels,
                 'loss_mask': loss_mask,
                 'position_ids': torch.arange(max_len, dtype=torch.int64),
+                'padding_mask': padding_mask,
             }
 
         original_seq_len = len(tokens_list) - 1  # length after the shift below

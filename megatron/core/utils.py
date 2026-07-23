@@ -2008,6 +2008,7 @@ def get_batch_on_this_tp_rank(
     pipeline_model_parallel_size: int = 1,
     is_pipeline_first_stage: bool = False,
     is_pipeline_last_stage: bool = False,
+    has_padding_mask: bool = False,
 ):
     """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
 
@@ -2048,12 +2049,15 @@ def get_batch_on_this_tp_rank(
         pipeline_model_parallel_size (int): Number of pipeline-parallel stages.
         is_pipeline_first_stage (bool): Whether this rank is on the first PP stage.
         is_pipeline_last_stage (bool): Whether this rank is on the last PP stage.
+        has_padding_mask (bool): Whether the batch carries a padding mask that
+            must be broadcast and partitioned with other sequence tensors.
 
     Returns:
         dict[str, torch.Tensor]: The batch dict with all tensors populated on
         every TP rank. Keys include 'tokens', 'labels', 'loss_mask',
-        'position_ids', 'attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
-        'max_seqlen', 'local_cp_size', and 'hybrid_cp_group'.
+        'position_ids', 'attention_mask', 'padding_mask', 'cu_seqlens',
+        'cu_seqlens_padded', 'max_seqlen', 'local_cp_size', and
+        'hybrid_cp_group'.
     """
 
     def _broadcast(item):
@@ -2095,6 +2099,9 @@ def get_batch_on_this_tp_rank(
                     _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
+            if has_padding_mask:
+                assert batch.get('padding_mask') is not None, "padding_mask is required"
+                _broadcast(batch['padding_mask'])
             if is_hybrid_cp:
                 _broadcast(batch['local_cp_size'])
 
@@ -2104,6 +2111,9 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(batch['tokens'])
             _broadcast(batch['position_ids'])
+            if has_padding_mask:
+                assert batch.get('padding_mask') is not None, "padding_mask is required"
+                _broadcast(batch['padding_mask'])
             if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
@@ -2118,6 +2128,9 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
+            if has_padding_mask:
+                assert batch.get('padding_mask') is not None, "padding_mask is required"
+                _broadcast(batch['padding_mask'])
             if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
@@ -2157,6 +2170,7 @@ def get_batch_on_this_tp_rank(
         cu_seqlens_padded = None
         max_seqlen = None
         attention_mask = None
+        padding_mask = None
         local_cp_size = None
 
         if has_cu_seqlens or is_hybrid_cp:
@@ -2169,6 +2183,8 @@ def get_batch_on_this_tp_rank(
                 dtype=torch.bool,
                 device=torch.cuda.current_device(),
             )
+        if has_padding_mask:
+            padding_mask = torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
 
         if is_hybrid_cp:
             local_cp_size = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
@@ -2209,6 +2225,8 @@ def get_batch_on_this_tp_rank(
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(position_ids)
+            if has_padding_mask:
+                _broadcast(padding_mask)
             if has_cu_seqlens or is_hybrid_cp:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
@@ -2225,6 +2243,8 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(tokens)
             _broadcast(position_ids)
+            if has_padding_mask:
+                _broadcast(padding_mask)
             if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
@@ -2239,6 +2259,8 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(labels)
             _broadcast(loss_mask)
+            if has_padding_mask:
+                _broadcast(padding_mask)
             if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
@@ -2265,6 +2287,7 @@ def get_batch_on_this_tp_rank(
             'loss_mask': loss_mask,
             'position_ids': position_ids,
             'attention_mask': attention_mask,
+            'padding_mask': padding_mask,
             'cu_seqlens': cu_seqlens,
             'cu_seqlens_padded': cu_seqlens_padded,
             'max_seqlen': max_seqlen,

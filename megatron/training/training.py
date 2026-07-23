@@ -2677,6 +2677,7 @@ def dummy_train_step(data_iterator):
         "attention_mask",
         "cu_seqlens",
         "cu_seqlens_padded",
+        "padding_mask",
         "max_seqlen",
         "local_cp_size",
         "hybrid_cp_group",
@@ -2711,6 +2712,8 @@ def dummy_train_step(data_iterator):
                 pipeline_model_parallel_size=args.pipeline_model_parallel_size,
                 is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
                 is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+                has_padding_mask=getattr(args, 'use_varlen_dataset', False)
+                and getattr(args, 'varlen_sbhd_validation', False),
             )
             batch = get_batch_on_this_cp_rank(
                 batch,
