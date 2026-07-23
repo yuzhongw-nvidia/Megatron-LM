@@ -52,6 +52,22 @@ def _build_thd_padding_mask(
     return positions >= valid_ends[seq_indices]
 
 
+def _sanitize_thd_padding_values(batch: Dict[str, Any], padding_mask: torch.Tensor) -> None:
+    """Replace padded token-like slots with safe neutral values in-place."""
+    assert padding_mask.dim() == 1
+    pad_values = {'tokens': 0, 'labels': 0, 'loss_mask': 0.0, 'position_ids': 0}
+    for key, pad_value in pad_values.items():
+        tensor = batch.get(key)
+        if tensor is None:
+            continue
+        assert tensor.dim() == 1, f"{key} must be 1D before CP slicing, got {tensor.dim()}D"
+        assert tensor.numel() == padding_mask.numel(), (
+            f"{key} length ({tensor.numel()}) must match padding_mask length "
+            f"({padding_mask.numel()}) before CP slicing."
+        )
+        batch[key] = tensor.masked_fill(padding_mask, pad_value)
+
+
 class BasePackingScheduler:
     """Base class for sequence packing schedulers."""
 
@@ -656,6 +672,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         batch['padding_mask'] = _build_thd_padding_mask(
             batch['cu_seqlens'], batch['cu_seqlens_padded']
         )
+        _sanitize_thd_padding_values(batch, batch['padding_mask'])
 
     # Partition sequence tensors for context parallelism. Padding mask is needed
     # on every PP stage, while data tensors are only needed on first/last/MTP stages.

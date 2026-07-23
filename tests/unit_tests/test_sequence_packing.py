@@ -13,6 +13,7 @@ from megatron.core.datasets.data_schedule import (
     DefaultDynamicCPScheduler,
     _build_thd_padding_mask,
     _get_scheduler_max_real_num_seqs,
+    _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
@@ -61,8 +62,7 @@ def test_scheduler_thd_padding_mask_from_cu_seqlens():
     )
 
 
-def test_scheduler_thd_padding_mask_does_not_mutate_token_values():
-    """Padding-mask construction must not rewrite packed token-like values."""
+def test_scheduler_sanitizes_thd_padding_values():
     cu_seqlens = torch.tensor([0, 2, 4], dtype=torch.int32)
     cu_seqlens_padded = torch.tensor([0, 3, 6], dtype=torch.int32)
     batch = {
@@ -71,13 +71,15 @@ def test_scheduler_thd_padding_mask_does_not_mutate_token_values():
         'loss_mask': torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 0.0], dtype=torch.float32),
         'position_ids': torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int64),
     }
-    expected = {key: value.clone() for key, value in batch.items()}
 
     padding_mask = _build_thd_padding_mask(cu_seqlens, cu_seqlens_padded)
+    _sanitize_thd_padding_values(batch, padding_mask)
 
     assert torch.equal(padding_mask, torch.tensor([False, False, True, False, False, True]))
-    for key, value in expected.items():
-        assert torch.equal(batch[key], value), f"{key} should not be mutated by mask construction"
+    assert torch.equal(batch['tokens'], torch.tensor([11, 12, 0, 21, 22, 0]))
+    assert torch.equal(batch['labels'], torch.tensor([12, 13, 0, 22, 23, 0]))
+    assert torch.equal(batch['loss_mask'], torch.tensor([1.0, 1.0, 0.0, 1.0, 1.0, 0.0]))
+    assert torch.equal(batch['position_ids'], torch.tensor([0, 1, 0, 0, 1, 0]))
 
 
 class MockVariableLengthSequencePackingDataIterator:
