@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -51,6 +52,97 @@ if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
+
+
+_CP_LAYOUT_LAYER_DUMP_CALL_INDICES = {}
+
+
+def _debug_cp_group_rank(group, default):
+    if group is None:
+        return default
+    try:
+        if torch.distributed.is_initialized():
+            return torch.distributed.get_rank(group)
+    except (AssertionError, RuntimeError, ValueError):
+        pass
+    try:
+        return group.rank()
+    except (AttributeError, RuntimeError):
+        return default
+
+
+def _debug_cp_group_size(group, default):
+    if group is None:
+        return default
+    try:
+        if torch.distributed.is_initialized():
+            return torch.distributed.get_world_size(group)
+    except (AssertionError, RuntimeError, ValueError):
+        pass
+    try:
+        return group.size()
+    except (AttributeError, RuntimeError):
+        return default
+
+
+def _debug_should_dump_cp_layout_layer_stage(stage):
+    global _CP_LAYOUT_LAYER_DUMP_CALL_INDICES
+    call_index = _CP_LAYOUT_LAYER_DUMP_CALL_INDICES.get(stage, 0) + 1
+    _CP_LAYOUT_LAYER_DUMP_CALL_INDICES[stage] = call_index
+    target_call = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_CALL")
+    max_calls = int(os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_MAX_CALLS", "1"))
+    if target_call is not None:
+        return call_index, call_index == int(target_call)
+    return call_index, call_index <= max_calls
+
+
+def _debug_dump_cp_layout_layer_stage(
+    stage,
+    pg_collection,
+    config,
+    *,
+    stage_metadata=None,
+    **payload,
+):
+    dump_dir = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_DIR")
+    if not dump_dir:
+        return
+
+    call_index, should_dump = _debug_should_dump_cp_layout_layer_stage(stage)
+    if not should_dump:
+        return
+
+    rank = int(os.environ.get("RANK", "0"))
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    cp_group = getattr(pg_collection, "cp", None)
+    metadata = {
+        "stage": stage,
+        "batch_dump_call_index": call_index,
+        "rank": rank,
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+        "context_parallel_rank": _debug_cp_group_rank(cp_group, 0),
+        "context_parallel_world_size": _debug_cp_group_size(
+            cp_group, getattr(config, "context_parallel_size", 1)
+        ),
+        "context_parallel_size": getattr(config, "context_parallel_size", None),
+        "sequence_parallel": getattr(config, "sequence_parallel", None),
+    }
+    if stage_metadata:
+        metadata.update(stage_metadata)
+
+    dump_payload = {"metadata": metadata}
+    for key, value in payload.items():
+        dump_payload[key] = value.detach().cpu() if torch.is_tensor(value) else value
+
+    os.makedirs(dump_dir, exist_ok=True)
+    dump_path = os.path.join(
+        dump_dir,
+        f"stage-{stage}_rank{rank:05d}_cp{metadata['context_parallel_rank']:02d}_call{call_index:03d}.pt",
+    )
+    tmp_path = f"{dump_path}.tmp"
+    torch.save(dump_payload, tmp_path)
+    os.replace(tmp_path, dump_path)
 
 
 @functools.lru_cache(maxsize=None)
@@ -724,6 +816,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 otherwise None.
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        stage_base = f"layer_{self.layer_number:03d}"
+        _debug_dump_cp_layout_layer_stage(
+            f"{stage_base}_attention_input",
+            self.pg_collection,
+            self.config,
+            stage_metadata={"layer_number": self.layer_number},
+            hidden_states=hidden_states,
+        )
 
         # Optional Input Layer norm
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
@@ -751,6 +851,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.fp32_residual_connection:
             residual = residual.float()
 
+        _debug_dump_cp_layout_layer_stage(
+            f"{stage_base}_attention_norm",
+            self.pg_collection,
+            self.config,
+            stage_metadata={"layer_number": self.layer_number},
+            hidden_states=input_layernorm_output,
+            residual=residual,
+        )
+
         using_fused_tp_inference_kernel = (
             InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
@@ -773,6 +882,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
+
+        _debug_dump_cp_layout_layer_stage(
+            f"{stage_base}_attention_raw",
+            self.pg_collection,
+            self.config,
+            stage_metadata={"layer_number": self.layer_number},
+            attention_output=attention_output_with_bias[0],
+            attention_bias=attention_output_with_bias[1],
+            residual=residual,
+        )
 
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
@@ -800,6 +919,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # because the residual is needed in the self_attn_bda.
         hidden_states = attn_norm_manager.group_offload(
             hidden_states, forced_released_tensors=[residual]
+        )
+
+        _debug_dump_cp_layout_layer_stage(
+            f"{stage_base}_attention_output",
+            self.pg_collection,
+            self.config,
+            stage_metadata={"layer_number": self.layer_number},
+            hidden_states=hidden_states,
         )
 
         # Optional Layer norm after self-attention
@@ -930,6 +1057,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> tuple[tuple[Tensor, Tensor | None], Tensor]:
         """Run pre-MLP norm + MLP/MoE and return the raw output before BDA."""
+        stage_base = f"layer_{self.layer_number:03d}"
+        _debug_dump_cp_layout_layer_stage(
+            f"{stage_base}_mlp_input",
+            self.pg_collection,
+            self.config,
+            stage_metadata={"layer_number": self.layer_number, "is_moe_layer": self.is_moe_layer},
+            hidden_states=hidden_states,
+        )
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
 
         if isinstance(pre_mlp_layernorm_output, tuple):
@@ -947,8 +1082,29 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.fp32_residual_connection:
             residual = residual.float()
 
+        _debug_dump_cp_layout_layer_stage(
+            f"{stage_base}_mlp_norm",
+            self.pg_collection,
+            self.config,
+            stage_metadata={"layer_number": self.layer_number, "is_moe_layer": self.is_moe_layer},
+            hidden_states=pre_mlp_layernorm_output,
+            residual=residual,
+        )
+
         pre_mlp_layernorm_output, padding_mask, moe_unflatten_mbs = self._maybe_unflatten_for_moe(
             pre_mlp_layernorm_output, padding_mask, packed_seq_params
+        )
+        _debug_dump_cp_layout_layer_stage(
+            f"{stage_base}_mlp_after_unflatten",
+            self.pg_collection,
+            self.config,
+            stage_metadata={
+                "layer_number": self.layer_number,
+                "is_moe_layer": self.is_moe_layer,
+                "moe_unflatten_mbs": moe_unflatten_mbs,
+            },
+            hidden_states=pre_mlp_layernorm_output,
+            padding_mask=padding_mask,
         )
 
         nvtx_range_push(suffix="mlp")
@@ -1030,12 +1186,39 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 pre_mlp_layernorm_output, padding_mask=padding_mask, **moe_kwargs
             )
 
+        _debug_dump_cp_layout_layer_stage(
+            f"{stage_base}_mlp_raw",
+            self.pg_collection,
+            self.config,
+            stage_metadata={
+                "layer_number": self.layer_number,
+                "is_moe_layer": self.is_moe_layer,
+                "moe_unflatten_mbs": moe_unflatten_mbs,
+            },
+            mlp_output=mlp_output_with_bias[0],
+            mlp_bias=mlp_output_with_bias[1],
+            residual=residual,
+        )
+
         if moe_unflatten_mbs is not None:
             mlp_output, mlp_bias = mlp_output_with_bias
             mlp_output = self._maybe_reflatten_from_moe(
                 mlp_output, packed_seq_params, moe_unflatten_mbs
             )
             mlp_output_with_bias = (mlp_output, mlp_bias)
+            _debug_dump_cp_layout_layer_stage(
+                f"{stage_base}_mlp_reflatten",
+                self.pg_collection,
+                self.config,
+                stage_metadata={
+                    "layer_number": self.layer_number,
+                    "is_moe_layer": self.is_moe_layer,
+                    "moe_unflatten_mbs": moe_unflatten_mbs,
+                },
+                mlp_output=mlp_output_with_bias[0],
+                mlp_bias=mlp_output_with_bias[1],
+                residual=residual,
+            )
 
         nvtx_range_pop(suffix="mlp")
         return mlp_output_with_bias, residual
@@ -1137,6 +1320,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states, forced_released_tensors=[residual]
             )
             self.mlp_norm_manager = None
+
+        _debug_dump_cp_layout_layer_stage(
+            f"layer_{self.layer_number:03d}_mlp_output",
+            self.pg_collection,
+            self.config,
+            stage_metadata={"layer_number": self.layer_number, "is_moe_layer": self.is_moe_layer},
+            hidden_states=hidden_states,
+        )
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

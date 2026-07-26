@@ -75,6 +75,174 @@ except ImportError:
 stimer = StragglerDetector()
 
 
+_BATCH_DUMP_CALL_INDEX = 0
+_TENSOR_DUMP_CALL_INDICES = {}
+
+
+def _maybe_call_parallel_state(fn, default=None):
+    try:
+        return fn()
+    except (AssertionError, RuntimeError, AttributeError):
+        return default
+
+
+def _maybe_cpu_tensor(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    return value
+
+
+def _maybe_dump_cp_layout_batch(
+    tokens,
+    labels,
+    loss_mask,
+    attention_mask,
+    position_ids,
+    packed_seq_params,
+    padding_mask,
+    cp_partition_mode,
+    vp_stage,
+):
+    """Optionally dump the post-CP-slice batch for CP layout debugging."""
+    dump_dir = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_DIR")
+    if not dump_dir:
+        return
+
+    global _BATCH_DUMP_CALL_INDEX
+    _BATCH_DUMP_CALL_INDEX += 1
+    target_call = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_CALL")
+    max_calls = int(os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_MAX_CALLS", "1"))
+    if target_call is not None:
+        if _BATCH_DUMP_CALL_INDEX != int(target_call):
+            return
+    elif _BATCH_DUMP_CALL_INDEX > max_calls:
+        return
+
+    args = get_args()
+    rank = int(os.environ.get("RANK", "0"))
+    cp_rank = _maybe_call_parallel_state(mpu.get_context_parallel_rank, 0)
+    metadata = {
+        "batch_dump_call_index": _BATCH_DUMP_CALL_INDEX,
+        "rank": rank,
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+        "tensor_model_parallel_rank": _maybe_call_parallel_state(
+            mpu.get_tensor_model_parallel_rank, 0
+        ),
+        "tensor_model_parallel_world_size": _maybe_call_parallel_state(
+            mpu.get_tensor_model_parallel_world_size, 1
+        ),
+        "context_parallel_rank": cp_rank,
+        "context_parallel_world_size": _maybe_call_parallel_state(
+            mpu.get_context_parallel_world_size, 1
+        ),
+        "data_parallel_rank": _maybe_call_parallel_state(mpu.get_data_parallel_rank, 0),
+        "data_parallel_world_size": _maybe_call_parallel_state(
+            mpu.get_data_parallel_world_size, 1
+        ),
+        "pipeline_model_parallel_rank": _maybe_call_parallel_state(
+            mpu.get_pipeline_model_parallel_rank, 0
+        ),
+        "pipeline_model_parallel_world_size": _maybe_call_parallel_state(
+            mpu.get_pipeline_model_parallel_world_size, 1
+        ),
+        "cp_partition_mode": cp_partition_mode,
+        "vp_stage": vp_stage,
+        "context_parallel_size_arg": getattr(args, "context_parallel_size", None),
+        "cp_comm_type_arg": getattr(args, "cp_comm_type", None),
+        "use_varlen_dataset_arg": getattr(args, "use_varlen_dataset", None),
+        "varlen_sbhd_validation_arg": getattr(args, "varlen_sbhd_validation", None),
+        "sequence_packing_scheduler_arg": getattr(args, "sequence_packing_scheduler", None),
+        "consumed_train_samples": getattr(args, "consumed_train_samples", None),
+        "consumed_valid_samples": getattr(args, "consumed_valid_samples", None),
+    }
+    payload = {
+        "metadata": metadata,
+        "tokens": _maybe_cpu_tensor(tokens),
+        "labels": _maybe_cpu_tensor(labels),
+        "loss_mask": _maybe_cpu_tensor(loss_mask),
+        "attention_mask": _maybe_cpu_tensor(attention_mask),
+        "position_ids": _maybe_cpu_tensor(position_ids),
+        "padding_mask": _maybe_cpu_tensor(padding_mask),
+    }
+    if packed_seq_params is not None:
+        payload["packed_seq_params"] = {
+            "cu_seqlens_q": _maybe_cpu_tensor(packed_seq_params.cu_seqlens_q),
+            "cu_seqlens_kv": _maybe_cpu_tensor(packed_seq_params.cu_seqlens_kv),
+            "max_seqlen_q": packed_seq_params.max_seqlen_q,
+            "max_seqlen_kv": packed_seq_params.max_seqlen_kv,
+            "qkv_format": packed_seq_params.qkv_format,
+            "cp_partition_mode": packed_seq_params.cp_partition_mode,
+        }
+
+    os.makedirs(dump_dir, exist_ok=True)
+    dump_path = os.path.join(
+        dump_dir, f"rank{rank:05d}_cp{int(cp_rank):02d}_call{_BATCH_DUMP_CALL_INDEX:03d}.pt"
+    )
+    tmp_path = f"{dump_path}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, dump_path)
+
+
+def _should_dump_cp_layout_call(stage):
+    global _TENSOR_DUMP_CALL_INDICES
+    call_index = _TENSOR_DUMP_CALL_INDICES.get(stage, 0) + 1
+    _TENSOR_DUMP_CALL_INDICES[stage] = call_index
+    target_call = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_CALL")
+    max_calls = int(os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_MAX_CALLS", "1"))
+    if target_call is not None:
+        return call_index, call_index == int(target_call)
+    return call_index, call_index <= max_calls
+
+
+def _maybe_dump_cp_layout_tensor_stage(stage, **payload):
+    """Optionally dump one tensor-stage payload for CP layout debugging."""
+    dump_dir = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_DIR")
+    if not dump_dir:
+        return
+
+    call_index, should_dump = _should_dump_cp_layout_call(stage)
+    if not should_dump:
+        return
+
+    args = get_args()
+    rank = int(os.environ.get("RANK", "0"))
+    cp_rank = _maybe_call_parallel_state(mpu.get_context_parallel_rank, 0)
+    metadata = {
+        "stage": stage,
+        "batch_dump_call_index": call_index,
+        "rank": rank,
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+        "tensor_model_parallel_rank": _maybe_call_parallel_state(
+            mpu.get_tensor_model_parallel_rank, 0
+        ),
+        "tensor_model_parallel_world_size": _maybe_call_parallel_state(
+            mpu.get_tensor_model_parallel_world_size, 1
+        ),
+        "context_parallel_rank": cp_rank,
+        "context_parallel_world_size": _maybe_call_parallel_state(
+            mpu.get_context_parallel_world_size, 1
+        ),
+        "data_parallel_rank": _maybe_call_parallel_state(mpu.get_data_parallel_rank, 0),
+        "data_parallel_world_size": _maybe_call_parallel_state(
+            mpu.get_data_parallel_world_size, 1
+        ),
+        "context_parallel_size_arg": getattr(args, "context_parallel_size", None),
+        "cp_comm_type_arg": getattr(args, "cp_comm_type", None),
+        "consumed_train_samples": getattr(args, "consumed_train_samples", None),
+    }
+    dump_payload = {"metadata": metadata}
+    for key, value in payload.items():
+        dump_payload[key] = _maybe_cpu_tensor(value)
+
+    os.makedirs(dump_dir, exist_ok=True)
+    dump_path = os.path.join(
+        dump_dir, f"stage-{stage}_rank{rank:05d}_cp{int(cp_rank):02d}_call{call_index:03d}.pt"
+    )
+    tmp_path = f"{dump_path}.tmp"
+    torch.save(dump_payload, tmp_path)
+    os.replace(tmp_path, dump_path)
+
+
 def get_batch(
     data_iterator,
     vp_stage: Optional[int] = None,
@@ -135,7 +303,7 @@ def get_batch(
     if args.sequence_packing_scheduler is not None:
         # `get_batch_on_this_rank_for_sequence_packing` owns scheduler THD metadata
         # and returns a 7-tuple including `padding_mask`.
-        return get_batch_on_this_rank_for_sequence_packing(
+        batch_tuple = get_batch_on_this_rank_for_sequence_packing(
             data_iterator,
             vpp_size=config.virtual_pipeline_model_parallel_size,
             mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
@@ -144,6 +312,8 @@ def get_batch(
             config=config,
             cp_partition_mode=cp_partition_mode,
         )
+        _maybe_dump_cp_layout_batch(*batch_tuple, cp_partition_mode, vp_stage)
+        return batch_tuple
 
     # TODO: this is pretty hacky, find a better way
     is_packed_sequence = args.sft or (args.use_varlen_dataset and not args.varlen_sbhd_validation)
@@ -175,7 +345,7 @@ def get_batch(
     # For middle pipeline stages with packed sequences, only cu_seqlens and
     # max_seqlen are needed (for attention masking); skip the full batch.
     if not is_first_or_last_pipeline_stage(vp_stage) and is_packed_sequence:
-        return (
+        batch_tuple = (
             None,
             None,
             None,
@@ -191,6 +361,8 @@ def get_batch(
             ),
             None,
         )
+        _maybe_dump_cp_layout_batch(*batch_tuple, cp_partition_mode, vp_stage)
+        return batch_tuple
 
     if cu_seqlens is None:
         # slice batch along sequence dimension for context parallelism
@@ -244,7 +416,7 @@ def get_batch(
             batch['position_ids'] = position_ids
 
     # Unpack explicitly to avoid relying on dict insertion order.
-    return (
+    batch_tuple = (
         batch.get('tokens'),
         batch.get('labels'),
         batch.get('loss_mask'),
@@ -253,6 +425,8 @@ def get_batch(
         packed_seq_params,
         padding_mask,
     )
+    _maybe_dump_cp_layout_batch(*batch_tuple, cp_partition_mode, vp_stage)
+    return batch_tuple
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -297,6 +471,8 @@ def loss_func(
             the data parallel ranks
     """
     args = get_args()
+    original_output_tensor = output_tensor
+    original_loss_mask = loss_mask
 
     if args.logits_load_dir is not None:
         # Offline knowledge distillation loss using cached teacher log-probabilities.
@@ -318,6 +494,14 @@ def loss_func(
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+
+    _maybe_dump_cp_layout_tensor_stage(
+        "loss_func_inputs",
+        output_tensor=original_output_tensor,
+        loss_mask=original_loss_mask,
+        local_loss=loss.detach().clone() if torch.is_tensor(loss) else loss,
+        num_tokens=num_tokens.detach().clone() if torch.is_tensor(num_tokens) else num_tokens,
+    )
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -399,6 +583,9 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 loss_mask=loss_mask,
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
+            )
+            _maybe_dump_cp_layout_tensor_stage(
+                "forward_output_tensor", output_tensor=output_tensor
             )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses

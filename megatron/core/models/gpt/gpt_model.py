@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
+import os
 from typing import Any, Callable, Dict, Literal, Optional
 
 import torch
@@ -51,6 +52,102 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_using_quantization_scales,
 )
+
+
+_CP_LAYOUT_GPT_DUMP_CALL_INDICES = {}
+
+
+def _debug_cp_group_rank(group, default):
+    if group is None:
+        return default
+    try:
+        if torch.distributed.is_initialized():
+            return torch.distributed.get_rank(group)
+    except (AssertionError, RuntimeError, ValueError):
+        pass
+    try:
+        return group.rank()
+    except (AttributeError, RuntimeError):
+        return default
+
+
+def _debug_cp_group_size(group, default):
+    if group is None:
+        return default
+    try:
+        if torch.distributed.is_initialized():
+            return torch.distributed.get_world_size(group)
+    except (AssertionError, RuntimeError, ValueError):
+        pass
+    try:
+        return group.size()
+    except (AttributeError, RuntimeError):
+        return default
+
+
+def _debug_cpu_value(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    return value
+
+
+def _debug_should_dump_cp_layout_stage(stage):
+    global _CP_LAYOUT_GPT_DUMP_CALL_INDICES
+    call_index = _CP_LAYOUT_GPT_DUMP_CALL_INDICES.get(stage, 0) + 1
+    _CP_LAYOUT_GPT_DUMP_CALL_INDICES[stage] = call_index
+    target_call = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_CALL")
+    max_calls = int(os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_MAX_CALLS", "1"))
+    if target_call is not None:
+        return call_index, call_index == int(target_call)
+    return call_index, call_index <= max_calls
+
+
+def _debug_dump_cp_layout_stage(
+    stage,
+    pg_collection,
+    config,
+    *,
+    stage_metadata=None,
+    **payload,
+):
+    dump_dir = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_DIR")
+    if not dump_dir:
+        return
+
+    call_index, should_dump = _debug_should_dump_cp_layout_stage(stage)
+    if not should_dump:
+        return
+
+    rank = int(os.environ.get("RANK", "0"))
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    cp_group = getattr(pg_collection, "cp", None)
+    metadata = {
+        "stage": stage,
+        "batch_dump_call_index": call_index,
+        "rank": rank,
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+        "context_parallel_rank": _debug_cp_group_rank(cp_group, 0),
+        "context_parallel_world_size": _debug_cp_group_size(
+            cp_group, getattr(config, "context_parallel_size", 1)
+        ),
+        "context_parallel_size": getattr(config, "context_parallel_size", None),
+        "sequence_parallel": getattr(config, "sequence_parallel", None),
+    }
+    if stage_metadata:
+        metadata.update(stage_metadata)
+
+    dump_payload = {"metadata": metadata}
+    for key, value in payload.items():
+        dump_payload[key] = _debug_cpu_value(value)
+
+    os.makedirs(dump_dir, exist_ok=True)
+    dump_path = os.path.join(
+        dump_dir, f"stage-{stage}_rank{rank:05d}_cp{metadata['context_parallel_rank']:02d}_call{call_index:03d}.pt"
+    )
+    tmp_path = f"{dump_path}.tmp"
+    torch.save(dump_payload, tmp_path)
+    os.replace(tmp_path, dump_path)
 
 
 class GPTModel(LanguageModule):
@@ -615,6 +712,14 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
+        _debug_dump_cp_layout_stage(
+            "gpt_preprocess_decoder_input",
+            self.pg_collection,
+            self.config,
+            stage_metadata={"partition_mode": self.get_input_cp_partition_mode()},
+            hidden_states=decoder_input,
+        )
+
         # Pass input_ids to decoder for hash-based MoE routing
         decoder_extra_block_kwargs = extra_block_kwargs or {}
         if self.config.moe_n_hash_layers > 0 and input_ids is not None:
@@ -641,6 +746,14 @@ class GPTModel(LanguageModule):
         else:
             hidden_states = decoder_output
             mhc_multistream = None
+
+        _debug_dump_cp_layout_stage(
+            "gpt_decoder_output",
+            self.pg_collection,
+            self.config,
+            stage_metadata={"partition_mode": self.get_output_cp_partition_mode()},
+            hidden_states=hidden_states,
+        )
 
         return self._postprocess(
             hidden_states=hidden_states,
@@ -714,6 +827,7 @@ class GPTModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
+        postprocess_partition_mode = self.get_output_cp_partition_mode()
         needs_batch_layout = self.post_process or (
             mtp_in_postprocess and not (in_inference_mode or is_spec_decode)
         )
@@ -800,6 +914,23 @@ class GPTModel(LanguageModule):
                 packed_seq_params = replace_packed_seq_params_cp_partition_mode(
                     packed_seq_params, target_partition_mode
                 )
+            postprocess_partition_mode = target_partition_mode
+
+            _debug_dump_cp_layout_stage(
+                "gpt_post_layout",
+                self.pg_collection,
+                self.config,
+                stage_metadata={
+                    "partition_mode": postprocess_partition_mode,
+                    "input_partition_mode": input_partition_mode,
+                    "decoder_output_partition_mode": current_partition_mode,
+                },
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                input_ids=input_ids,
+                position_ids=position_ids,
+            )
 
         if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
@@ -817,6 +948,15 @@ class GPTModel(LanguageModule):
                 padding_mask=padding_mask,
                 embedding=self.embedding,
                 **(extra_block_kwargs or {}),
+            )
+            _debug_dump_cp_layout_stage(
+                "gpt_after_mtp",
+                self.pg_collection,
+                self.config,
+                stage_metadata={"partition_mode": postprocess_partition_mode},
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
             )
 
         if not self.post_process:
@@ -939,6 +1079,16 @@ class GPTModel(LanguageModule):
         else:
             logits, _ = self.output_layer(**output_layer_kwargs)
             loss = self.compute_language_model_loss(labels, logits)
+
+        _debug_dump_cp_layout_stage(
+            "gpt_main_loss",
+            self.pg_collection,
+            self.config,
+            stage_metadata={"partition_mode": postprocess_partition_mode},
+            loss=loss,
+            labels=labels,
+            loss_mask=loss_mask,
+        )
 
         return loss
 
