@@ -124,6 +124,7 @@ def _debug_should_dump_cp_layout_gdn_stage(stage, layer_number):
     return call_index, call_index <= max_calls
 
 
+@torch._dynamo.disable
 def _debug_dump_cp_layout_gdn_stage(
     stage,
     *,

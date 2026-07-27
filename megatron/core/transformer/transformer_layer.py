@@ -94,6 +94,7 @@ def _debug_should_dump_cp_layout_layer_stage(stage):
     return call_index, call_index <= max_calls
 
 
+@torch._dynamo.disable
 def _debug_dump_cp_layout_layer_stage(
     stage,
     pg_collection,
@@ -186,6 +187,7 @@ def _debug_register_layer001_submodule_dumps(layer):
                 f"{_debug_sanitize_stage_name(module_name)}"
             )
 
+            @torch._dynamo.disable
             def _hook(_module, _inputs, output, stage=stage, module_name=module_name):
                 payload = _debug_collect_tensor_outputs(output)
                 if not payload:
