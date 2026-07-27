@@ -1150,7 +1150,14 @@ class GatedDeltaNet(MegatronModule):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            # Temporary debug workaround: replace FLA l2norm with a torch-native
+            # equivalent to test whether the first CP1/CP4 mismatch moves.
+            query_key = query_key.contiguous()
+            query_key_float = query_key.float()
+            query_key = (
+                query_key_float
+                * torch.rsqrt(torch.sum(query_key_float * query_key_float, dim=-1, keepdim=True) + 1e-6)
+            ).to(query_key.dtype)
 
         # Split query and key
         split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size_headwise
