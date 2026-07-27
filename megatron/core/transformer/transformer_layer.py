@@ -145,6 +145,70 @@ def _debug_dump_cp_layout_layer_stage(
     os.replace(tmp_path, dump_path)
 
 
+def _debug_sanitize_stage_name(name):
+    if not name:
+        return "root"
+    return "".join(ch if ch.isalnum() else "_" for ch in name)
+
+
+def _debug_collect_tensor_outputs(value, prefix="hidden_output"):
+    tensors = {}
+    if torch.is_tensor(value):
+        if value.dim() >= 2:
+            tensors[prefix] = value
+        return tensors
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            tensors.update(_debug_collect_tensor_outputs(item, f"{prefix}_{index}"))
+        return tensors
+    if isinstance(value, dict):
+        for key, item in value.items():
+            tensors.update(_debug_collect_tensor_outputs(item, f"{prefix}_{key}"))
+        return tensors
+    return tensors
+
+
+def _debug_register_layer001_submodule_dumps(layer):
+    dump_dir = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_DIR")
+    if not dump_dir:
+        return
+    target_layer = int(os.environ.get("MCORE_CP_LAYOUT_SUBMODULE_DUMP_LAYER", "1"))
+    if int(layer.layer_number or -1) != target_layer:
+        return
+
+    handles = []
+
+    def _register(root_name, root_module):
+        for module_name, module in root_module.named_modules():
+            stage = (
+                f"layer_{int(layer.layer_number or 0):03d}_{root_name}_module_"
+                f"{_debug_sanitize_stage_name(module_name)}"
+            )
+
+            def _hook(_module, _inputs, output, stage=stage, module_name=module_name):
+                payload = _debug_collect_tensor_outputs(output)
+                if not payload:
+                    return
+                _debug_dump_cp_layout_layer_stage(
+                    stage,
+                    layer.pg_collection,
+                    layer.config,
+                    stage_metadata={
+                        "layer_number": layer.layer_number,
+                        "root_module": root_name,
+                        "module_name": module_name or "root",
+                        "module_type": type(_module).__name__,
+                    },
+                    **payload,
+                )
+
+            handles.append(module.register_forward_hook(_hook))
+
+    _register("gdn", layer.self_attention)
+    _register("mlp", layer.mlp)
+    layer._debug_cp_layout_submodule_dump_handles = handles
+
+
 @functools.lru_cache(maxsize=None)
 def _get_offloading_interface():
     """Get the offloading interface for fine-grained activation offloading."""
@@ -553,6 +617,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
+        _debug_register_layer001_submodule_dumps(self)
 
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Protocol
@@ -66,6 +67,99 @@ if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 else:
     TELinear, te_checkpoint = None, None
+
+_CP_LAYOUT_MOE_DUMP_CALL_INDICES = {}
+
+
+def _debug_moe_cp_group_rank(group, default=0):
+    if group is None:
+        return default
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            return torch.distributed.get_group_rank(group, torch.distributed.get_rank())
+        except (AssertionError, RuntimeError, ValueError):
+            pass
+    try:
+        return group.rank()
+    except (AttributeError, RuntimeError):
+        return default
+
+
+def _debug_moe_cp_group_size(group, default=1):
+    if group is None:
+        return default
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            return torch.distributed.get_world_size(group)
+        except (AssertionError, RuntimeError, ValueError):
+            pass
+    try:
+        return group.size()
+    except (AttributeError, RuntimeError):
+        return default
+
+
+def _debug_should_dump_moe_stage(stage, layer_number):
+    dump_dir = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_DIR")
+    if not dump_dir:
+        return None, False
+    target_layer = int(os.environ.get("MCORE_CP_LAYOUT_SUBMODULE_DUMP_LAYER", "1"))
+    if int(layer_number or -1) != target_layer:
+        return None, False
+
+    global _CP_LAYOUT_MOE_DUMP_CALL_INDICES
+    call_index = _CP_LAYOUT_MOE_DUMP_CALL_INDICES.get(stage, 0) + 1
+    _CP_LAYOUT_MOE_DUMP_CALL_INDICES[stage] = call_index
+    target_call = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_CALL")
+    max_calls = int(os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_MAX_CALLS", "1"))
+    if target_call is not None:
+        return call_index, call_index == int(target_call)
+    return call_index, call_index <= max_calls
+
+
+def _debug_dump_moe_stage(stage, moe_layer, *, stage_metadata=None, **payload):
+    call_index, should_dump = _debug_should_dump_moe_stage(stage, moe_layer.layer_number)
+    if not should_dump:
+        return
+
+    dump_dir = os.environ["MCORE_CP_LAYOUT_BATCH_DUMP_DIR"]
+    rank = int(os.environ.get("RANK", "0"))
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    cp_group = getattr(getattr(moe_layer, "router", None), "cp_group", None)
+    metadata = {
+        "stage": stage,
+        "batch_dump_call_index": call_index,
+        "rank": rank,
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+        "context_parallel_rank": _debug_moe_cp_group_rank(cp_group, 0),
+        "context_parallel_world_size": _debug_moe_cp_group_size(
+            cp_group, getattr(moe_layer.config, "context_parallel_size", 1)
+        ),
+        "context_parallel_size": getattr(moe_layer.config, "context_parallel_size", None),
+        "sequence_parallel": getattr(moe_layer.config, "sequence_parallel", None),
+        "layer_number": moe_layer.layer_number,
+        "token_dispatcher_type": type(getattr(moe_layer, "token_dispatcher", None)).__name__,
+    }
+    if stage_metadata:
+        metadata.update(stage_metadata)
+
+    dump_payload = {"metadata": metadata}
+    for key, value in payload.items():
+        if torch.is_tensor(value) and value.dim() >= 2:
+            dump_payload[key] = value.detach().cpu()
+
+    if len(dump_payload) == 1:
+        return
+
+    os.makedirs(dump_dir, exist_ok=True)
+    dump_path = os.path.join(
+        dump_dir,
+        f"stage-{stage}_rank{rank:05d}_cp{metadata['context_parallel_rank']:02d}_call{call_index:03d}.pt",
+    )
+    tmp_path = f"{dump_path}.tmp"
+    torch.save(dump_payload, tmp_path)
+    os.replace(tmp_path, dump_path)
 
 
 class ExpertsInterface(Protocol):
@@ -463,6 +557,13 @@ class MoELayer(BaseMoELayer):
         probs, routing_map = apply_module(self.router)(
             hidden_states, padding_mask, input_ids, packed_seq_params
         )
+        _debug_dump_moe_stage(
+            f"moe_layer_{int(self.layer_number or 0):03d}_route",
+            self,
+            hidden_states=hidden_states,
+            probs=probs,
+            routing_map=routing_map,
+        )
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -505,6 +606,13 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
+        _debug_dump_moe_stage(
+            f"moe_layer_{int(self.layer_number or 0):03d}_preprocess",
+            self,
+            hidden_states=hidden_states,
+            probs=probs,
+            routing_map=routing_map,
+        )
         return hidden_states, probs
 
     @staticmethod
@@ -526,7 +634,16 @@ class MoELayer(BaseMoELayer):
         """
         if self.config.overlap_dispatch_backward_with_experts_wgrad:
             hidden_states = _RegisterDelayedWgradForExperts.apply(self, hidden_states)
-        return self.token_dispatcher.token_dispatch(hidden_states, probs)
+        dispatched_hidden_states, dispatched_probs = self.token_dispatcher.token_dispatch(
+            hidden_states, probs
+        )
+        _debug_dump_moe_stage(
+            f"moe_layer_{int(self.layer_number or 0):03d}_dispatch",
+            self,
+            hidden_states=dispatched_hidden_states,
+            probs=dispatched_probs,
+        )
+        return dispatched_hidden_states, dispatched_probs
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
@@ -554,6 +671,12 @@ class MoELayer(BaseMoELayer):
             else:
                 shared_expert_output = apply_module(self.shared_experts)(hidden_states)
 
+        _debug_dump_moe_stage(
+            f"moe_layer_{int(self.layer_number or 0):03d}_shared_experts",
+            self,
+            hidden_states=hidden_states,
+            shared_expert_output=shared_expert_output,
+        )
         return shared_expert_output
 
     def _maybe_record_overload_factor(
@@ -605,6 +728,12 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
+        _debug_dump_moe_stage(
+            f"moe_layer_{int(self.layer_number or 0):03d}_dispatch_postprocess",
+            self,
+            dispatched_input=dispatched_input,
+            permuted_probs=permuted_probs,
+        )
         dispatched_input = self._maybe_record_overload_factor(dispatched_input, tokens_per_expert)
         if (
             hasattr(self, "_inference_token_dispatcher")
@@ -620,7 +749,19 @@ class MoELayer(BaseMoELayer):
                 dispatched_input, tokens_per_expert, permuted_probs
             )
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+        _debug_dump_moe_stage(
+            f"moe_layer_{int(self.layer_number or 0):03d}_experts",
+            self,
+            dispatched_input=dispatched_input,
+            expert_output=expert_output,
+        )
         output = self.token_dispatcher.combine_preprocess(expert_output)
+        _debug_dump_moe_stage(
+            f"moe_layer_{int(self.layer_number or 0):03d}_combine_preprocess",
+            self,
+            expert_output=expert_output,
+            output=output,
+        )
 
         return output, mlp_bias
 
@@ -631,6 +772,11 @@ class MoELayer(BaseMoELayer):
         experts (e.g., via an All-to-All communication).
         """
         output = self.token_dispatcher.token_combine(output)
+        _debug_dump_moe_stage(
+            f"moe_layer_{int(self.layer_number or 0):03d}_combine",
+            self,
+            output=output,
+        )
         return output
 
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
@@ -656,6 +802,12 @@ class MoELayer(BaseMoELayer):
             torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
             output = output + self._latent_shared_expert_output
             self._latent_shared_expert_output = None
+        _debug_dump_moe_stage(
+            f"moe_layer_{int(self.layer_number or 0):03d}_postprocess",
+            self,
+            output=output,
+            shared_expert_output=shared_expert_output,
+        )
         return output
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):
@@ -737,6 +889,12 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            _debug_dump_moe_stage(
+                f"moe_layer_{int(self.layer_number or 0):03d}_input",
+                self,
+                hidden_states=hidden_states,
+                padding_mask=padding_mask,
+            )
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
