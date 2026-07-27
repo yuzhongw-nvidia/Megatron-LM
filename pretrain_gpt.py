@@ -74,6 +74,86 @@ except ImportError:
 
 stimer = StragglerDetector()
 
+_CP_LAYOUT_BATCH_DUMP_CALL_INDEX = 0
+
+
+def _debug_cp_group_rank(group, default=0):
+    if group is None:
+        return default
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            return torch.distributed.get_group_rank(group, torch.distributed.get_rank())
+        except (AssertionError, RuntimeError, ValueError):
+            pass
+    try:
+        return group.rank()
+    except (AttributeError, RuntimeError):
+        return default
+
+
+def _debug_cp_group_size(group, default=1):
+    if group is None:
+        return default
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            return torch.distributed.get_world_size(group)
+        except (AssertionError, RuntimeError, ValueError):
+            pass
+    try:
+        return group.size()
+    except (AttributeError, RuntimeError):
+        return default
+
+
+def _debug_dump_cp_layout_batch(config, **payload):
+    dump_dir = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_DIR")
+    if not dump_dir:
+        return
+
+    global _CP_LAYOUT_BATCH_DUMP_CALL_INDEX
+    _CP_LAYOUT_BATCH_DUMP_CALL_INDEX += 1
+    target_call = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_CALL")
+    max_calls = int(os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_MAX_CALLS", "1"))
+    if target_call is not None:
+        if _CP_LAYOUT_BATCH_DUMP_CALL_INDEX != int(target_call):
+            return
+    elif _CP_LAYOUT_BATCH_DUMP_CALL_INDEX > max_calls:
+        return
+
+    rank = int(os.environ.get("RANK", "0"))
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+    cp_group = None
+    try:
+        cp_group = mpu.get_context_parallel_group()
+    except (AssertionError, RuntimeError, ValueError, AttributeError):
+        cp_group = None
+    metadata = {
+        "batch_dump_call_index": _CP_LAYOUT_BATCH_DUMP_CALL_INDEX,
+        "rank": rank,
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+        "context_parallel_rank": _debug_cp_group_rank(cp_group, 0),
+        "context_parallel_world_size": _debug_cp_group_size(
+            cp_group, getattr(config, "context_parallel_size", 1)
+        ),
+        "context_parallel_size": getattr(config, "context_parallel_size", None),
+        "sequence_parallel": getattr(config, "sequence_parallel", None),
+    }
+    dump_payload = {"metadata": metadata}
+    for key, value in payload.items():
+        if torch.is_tensor(value):
+            dump_payload[key] = value.detach().cpu()
+
+    os.makedirs(dump_dir, exist_ok=True)
+    dump_path = os.path.join(
+        dump_dir,
+        f"batch_rank{rank:05d}_cp{metadata['context_parallel_rank']:02d}"
+        f"_call{_CP_LAYOUT_BATCH_DUMP_CALL_INDEX:03d}.pt",
+    )
+    tmp_path = f"{dump_path}.tmp"
+    torch.save(dump_payload, tmp_path)
+    os.replace(tmp_path, dump_path)
+
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch.
@@ -230,6 +310,14 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             batch['loss_mask'] = loss_mask
         if 'position_ids' in batch:
             batch['position_ids'] = position_ids
+
+    _debug_dump_cp_layout_batch(
+        config,
+        tokens=batch.get('tokens'),
+        labels=batch.get('labels'),
+        loss_mask=batch.get('loss_mask'),
+        position_ids=batch.get('position_ids'),
+    )
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (

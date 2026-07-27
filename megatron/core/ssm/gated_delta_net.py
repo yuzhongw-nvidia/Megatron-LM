@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Union
@@ -60,6 +61,121 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+_CP_LAYOUT_GDN_DUMP_CALL_INDICES = {}
+
+
+def _debug_cp_group_rank(group, default=0):
+    if group is None:
+        return default
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            return torch.distributed.get_group_rank(group, torch.distributed.get_rank())
+        except (AssertionError, RuntimeError, ValueError):
+            pass
+    try:
+        return group.rank()
+    except (AttributeError, RuntimeError):
+        return default
+
+
+def _debug_cp_group_size(group, default=1):
+    if group is None:
+        return default
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        try:
+            return torch.distributed.get_world_size(group)
+        except (AssertionError, RuntimeError, ValueError):
+            pass
+    try:
+        return group.size()
+    except (AttributeError, RuntimeError):
+        return default
+
+
+def _debug_seq_first(value):
+    if torch.is_tensor(value):
+        if value.dim() >= 2:
+            return value.transpose(0, 1).contiguous().detach().cpu()
+        return value.detach().cpu()
+    return value
+
+
+def _debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise):
+    return cp_group_chunkwise if cp_group_chunkwise is not None else cp_group_headwise
+
+
+def _debug_should_dump_cp_layout_gdn_stage(stage, layer_number):
+    dump_dir = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_DIR")
+    if not dump_dir:
+        return None, False
+
+    target_layer = int(os.environ.get("MCORE_CP_LAYOUT_GDN_DUMP_LAYER", "1"))
+    if int(layer_number or -1) != target_layer:
+        return None, False
+
+    global _CP_LAYOUT_GDN_DUMP_CALL_INDICES
+    call_index = _CP_LAYOUT_GDN_DUMP_CALL_INDICES.get(stage, 0) + 1
+    _CP_LAYOUT_GDN_DUMP_CALL_INDICES[stage] = call_index
+    target_call = os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_CALL")
+    max_calls = int(os.environ.get("MCORE_CP_LAYOUT_BATCH_DUMP_MAX_CALLS", "1"))
+    if target_call is not None:
+        return call_index, call_index == int(target_call)
+    return call_index, call_index <= max_calls
+
+
+def _debug_dump_cp_layout_gdn_stage(
+    stage,
+    *,
+    layer_number,
+    cp_group,
+    config,
+    stage_metadata=None,
+    seq_first_payload=False,
+    **payload,
+):
+    call_index, should_dump = _debug_should_dump_cp_layout_gdn_stage(stage, layer_number)
+    if not should_dump:
+        return
+
+    dump_dir = os.environ["MCORE_CP_LAYOUT_BATCH_DUMP_DIR"]
+    rank = int(os.environ.get("RANK", "0"))
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+
+    metadata = {
+        "stage": stage,
+        "batch_dump_call_index": call_index,
+        "rank": rank,
+        "world_size": int(os.environ.get("WORLD_SIZE", "1")),
+        "context_parallel_rank": _debug_cp_group_rank(cp_group, 0),
+        "context_parallel_world_size": _debug_cp_group_size(
+            cp_group, getattr(config, "context_parallel_size", 1)
+        ),
+        "context_parallel_size": getattr(config, "context_parallel_size", None),
+        "sequence_parallel": getattr(config, "sequence_parallel", None),
+        "layer_number": layer_number,
+        "linear_cp_mode": getattr(config, "linear_cp_mode", None),
+    }
+    if stage_metadata:
+        metadata.update(stage_metadata)
+
+    dump_payload = {"metadata": metadata}
+    for key, value in payload.items():
+        if not torch.is_tensor(value) or value.dim() == 0:
+            continue
+        dump_payload[key] = _debug_seq_first(value) if seq_first_payload else value.detach().cpu()
+    if len(dump_payload) == 1:
+        return
+
+    os.makedirs(dump_dir, exist_ok=True)
+    dump_path = os.path.join(
+        dump_dir,
+        f"stage-{stage}_rank{rank:05d}_cp{metadata['context_parallel_rank']:02d}_call{call_index:03d}.pt",
+    )
+    tmp_path = f"{dump_path}.tmp"
+    torch.save(dump_payload, tmp_path)
+    os.replace(tmp_path, dump_path)
 
 
 @dataclass
@@ -507,6 +623,18 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_in_proj",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_chunkwise": cp_size_chunkwise,
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            qkvzba=qkvzba,
+        )
 
         # Chunkwise CP expects the contiguous-time chunk layout (rank r holds chunks
         # [2r, 2r+1]) inside conv1d / chunk_gated_delta_rule. Megatron attention CP
@@ -524,6 +652,18 @@ class GatedDeltaNet(MegatronModule):
             else:
                 qkvzba = zigzag_to_contiguous_chunks(qkvzba, cp_group_chunkwise, seq_dim=0)
             nvtx_range_pop(suffix="zigzag_to_contiguous")
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_after_zigzag_to_contiguous",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_chunkwise": cp_size_chunkwise,
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            qkvzba=qkvzba,
+        )
 
         qkvzba, thd_cp_a2a_inv = self._a2a_cp_to_hp(
             qkvzba,
@@ -532,6 +672,18 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_q,
             seq_len_post_headwise,
             packed_seq_params,
+        )
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_after_headwise_a2a",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_chunkwise": cp_size_chunkwise,
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            qkvzba=qkvzba,
         )
 
         if self.gdn_pre_gated_delta_rule_fusion:
@@ -590,11 +742,30 @@ class GatedDeltaNet(MegatronModule):
                 seq_len_post_headwise,
                 cp_size_headwise,
                 cp_group_headwise,
+                cp_group_chunkwise,
                 cu_seqlens_q,
                 chunkwise_cp_context,
                 packed_seq_params=packed_seq_params,
             )
             nvtx_range_pop(suffix="pre_gated_delta_rule")
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_prepared_gdr_inputs",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_chunkwise": cp_size_chunkwise,
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            seq_first_payload=True,
+            query=query,
+            key=key,
+            value=value,
+            gate=gate,
+            beta=beta,
+            g=g,
+        )
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
@@ -610,6 +781,19 @@ class GatedDeltaNet(MegatronModule):
             cp_context=chunkwise_cp_context,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_gated_delta_rule",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_chunkwise": cp_size_chunkwise,
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            seq_first_payload=True,
+            core_attn_out=core_attn_out,
+        )
 
         # RMSNorm
         nvtx_range_push(suffix="gated_norm")
@@ -619,6 +803,19 @@ class GatedDeltaNet(MegatronModule):
         # Transpose: b s x --> s b x
         # From bshd back to sbhd format
         norm_out = norm_out.reshape(batch, seq_len_post_headwise, -1)
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_gated_norm_bshd",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_chunkwise": cp_size_chunkwise,
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            seq_first_payload=True,
+            norm_out=norm_out,
+        )
         norm_out = norm_out.transpose(0, 1).contiguous()
 
         # Inverse of the zigzag -> contiguous reshuffle performed before conv1d.
@@ -637,15 +834,51 @@ class GatedDeltaNet(MegatronModule):
                     norm_out, cp_group=cp_group_chunkwise, seq_dim=0
                 )
             nvtx_range_pop(suffix="contiguous_to_zigzag")
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_after_contiguous_to_zigzag",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_chunkwise": cp_size_chunkwise,
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            norm_out=norm_out,
+        )
 
         norm_out = self._a2a_hp_to_cp(
             norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv
+        )
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_before_out_proj",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_chunkwise": cp_size_chunkwise,
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            norm_out=norm_out,
         )
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_out_proj",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_chunkwise": cp_size_chunkwise,
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            out=out,
+        )
 
         return out, out_bias
 
@@ -656,6 +889,7 @@ class GatedDeltaNet(MegatronModule):
         seq_len,
         cp_size_headwise,
         cp_group_headwise,
+        cp_group_chunkwise=None,
         cu_seqlens_q=None,
         chunkwise_cp_context=None,
         packed_seq_params=None,
@@ -680,6 +914,21 @@ class GatedDeltaNet(MegatronModule):
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
         beta = beta.reshape(batch, seq_len, -1)
         alpha = alpha.reshape(batch, seq_len, -1)
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_pre_gdr_split",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            seq_first_payload=True,
+            qkv=qkv,
+            gate=gate,
+            beta=beta,
+            alpha=alpha,
+        )
 
         kernel_batch = batch
         kernel_seq_len = seq_len
@@ -762,6 +1011,18 @@ class GatedDeltaNet(MegatronModule):
             if _pad_n > 0:
                 qkv = qkv[:, :_orig_seq, :]
         nvtx_range_pop(suffix="conv1d")
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_post_conv",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            seq_first_payload=True,
+            qkv=qkv,
+        )
 
         # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
         nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
@@ -769,6 +1030,23 @@ class GatedDeltaNet(MegatronModule):
             qkv, gate, beta, alpha, kernel_batch, kernel_seq_len, cp_size_headwise=cp_size_headwise
         )
         nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_post_prepare_qkv",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            seq_first_payload=True,
+            query=query,
+            key=key,
+            value=value,
+            gate=gate,
+            beta=beta,
+            alpha=alpha,
+        )
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
@@ -780,6 +1058,19 @@ class GatedDeltaNet(MegatronModule):
         )
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
+        _debug_dump_cp_layout_gdn_stage(
+            f"gdn_layer_{int(self.layer_number or 0):03d}_post_g_beta",
+            layer_number=self.layer_number,
+            cp_group=_debug_preferred_cp_group(cp_group_chunkwise, cp_group_headwise),
+            config=self.config,
+            stage_metadata={
+                "cp_size_headwise": cp_size_headwise,
+                "packed_format": getattr(packed_seq_params, "qkv_format", None),
+            },
+            seq_first_payload=True,
+            g=g,
+            beta=beta,
+        )
 
         return query, key, value, gate, beta, g
 
