@@ -372,9 +372,11 @@ class GPTModel(LanguageModule):
         rotary_pos_sin = None
         # this is used to store combined cos/sin embeddings, exclusively for flash infer rope
         rotary_pos_cos_sin = None
-        cp_partition_mode = getattr(
-            packed_seq_params, "cp_partition_mode", self.config.cp_partition_mode
-        )
+        # Model-level RoPE is consumed by regular attention. Keep external
+        # RoPE in regular attention's concrete CP layout regardless of the
+        # current batch layout; attention variants that own RoPE materialization
+        # pass their own concrete layout at their internal callsites.
+        external_rope_cp_partition_mode = "zigzag"
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             use_flash_infer_fused_rope = (
@@ -415,7 +417,7 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                    cp_partition_mode=cp_partition_mode,
+                    cp_partition_mode=external_rope_cp_partition_mode,
                 )
         elif self.position_embedding_type == 'yarn' and not self.config.multi_latent_attention:
             if not InferenceMode.is_active() or not self.config.flash_decode:
@@ -427,7 +429,7 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-                    cp_partition_mode=cp_partition_mode,
+                    cp_partition_mode=external_rope_cp_partition_mode,
                 )
             else:
                 raise NotImplementedError(
@@ -456,7 +458,7 @@ class GPTModel(LanguageModule):
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                     return_raw_freqs=use_fused_mrope,
                     packed_seq=packed_seq,
-                    cp_partition_mode=cp_partition_mode,
+                    cp_partition_mode=external_rope_cp_partition_mode,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE
