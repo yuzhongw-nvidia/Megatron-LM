@@ -1561,6 +1561,9 @@ class Attention(MegatronModule, ABC):
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
                 rope_max_seqlen_q = rope_max_seqlen_kv = None
+            cp_partition_mode = getattr(
+                packed_seq_params, "cp_partition_mode", self.config.cp_partition_mode
+            )
 
             if split_qkv:
                 if q_pos_emb is not None:
@@ -1573,6 +1576,7 @@ class Attention(MegatronModule, ABC):
                             cu_seqlens=cu_seqlens_q,
                             mscale=self._yarn_concentration_factor,
                             cp_group=self.pg_collection.cp,
+                            cp_partition_mode=cp_partition_mode,
                             max_seqlen=rope_max_seqlen_q,
                         )
                     else:
@@ -1592,6 +1596,7 @@ class Attention(MegatronModule, ABC):
                         cu_seqlens=cu_seqlens_kv,
                         mscale=self._yarn_concentration_factor,
                         cp_group=self.pg_collection.cp,
+                        cp_partition_mode=cp_partition_mode,
                         max_seqlen=rope_max_seqlen_kv,
                     )
             else:

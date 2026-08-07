@@ -4,6 +4,10 @@ import pytest
 import torch
 
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings.rope_utils import (
+    _apply_rotary_pos_emb_bshd,
+    get_pos_emb_on_this_cp_rank,
+)
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
     RotaryEmbedding,
@@ -19,6 +23,77 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 from tests.unit_tests.test_utilities import Utils
+
+
+class FakeCPGroup:
+    def __init__(self, size=1, rank=0):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
+@pytest.mark.parametrize(
+    ("cp_partition_mode", "rank", "expected_positions"),
+    [
+        ("zigzag", 0, [0, 1, 6, 7]),
+        ("zigzag", 1, [2, 3, 4, 5]),
+        ("contiguous", 0, [0, 1, 2, 3]),
+        ("contiguous", 1, [4, 5, 6, 7]),
+    ],
+)
+def test_get_pos_emb_on_this_cp_rank_respects_partition_mode(
+    cp_partition_mode, rank, expected_positions
+):
+    pos_emb = torch.arange(8, dtype=torch.float32).view(8, 1, 1, 1)
+
+    local = get_pos_emb_on_this_cp_rank(
+        pos_emb, 0, FakeCPGroup(size=2, rank=rank), cp_partition_mode=cp_partition_mode
+    )
+
+    assert local.flatten().tolist() == expected_positions
+
+
+@pytest.mark.parametrize(
+    ("cp_partition_mode", "rank", "expected_freq_positions"),
+    [
+        ("zigzag", 0, [0, 1, 6, 7, 0, 1, 6, 7]),
+        ("zigzag", 1, [2, 3, 4, 5, 2, 3, 4, 5]),
+        ("contiguous", 0, list(range(8))),
+        ("contiguous", 1, list(range(8))),
+    ],
+)
+def test_apply_rotary_pos_emb_thd_respects_partition_mode(
+    cp_partition_mode, rank, expected_freq_positions
+):
+    t = torch.randn(8, 2, 8)
+    freqs = torch.randn(8, 1, 1, 8)
+    cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=2,
+        apply_rope_fusion=False,
+    )
+
+    out = apply_rotary_pos_emb(
+        t,
+        freqs,
+        config,
+        cu_seqlens=cu_seqlens,
+        cp_group=FakeCPGroup(size=2, rank=rank),
+        cp_partition_mode=cp_partition_mode,
+        max_seqlen=8,
+    )
+    ref = _apply_rotary_pos_emb_bshd(
+        t.unsqueeze(1), freqs[torch.tensor(expected_freq_positions)]
+    ).squeeze(1)
+
+    torch.testing.assert_close(out, ref)
 
 
 class TestMultimodalRotaryEmbedding:

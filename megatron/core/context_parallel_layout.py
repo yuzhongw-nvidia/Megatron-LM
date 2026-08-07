@@ -9,6 +9,32 @@ import torch
 from megatron.core.tensor_parallel import all_to_all
 
 
+def get_context_parallel_layout_chunk_indices(
+    cp_size: int, cp_rank: int, layout: str
+) -> torch.Tensor:
+    """Return SBHD chunk indices owned by one CP rank in a layout.
+
+    Args:
+        cp_size: Context-parallel group size.
+        cp_rank: Context-parallel rank.
+        layout: Either ``"zigzag"`` or ``"contiguous"``.
+
+    SBHD tensors are partitioned into ``2 * cp_size`` equal chunks along the
+    sequence dimension. This helper returns the two global chunk indices, in
+    rank-local order, for the requested concrete layout.
+    """
+    if layout not in ("zigzag", "contiguous"):
+        raise ValueError(f"Unsupported context-parallel layout {layout!r}.")
+    if cp_size < 1:
+        raise ValueError(f"cp_size must be >= 1, got {cp_size}.")
+    if not 0 <= cp_rank < cp_size:
+        raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}.")
+
+    if layout == "contiguous":
+        return torch.tensor([2 * cp_rank, 2 * cp_rank + 1], device="cpu", dtype=torch.long)
+    return torch.tensor([cp_rank, 2 * cp_size - cp_rank - 1], device="cpu", dtype=torch.long)
+
+
 def get_thd_context_parallel_rank_indices(
     cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, layout: str
 ) -> torch.Tensor:

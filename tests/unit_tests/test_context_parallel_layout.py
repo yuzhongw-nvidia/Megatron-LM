@@ -3,11 +3,33 @@
 import pytest
 import torch
 
-from megatron.core.context_parallel_layout import get_thd_context_parallel_rank_indices
+from megatron.core.context_parallel_layout import (
+    get_context_parallel_layout_chunk_indices,
+    get_thd_context_parallel_rank_indices,
+)
 
 
 def _token_ranges(*spans):
     return [token for start, end in spans for token in range(start, end)]
+
+
+@pytest.mark.parametrize(
+    ("layout", "expected"),
+    [
+        ("zigzag", [[0, 7], [1, 6], [2, 5], [3, 4]]),
+        ("contiguous", [[0, 1], [2, 3], [4, 5], [6, 7]]),
+    ],
+)
+def test_context_parallel_layout_chunk_indices(layout, expected):
+    assert [
+        get_context_parallel_layout_chunk_indices(4, rank, layout).tolist()
+        for rank in range(4)
+    ] == expected
+
+
+def test_context_parallel_layout_chunk_indices_reject_unknown_layout():
+    with pytest.raises(ValueError, match="Unsupported"):
+        get_context_parallel_layout_chunk_indices(2, 0, "interleaved")
 
 
 def test_thd_context_parallel_rank_indices_match_per_sequence_chunk_order():

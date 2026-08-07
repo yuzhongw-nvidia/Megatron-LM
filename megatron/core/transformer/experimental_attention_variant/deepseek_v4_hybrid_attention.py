@@ -219,6 +219,11 @@ class DSv4HybridAttention(Attention):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    def _get_packed_cp_partition_mode(self, packed_seq_params):
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            return packed_seq_params.cp_partition_mode
+        return self.config.cp_partition_mode
+
     def forward(
         self,
         hidden_states,
@@ -367,12 +372,17 @@ class DSv4HybridAttention(Attention):
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
+        cp_partition_mode = self._get_packed_cp_partition_mode(packed_seq_params)
         if self.config.apply_rope_fusion:
             # ``mscale=1.0`` strips yarn's concentration factor from the
             # cached cos/sin so the fused kernel matches the unfused
             # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+                rope_seqlen,
+                dtype=hidden_states.dtype,
+                packed_seq=packed_seq,
+                cp_partition_mode=cp_partition_mode,
+                mscale=mscale,
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -380,9 +390,13 @@ class DSv4HybridAttention(Attention):
                 fused_mla_rope_inplace is not None
             ), "Fused MLA RoPE apply is not imported successfully"
         elif self._dsv4_uses_yarn_rope:
-            rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+            rotary_pos_emb, _ = self.rotary_pos_emb(
+                rope_seqlen, packed_seq=packed_seq, cp_partition_mode=cp_partition_mode
+            )
         else:
-            rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rope_seqlen, packed_seq=packed_seq, cp_partition_mode=cp_partition_mode
+            )
         if self.config.apply_rope_fusion:
             if use_thd_cp:
                 global_start = self.pg_collection.cp.rank() * core_attn_out.shape[0]
@@ -449,6 +463,7 @@ class DSv4HybridAttention(Attention):
                 mla_rotary_interleaved=True,
                 inverse=True,
                 mla_output_remove_interleaving=True,
+                cp_partition_mode=cp_partition_mode,
                 max_seqlen=rope_max_seqlen_kv,
             )
             if packed_seq:
@@ -623,12 +638,17 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        cp_partition_mode = self._get_packed_cp_partition_mode(packed_seq_params)
         if self.config.apply_rope_fusion:
             # ``mscale=1.0`` strips yarn's concentration factor from the
             # cached cos/sin so the fused kernel matches the unfused
             # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+                rotary_seq_len,
+                dtype=hidden_states.dtype,
+                packed_seq=packed_seq,
+                cp_partition_mode=cp_partition_mode,
+                mscale=mscale,
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -636,9 +656,13 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 fused_mla_rope_inplace is not None
             ), "Fused MLA RoPE apply is not imported successfully"
         elif self._dsv4_uses_yarn_rope:
-            rotary_pos_emb, _ = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb, _ = self.rotary_pos_emb(
+                rotary_seq_len, packed_seq=packed_seq, cp_partition_mode=cp_partition_mode
+            )
         else:
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
+            rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len, packed_seq=packed_seq, cp_partition_mode=cp_partition_mode
+            )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -828,6 +852,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         cp_group=cp_group,
                         mla_rotary_interleaved=True,
                         mla_output_remove_interleaving=True,
+                        cp_partition_mode=cp_partition_mode,
                         max_seqlen=rope_max_seqlen_q,
                     )
                     # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
@@ -846,6 +871,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         cp_group=cp_group,
                         mla_rotary_interleaved=True,
                         mla_output_remove_interleaving=True,
+                        cp_partition_mode=cp_partition_mode,
                         max_seqlen=rope_max_seqlen_kv,
                     )
 

@@ -479,6 +479,7 @@ def _apply_unfused_rope(
     cu_seqlens: Optional[torch.Tensor],
     cp_group: torch.distributed.ProcessGroup,
     max_seqlen: Optional[int] = None,
+    cp_partition_mode: str = "zigzag",
 ) -> torch.Tensor:
     """Apply unfused RoPE (split, rotate, concat) with 3-D / 4-D handling.
 
@@ -511,6 +512,7 @@ def _apply_unfused_rope(
         cp_group=cp_group,
         mla_rotary_interleaved=True,
         mla_output_remove_interleaving=True,
+        cp_partition_mode=cp_partition_mode,
         max_seqlen=max_seqlen,
     )
     out = torch.cat([x_nope, x_pe], dim=-1)
@@ -535,6 +537,7 @@ def _apply_rope(
     cp_group: torch.distributed.ProcessGroup = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     max_seqlen_rope: Optional[int] = None,
+    cp_partition_mode: str = "zigzag",
 ) -> torch.Tensor:
     """Apply RoPE to the last ``pos_dim`` dims, leaving the rest unchanged.
 
@@ -567,6 +570,8 @@ def _apply_rope(
         max_total = None
 
     use_fused = config.apply_rope_fusion
+    if packed_seq and cp_group is not None and cp_group.size() > 1:
+        use_fused = use_fused and cp_partition_mode == "zigzag"
 
     if use_fused:
         # ``mscale=1.0`` keeps the cached cos/sin free of yarn's
@@ -574,7 +579,11 @@ def _apply_rope(
         # split-rotate path (DSv4 "pure rotation" contract).
         if packed_seq:
             cos, sin = rotary_pos_emb_module.get_cached_cos_sin(
-                max_total, dtype=x.dtype, packed_seq=True, mscale=1.0
+                max_total,
+                dtype=x.dtype,
+                packed_seq=True,
+                cp_partition_mode=cp_partition_mode,
+                mscale=1.0,
             )
             if ratio > 1:
                 cos = cos[:max_total:ratio]
@@ -582,7 +591,11 @@ def _apply_rope(
         else:
             total = rotary_seq_len * ratio if ratio > 1 else rotary_seq_len
             cos, sin = rotary_pos_emb_module.get_cached_cos_sin(
-                total, dtype=x.dtype, packed_seq=False, mscale=1.0
+                total,
+                dtype=x.dtype,
+                packed_seq=False,
+                cp_partition_mode=cp_partition_mode,
+                mscale=1.0,
             )
             if ratio > 1:
                 cos = cos[:total:ratio][:rotary_seq_len]
@@ -591,13 +604,17 @@ def _apply_rope(
 
     # ---- Unfused path: build rotary_pos_emb tensor ----------------------
     if packed_seq:
-        rope_result = rotary_pos_emb_module(max_total, packed_seq=True)
+        rope_result = rotary_pos_emb_module(
+            max_total, packed_seq=True, cp_partition_mode=cp_partition_mode
+        )
         rotary_pos_emb = rope_result[0] if isinstance(rope_result, tuple) else rope_result
         if ratio > 1:
             rotary_pos_emb = rotary_pos_emb[:max_total:ratio]
     else:
         total = rotary_seq_len * ratio if ratio > 1 else rotary_seq_len
-        rope_result = rotary_pos_emb_module(total, packed_seq=False)
+        rope_result = rotary_pos_emb_module(
+            total, packed_seq=False, cp_partition_mode=cp_partition_mode
+        )
         rotary_pos_emb = rope_result[0] if isinstance(rope_result, tuple) else rope_result
         if ratio > 1:
             rotary_pos_emb = rotary_pos_emb[:total:ratio][:rotary_seq_len]
@@ -608,7 +625,15 @@ def _apply_rope(
     # no-global-offset path without a GPU→CPU sync over ``cu_seqlens``.
     max_seqlen = rotary_pos_emb.shape[0] if packed_seq else None
     return _apply_unfused_rope(
-        x, rotary_pos_emb, nope_dim, pos_dim, config, cu_seqlens, cp_group, max_seqlen=max_seqlen
+        x,
+        rotary_pos_emb,
+        nope_dim,
+        pos_dim,
+        config,
+        cu_seqlens,
+        cp_group,
+        max_seqlen=max_seqlen,
+        cp_partition_mode=cp_partition_mode,
     )
 
 
@@ -1180,6 +1205,7 @@ class Compressor(MegatronModule):
             n_compressed,
             ratio=ratio,
             cp_group=self.pg_collection.cp,
+            cp_partition_mode=self.config.cp_partition_mode,
         )
 
         if self.rotate:
@@ -1324,7 +1350,11 @@ class Compressor(MegatronModule):
             position_ids = compressed_group_ids[:total_comp].clamp_min(0) * ratio
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    int(max_seqlen_q), dtype=compressed_thd.dtype, packed_seq=True, mscale=1.0
+                    int(max_seqlen_q),
+                    dtype=compressed_thd.dtype,
+                    packed_seq=True,
+                    cp_partition_mode=packed_seq_params.cp_partition_mode,
+                    mscale=1.0,
                 )
                 compressed_thd = fused_mla_rope_inplace(
                     compressed_thd,
@@ -1337,7 +1367,11 @@ class Compressor(MegatronModule):
                     position_ids=position_ids,
                 )
             else:
-                rope_result = self.rotary_pos_emb(int(max_seqlen_q), packed_seq=True)
+                rope_result = self.rotary_pos_emb(
+                    int(max_seqlen_q),
+                    packed_seq=True,
+                    cp_partition_mode=packed_seq_params.cp_partition_mode,
+                )
                 rotary_pos_emb = rope_result[0] if isinstance(rope_result, tuple) else rope_result
                 compressed_thd = _apply_unfused_rope(
                     compressed_thd,
@@ -1347,6 +1381,7 @@ class Compressor(MegatronModule):
                     self.config,
                     None,
                     self.pg_collection.cp,
+                    cp_partition_mode=packed_seq_params.cp_partition_mode,
                 )
         else:
             # RoPE: applied in a single vectorized THD call.
@@ -1362,6 +1397,7 @@ class Compressor(MegatronModule):
                 cp_group=self.pg_collection.cp,
                 cu_seqlens=cu_seqlens_compressed,
                 max_seqlen_rope=max_seqlen_rope,
+                cp_partition_mode=packed_seq_params.cp_partition_mode,
             )
 
         if self.rotate:
@@ -1581,6 +1617,9 @@ class CSAIndexer(MegatronModule):
             cp_group=self.pg_collection.cp,
             cu_seqlens=cu_seqlens_q,
             max_seqlen_rope=max_seqlen_rope,
+            cp_partition_mode=getattr(
+                packed_seq_params, "cp_partition_mode", self.config.cp_partition_mode
+            ),
         )
         q = rotate_activation(q)
 
@@ -2606,7 +2645,11 @@ class CompressedSparseAttention(MegatronModule):
                 )
                 if self.config.apply_rope_fusion:
                     rotary_pos_cos, rotary_pos_sin = indexer.rotary_pos_emb.get_cached_cos_sin(
-                        max_seqlen_q, dtype=q_indexer_cp.dtype, packed_seq=True, mscale=1.0
+                        max_seqlen_q,
+                        dtype=q_indexer_cp.dtype,
+                        packed_seq=True,
+                        cp_partition_mode=packed_seq_params.cp_partition_mode,
+                        mscale=1.0,
                     )
                     q_indexer_cp = cp_utils.apply_thd_cp_local_rope_fused(
                         q_indexer_cp,
@@ -2618,7 +2661,11 @@ class CompressedSparseAttention(MegatronModule):
                         global_start,
                     )
                 else:
-                    rope_result = indexer.rotary_pos_emb(max_seqlen_q, packed_seq=True)
+                    rope_result = indexer.rotary_pos_emb(
+                        max_seqlen_q,
+                        packed_seq=True,
+                        cp_partition_mode=packed_seq_params.cp_partition_mode,
+                    )
                     rotary_pos_emb = (
                         rope_result[0] if isinstance(rope_result, tuple) else rope_result
                     )
