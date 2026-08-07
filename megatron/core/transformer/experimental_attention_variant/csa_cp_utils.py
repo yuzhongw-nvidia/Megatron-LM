@@ -397,3 +397,123 @@ def compute_cp_indexer_topk(
         q_causal_offsets=q_causal_offsets,
     )
     return topk, (cu_q_topk, cu_k_topk, q_causal_offsets)
+
+
+def build_uncompacted_cp_attention_indices(
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    local_rows: int,
+    d_window: int,
+    window_size: int,
+    ratio: int,
+    compressed_width: int,
+    compressed_topk: Optional[torch.Tensor] = None,
+    cu_seqlens_compressed: Optional[torch.Tensor] = None,
+    seq_to_rank_row: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Build CP physical indices while preserving THD reference slot order.
+
+    The fused CP lowering compacts valid slots for FlashMLA. The PyTorch fallback
+    should instead keep fixed-width slots without compacting invalid ``-1``
+    entries. Indexer-loss mode still puts selected compressed slots first,
+    matching ``csa.py``'s unfused loss helper contract.
+
+    Returns:
+        ``(topk_idxs, indexer_rank_major)``. ``indexer_rank_major`` is returned
+        only when ``compressed_topk`` is provided; it maps each selected
+        compressed id to the rank-major compressed buffer for the indexer-loss
+        path.
+    """
+    device = cu_seqlens.device
+    global_start = int(global_start)
+    local_rows = int(local_rows)
+    d_window = int(d_window)
+    window_size = int(window_size)
+    ratio = int(ratio)
+    compressed_width = int(compressed_width)
+    compressed_base = d_window + local_rows
+
+    global_rows = torch.arange(
+        global_start,
+        global_start + local_rows,
+        dtype=cu_seqlens.dtype,
+        device=device,
+    )
+    sequence_ids = torch.bucketize(
+        global_rows, cu_seqlens[1:], out_int32=True, right=True
+    ).clamp_max(cu_seqlens.shape[0] - 2)
+    sequence_starts = cu_seqlens[sequence_ids]
+    sequence_ends = cu_seqlens[sequence_ids + 1]
+    valid_rows = (global_rows >= sequence_starts) & (global_rows < sequence_ends)
+
+    window_offsets = torch.arange(window_size, dtype=cu_seqlens.dtype, device=device)
+    window_starts = torch.maximum(global_rows - window_size + 1, sequence_starts)
+    window_counts = torch.where(valid_rows, global_rows - window_starts + 1, 0)
+    window_global_rows = window_starts.unsqueeze(1) + window_offsets.unsqueeze(0)
+    window_valid = window_offsets.unsqueeze(0) < window_counts.unsqueeze(1)
+    window_cp_rows = torch.where(
+        window_global_rows < global_start,
+        window_global_rows - (global_start - d_window),
+        d_window + window_global_rows - global_start,
+    )
+    window_idxs = torch.where(
+        window_valid, window_cp_rows, torch.full_like(window_cp_rows, -1)
+    ).to(torch.int32)
+
+    if compressed_width == 0:
+        indexer_rank_major = None
+        if compressed_topk is not None:
+            indexer_rank_major = torch.empty(
+                (local_rows, 0), dtype=torch.int32, device=cu_seqlens.device
+            )
+        return window_idxs, indexer_rank_major
+    if cu_seqlens_compressed is None or seq_to_rank_row is None:
+        raise RuntimeError("compressed CP attention indices require compressed row metadata.")
+
+    if compressed_topk is None:
+        compressed_ids = (
+            torch.arange(compressed_width, dtype=cu_seqlens.dtype, device=device)
+            .unsqueeze(0)
+            .expand(local_rows, -1)
+        )
+        seq_compressed_lens = cu_seqlens_compressed[1:] - cu_seqlens_compressed[:-1]
+        visible_compressed = torch.minimum(
+            torch.div(global_rows - sequence_starts + 1, ratio, rounding_mode="floor"),
+            seq_compressed_lens[sequence_ids],
+        ).clamp_min(0)
+        compressed_valid = (
+            valid_rows.unsqueeze(1) & (compressed_ids < visible_compressed.unsqueeze(1))
+        )
+    else:
+        compressed_ids = compressed_topk.to(cu_seqlens.dtype)
+        seq_compressed_lens = cu_seqlens_compressed[1:] - cu_seqlens_compressed[:-1]
+        compressed_valid = (
+            valid_rows.unsqueeze(1)
+            & (compressed_ids >= 0)
+            & (compressed_ids < seq_compressed_lens[sequence_ids].unsqueeze(1))
+        )
+
+    seq_major_rows = cu_seqlens_compressed[sequence_ids].unsqueeze(1) + compressed_ids
+    if seq_to_rank_row.numel() == 0:
+        rank_major_rows = torch.full_like(seq_major_rows, -1)
+        compressed_valid = compressed_valid & False
+    else:
+        safe_seq_major_rows = seq_major_rows.clamp(0, seq_to_rank_row.shape[0] - 1).long()
+        rank_major_rows = seq_to_rank_row[safe_seq_major_rows]
+        compressed_valid = compressed_valid & (rank_major_rows >= 0)
+    compressed_idxs = torch.where(
+        compressed_valid,
+        compressed_base + rank_major_rows.to(cu_seqlens.dtype),
+        torch.full_like(seq_major_rows, -1),
+    ).to(torch.int32)
+
+    indexer_rank_major = None
+    if compressed_topk is not None:
+        indexer_rank_major = torch.where(
+            compressed_valid,
+            rank_major_rows,
+            torch.full_like(rank_major_rows, -1),
+        ).to(torch.int32)
+        return torch.cat((compressed_idxs, window_idxs), dim=-1), indexer_rank_major
+
+    return torch.cat((window_idxs, compressed_idxs), dim=-1), indexer_rank_major

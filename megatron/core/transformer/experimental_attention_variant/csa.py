@@ -2692,8 +2692,24 @@ class CompressedSparseAttention(MegatronModule):
         # Lower the logical ids into two physical spaces: indexer_topk_rank_major
         # addresses the rank-major compressed buffers without kv_full_thd's
         # compressed base, while topk_idxs addresses final rows in kv_full_thd.
-        topk_idxs, topk_length, indexer_topk_rank_major = (
-            csa_cp_layout_kernels.build_attention_indices(
+        if self.use_fused_kernels:
+            topk_idxs, topk_length, indexer_topk_rank_major = (
+                csa_cp_layout_kernels.build_attention_indices(
+                    cu_seqlens,
+                    global_start,
+                    l_local,
+                    d_window,
+                    self.window_size,
+                    ratio,
+                    compressed_width,
+                    compressed_topk,
+                    cu_seqlens_compressed=cu_seqlens_compressed,
+                    seq_to_rank_row=seq_to_rank_row,
+                    for_indexer_loss=use_indexer_loss,
+                )
+            )
+        else:
+            topk_idxs, indexer_topk_rank_major = cp_utils.build_uncompacted_cp_attention_indices(
                 cu_seqlens,
                 global_start,
                 l_local,
@@ -2704,9 +2720,8 @@ class CompressedSparseAttention(MegatronModule):
                 compressed_topk,
                 cu_seqlens_compressed=cu_seqlens_compressed,
                 seq_to_rank_row=seq_to_rank_row,
-                for_indexer_loss=use_indexer_loss,
             )
-        )
+            topk_length = None
         if use_indexer_loss:
             # ---- Step 7a: indexer-loss path ----------------------------------
             k_indexer_for_loss = k_indexer_rank_major
