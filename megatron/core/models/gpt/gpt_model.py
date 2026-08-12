@@ -579,6 +579,7 @@ class GPTModel(LanguageModule):
             self.preprocess_for_paged_stash()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        token_padding_mask = padding_mask
 
         preproc_output = self._preprocess(
             input_ids=input_ids,
@@ -649,6 +650,7 @@ class GPTModel(LanguageModule):
             mhc_multistream=mhc_multistream,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
+            token_padding_mask=token_padding_mask,
         )
 
     def _postprocess(
@@ -674,6 +676,7 @@ class GPTModel(LanguageModule):
         mhc_multistream=None,
         output_processor=None,
         output_processor_context=None,
+        token_padding_mask=None,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -695,6 +698,7 @@ class GPTModel(LanguageModule):
         )
         mtp_cp_group = None
         sequence_roll_context = None
+        mtp_padding_mask = padding_mask
         if (
             self.config.mtp_num_layers
             and (mtp_in_postprocess or self.post_process)
@@ -710,6 +714,7 @@ class GPTModel(LanguageModule):
                 packed_seq_params=packed_seq_params,
             )
             if sequence_roll_context is not None:
+                mtp_padding_mask = token_padding_mask if token_padding_mask is not None else padding_mask
                 roll_position_ids = mtp_in_postprocess and getattr(
                     self.embedding, "add_position_embedding", True
                 )
@@ -723,7 +728,7 @@ class GPTModel(LanguageModule):
                     position_ids=position_ids if roll_position_ids else None,
                     labels=labels if self.post_process else None,
                     loss_mask=loss_mask if self.post_process else None,
-                    padding_mask=padding_mask if mtp_in_postprocess else None,
+                    padding_mask=mtp_padding_mask if mtp_in_postprocess else None,
                 )
 
         # logits and loss
@@ -744,7 +749,7 @@ class GPTModel(LanguageModule):
                 packed_seq_params=packed_seq_params,
                 sequence_roll_context=sequence_roll_context,
                 sequence_len_offset=sequence_len_offset,
-                padding_mask=padding_mask,
+                padding_mask=mtp_padding_mask,
                 embedding=self.embedding,
                 **(extra_block_kwargs or {}),
             )

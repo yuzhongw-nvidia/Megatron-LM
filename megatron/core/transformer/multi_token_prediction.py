@@ -2111,6 +2111,11 @@ class MultiTokenPredictionLayer(MegatronModule):
             tensors_to_roll.append(padding_mask)
             fill_values.append(True)
             sequence_fields.append("padding_mask")
+        scatter_padding_mask_after_roll = (
+            padding_mask is not None
+            and self.config.sequence_parallel
+            and sequence_roll_context is not None
+        )
 
         rolled_tensors = roll_tensor(
             tensors_to_roll,
@@ -2132,6 +2137,14 @@ class MultiTokenPredictionLayer(MegatronModule):
             padding_mask = rolled_tensors[next_rolled_tensor]
 
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+        if scatter_padding_mask_after_roll:
+            padding_mask = (
+                scatter_to_sequence_parallel_region(
+                    padding_mask.transpose(0, 1).contiguous(), group=self.tp_group
+                )
+                .transpose(0, 1)
+                .contiguous()
+            )
 
         if self.config.mtp_detach_heads:
             decoder_input = decoder_input.detach()
