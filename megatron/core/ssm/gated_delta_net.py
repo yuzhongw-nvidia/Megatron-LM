@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import math
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Union
@@ -16,10 +17,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import tensor_parallel
-from megatron.core.context_parallel_layout import (
-    contiguous_to_zigzag_chunks,
-    zigzag_to_contiguous_chunks,
-)
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
@@ -202,16 +200,19 @@ class GatedDeltaNet(MegatronModule):
 
         # weight shape: [conv_dim, 1, d_conv]
         # bias shape: [conv_dim]
-        self.conv1d = nn.Conv1d(
-            in_channels=self.conv_dim_local_tp,
-            out_channels=self.conv_dim_local_tp,
-            bias=conv_bias,
-            kernel_size=self.conv_kernel_dim,
-            groups=self.conv_dim_local_tp,
-            padding=self.conv_kernel_dim - 1,
-            device=torch.cuda.current_device(),
-            dtype=config.params_dtype,
-        )
+        # Conv1d performs implicit CUDA RNG initialization in its constructor.
+        # Isolate it; reset_parameters below owns the final Megatron-tracked init.
+        with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+            self.conv1d = nn.Conv1d(
+                in_channels=self.conv_dim_local_tp,
+                out_channels=self.conv_dim_local_tp,
+                bias=conv_bias,
+                kernel_size=self.conv_kernel_dim,
+                groups=self.conv_dim_local_tp,
+                padding=self.conv_kernel_dim - 1,
+                device=torch.cuda.current_device(),
+                dtype=config.params_dtype,
+            )
         setattr(self.conv1d.weight, "tensor_model_parallel", True)
         setattr(self.conv1d.weight, "partition_dim", 0)
         if conv_bias:
@@ -295,6 +296,12 @@ class GatedDeltaNet(MegatronModule):
                 # conv1d.weight
                 if self.conv_init is not None:
                     nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
+                else:
+                    nn.init.kaiming_uniform_(self.conv1d.weight, a=math.sqrt(5))
+                if self.conv1d.bias is not None:
+                    fan_in = self.conv1d.weight.size(1) * self.conv1d.weight.size(2)
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(self.conv1d.bias, -bound, bound)
                 # dt_bias
                 torch.ones(
                     self.num_v_heads_local_tp,
@@ -366,6 +373,20 @@ class GatedDeltaNet(MegatronModule):
             )
         cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
         cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
+        back_to_input_converter = None
+        if self.config.linear_cp_mode == "chunkwise":
+            (
+                hidden_states,
+                back_to_input_converter,
+            ) = convert_module_input_tensors_cp_partition_mode(
+                hidden_states=hidden_states,
+                packed_seq_params=packed_seq_params,
+                cp_group=cp_group_chunkwise,
+                tp_group=self.tp_group,
+                target_partition_mode="contiguous",
+                sequence_parallel=self.config.sequence_parallel,
+                config=self.config,
+            )
 
         seq_len_local, batch, _ = hidden_states.shape
         seq_len_post_headwise = seq_len_local * self.sp_size * cp_size_headwise
@@ -479,6 +500,13 @@ class GatedDeltaNet(MegatronModule):
                 chunkwise_cp_context,
             )
 
+        if back_to_input_converter is not None:
+            out = back_to_input_converter.convert(
+                out,
+                seq_dim=0,
+                sequence_parallel=self.config.sequence_parallel,
+            )
+
         return out, out_bias
 
     def _forward_compute(
@@ -507,23 +535,6 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
-
-        # Chunkwise CP expects the contiguous-time chunk layout (rank r holds chunks
-        # [2r, 2r+1]) inside conv1d / chunk_gated_delta_rule. Megatron attention CP
-        # feeds us the zigzag attention-load-balanced layout (rank r holds
-        # [r, 2*cp-r-1]), so reshuffle chunks over the CP group with a single
-        # all-to-all — no full-sequence gather required.
-        # TODO: Move CP layout ownership to a model/region-level scheduler so hybrid models can
-        # enter contiguous layout before GDN regions instead of paying module-local conversions.
-        if cp_size_chunkwise > 1:
-            nvtx_range_push(suffix="zigzag_to_contiguous")
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                qkvzba = zigzag_to_contiguous_chunks(
-                    qkvzba, cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
-                )
-            else:
-                qkvzba = zigzag_to_contiguous_chunks(qkvzba, cp_group_chunkwise, seq_dim=0)
-            nvtx_range_pop(suffix="zigzag_to_contiguous")
 
         qkvzba, thd_cp_a2a_inv = self._a2a_cp_to_hp(
             qkvzba,
@@ -620,23 +631,6 @@ class GatedDeltaNet(MegatronModule):
         # From bshd back to sbhd format
         norm_out = norm_out.reshape(batch, seq_len_post_headwise, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
-
-        # Inverse of the zigzag -> contiguous reshuffle performed before conv1d.
-        # Restores the Megatron attention-load-balanced layout that downstream
-        # layers and loss computation expect.
-        # TODO: The planned CP layout refactor should keep consecutive GDN layers contiguous and
-        # restore zigzag only at SDPA/canonical-layout boundaries.
-        if cp_size_chunkwise > 1:
-            nvtx_range_push(suffix="contiguous_to_zigzag")
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0, cu_seqlens=cu_seqlens_q
-                )
-            else:
-                norm_out = contiguous_to_zigzag_chunks(
-                    norm_out, cp_group=cp_group_chunkwise, seq_dim=0
-                )
-            nvtx_range_pop(suffix="contiguous_to_zigzag")
 
         norm_out = self._a2a_hp_to_cp(
             norm_out, cp_size_headwise, cp_group_headwise, packed_seq_params, thd_cp_a2a_inv

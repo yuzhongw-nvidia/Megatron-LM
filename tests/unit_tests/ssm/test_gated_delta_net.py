@@ -9,14 +9,10 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.models.common.embeddings.rope_utils import (
-    get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
-)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
     get_transformer_block_with_experimental_attention_variant_spec,
 )
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import (
@@ -28,16 +24,6 @@ from megatron.core.ssm.gated_delta_net import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.utils import unwrap_model
-from megatron.training.arguments import parse_args
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.global_vars import set_args
-from megatron.training.training import get_model
-from tests.unit_tests.dist_checkpointing import (
-    TempNamedDir,
-    init_basic_mock_args,
-    init_checkpointing_mock_args,
-)
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -98,6 +84,18 @@ def _make_gdn_config(**overrides):
     }
     config_kwargs.update(overrides)
     return TransformerConfig(**config_kwargs)
+
+
+def _set_gdn_test_cp_partition_mode(packed_seq_params, cp_size, linear_cp_mode):
+    if cp_size <= 1:
+        return packed_seq_params
+    if linear_cp_mode == "headwise":
+        packed_seq_params.cp_partition_mode = "zigzag"
+    elif linear_cp_mode == "chunkwise":
+        packed_seq_params.cp_partition_mode = "contiguous"
+    else:
+        raise ValueError(f"Invalid linear CP mode: {linear_cp_mode}")
+    return packed_seq_params
 
 
 def test_gdn_pre_gated_delta_rule_fusion_defaults_to_disabled():
@@ -543,6 +541,7 @@ class TestGatedDeltaNet:
         hidden_states_thd = hidden_states_thd.view(-1, 1, self.gdn.config.hidden_size)
         attention_mask_thd = None
         packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+        _set_gdn_test_cp_partition_mode(packed_seq_params, self.cp_size, self.linear_cp_mode)
 
         # THD format
         output_thd, _ = self.gdn(
@@ -594,6 +593,7 @@ class TestGatedDeltaNet:
         padded_params = make_test_packed_seq_params_with_padding(
             cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 128]
         )
+        _set_gdn_test_cp_partition_mode(padded_params, self.cp_size, self.linear_cp_mode)
         output_thd_padded, _ = self.gdn(hidden_states_thd, None, packed_seq_params=padded_params)
         output_thd2bshd = output_thd_padded.view(*output_bshd.shape)
         torch.testing.assert_close(
@@ -606,6 +606,7 @@ class TestGatedDeltaNet:
 
         # B) no-padded branch: use actual cu_seqlens when it matches total_sequence_length.
         no_padding_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 128])
+        _set_gdn_test_cp_partition_mode(no_padding_params, self.cp_size, self.linear_cp_mode)
         output_thd_no_padding, _ = self.gdn(
             hidden_states_thd, None, packed_seq_params=no_padding_params
         )
@@ -631,11 +632,13 @@ class TestGatedDeltaNet:
         padded_mismatch_params = make_test_packed_seq_params_with_padding(
             cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 126]
         )
+        _set_gdn_test_cp_partition_mode(padded_mismatch_params, self.cp_size, self.linear_cp_mode)
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=padded_mismatch_params)
 
         # E) actual mismatch branch without *_padded: should raise.
         actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
+        _set_gdn_test_cp_partition_mode(actual_mismatch_params, self.cp_size, self.linear_cp_mode)
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
 
@@ -747,6 +750,15 @@ class TestFusedPreGatedDeltaRule:
                 rtol=output_rtol,
                 msg=lambda msg, output_name=name: f"{output_name} mismatch: {msg}",
             )
+
+    def _make_pre_gated_delta_rule_grad_outputs(self, outputs):
+        grad_outputs = []
+        for output_idx, output in enumerate(outputs):
+            grad = torch.linspace(
+                -0.1, 0.1, output.numel(), device=output.device, dtype=torch.float32
+            ).reshape(output.shape)
+            grad_outputs.append(grad + (output_idx - 2.5) * 0.01)
+        return grad_outputs
 
     def test_fused_and_unfused_forward_match(self):
         hidden_states = torch.randn(
@@ -941,6 +953,7 @@ class TestFusedPreGatedDeltaRule:
 
         batch = 2
         seq_len = 32
+        torch.manual_seed(1234)
         qkvzba = torch.randn(
             (seq_len, batch, reference_gdn.in_proj_dim),
             device=torch.cuda.current_device(),
@@ -956,7 +969,7 @@ class TestFusedPreGatedDeltaRule:
             qkvzba_unfused, batch, seq_len, reference_gdn.cp_size, reference_gdn.pg_collection.cp
         )
         fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(qkvzba_fused)
-        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+        grad_outputs = self._make_pre_gated_delta_rule_grad_outputs(unfused_outputs)
 
         unfused_loss = sum(
             (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
@@ -992,6 +1005,7 @@ class TestFusedPreGatedDeltaRule:
             [0, 1, 4, 6, 11], device=torch.cuda.current_device(), dtype=torch.int32
         )
         seq_len = cu_seqlens[-1].item()
+        torch.manual_seed(1234)
         qkvzba = torch.randn(
             (seq_len, batch, reference_gdn.in_proj_dim),
             device=torch.cuda.current_device(),
@@ -1095,7 +1109,7 @@ class TestFusedPreGatedDeltaRule:
         fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
             qkvzba_fused, cu_seqlens_q=cu_seqlens
         )
-        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+        grad_outputs = self._make_pre_gated_delta_rule_grad_outputs(unfused_outputs)
 
         unfused_loss = sum(
             (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
@@ -1162,7 +1176,7 @@ class TestFusedPreGatedDeltaRule:
         fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
             qkvzba_fused, cu_seqlens_q=cu_seqlens
         )
-        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+        grad_outputs = self._make_pre_gated_delta_rule_grad_outputs(unfused_outputs)
 
         unfused_loss = sum(
             (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
@@ -1401,6 +1415,7 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
                 cu_seqlens[i + 1] - cu_seqlens[i] for i in range(len(cu_seqlens) - 1)
             ),
             total_tokens=cu_seqlens[-1] // cp_size,
+            cp_partition_mode="contiguous",
         )
 
     @staticmethod
@@ -1734,6 +1749,8 @@ def test_parallel_gated_delta_net_correctness(
         sequence_length=256,
         micro_batch_size=micro_batch_size,
         sequence_packing=sequence_packing,
+        cp_partition_mode="contiguous" if is_chunkwise_cp else "zigzag",
+        compare_param_grads=is_chunkwise_cp and tp == 1 and not sequence_packing,
     )
 
 

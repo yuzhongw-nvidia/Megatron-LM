@@ -11,6 +11,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -1361,6 +1362,21 @@ class Attention(MegatronModule, ABC):
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
             self.pg_collection.cp = packed_seq_params.cp_group
+        (
+            hidden_states,
+            back_to_input_converter,
+        ) = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            key_value_states=key_value_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=self.pg_collection.cp,
+            tp_group=self.pg_collection.tp,
+            target_partition_mode="zigzag",
+            sequence_parallel=self.config.sequence_parallel,
+            config=self.config,
+            attention_mask=attention_mask,
+            attention_bias=attention_bias,
+        )
 
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
@@ -1507,6 +1523,12 @@ class Attention(MegatronModule, ABC):
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = apply_module(self.linear_proj)(context_layer)
+            if back_to_input_converter is not None:
+                output = back_to_input_converter.convert(
+                    output,
+                    seq_dim=0,
+                    sequence_parallel=self.config.sequence_parallel,
+                )
             self.pg_collection.cp = _orig_cp_group
             return output, bias
 
@@ -1699,6 +1721,13 @@ class Attention(MegatronModule, ABC):
             output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
         nvtx_range_pop(suffix="linear_proj")
+
+        if back_to_input_converter is not None:
+            output = back_to_input_converter.convert(
+                output,
+                seq_dim=0,
+                sequence_parallel=self.config.sequence_parallel,
+            )
 
         self.pg_collection.cp = _orig_cp_group
         return output, bias
