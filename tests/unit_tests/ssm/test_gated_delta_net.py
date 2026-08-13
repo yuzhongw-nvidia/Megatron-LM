@@ -1,5 +1,7 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
+import inspect
 import os
 from functools import partial
 from unittest import mock
@@ -9,9 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
-from megatron.core.models.common.embeddings.rope_utils import (
-    get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
-)
+from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
     get_transformer_block_with_experimental_attention_variant_spec,
@@ -19,8 +19,8 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.gated_delta_net import (
-    GatedDeltaNet,
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet, torch_chunk_gated_delta_rule
+from megatron.core.ssm.gated_delta_net.common import (
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
     tensor_a2a_cp2hp,
@@ -28,16 +28,6 @@ from megatron.core.ssm.gated_delta_net import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.utils import unwrap_model
-from megatron.training.arguments import parse_args
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.global_vars import set_args
-from megatron.training.training import get_model
-from tests.unit_tests.dist_checkpointing import (
-    TempNamedDir,
-    init_basic_mock_args,
-    init_checkpointing_mock_args,
-)
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -119,6 +109,28 @@ def test_gdn_pre_gated_delta_rule_fusion_requires_gdn_variant():
         )
 
 
+def test_gdn_norm_out_recompute_accepts_gdn_variant():
+    config = _make_gdn_config(recompute_granularity="selective", recompute_modules=["gdn_norm_out"])
+    assert "gdn_norm_out" in config.recompute_modules
+
+
+def test_gdn_and_norm_out_recompute_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="'gdn' and 'gdn_norm_out'"):
+        _make_gdn_config(
+            recompute_granularity="selective", recompute_modules=["gdn", "gdn_norm_out"]
+        )
+
+
+def test_gdn_norm_out_recompute_requires_gdn_variant():
+    with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
+        _make_gdn_config(
+            experimental_attention_variant=None,
+            linear_attention_freq=None,
+            recompute_granularity="selective",
+            recompute_modules=["gdn_norm_out"],
+        )
+
+
 def test_gdn_conv_pad_alignment_rejects_chunkwise_cp():
     with pytest.raises(AssertionError, match="gdn_conv_pad_alignment is incompatible"):
         _make_gdn_config(
@@ -135,6 +147,24 @@ def test_gdn_chunkwise_cp_head_divisibility_ignores_cp_size():
         linear_num_value_heads=8,
     )
     assert config.linear_cp_mode == "chunkwise"
+
+
+def test_torch_chunk_gated_delta_rule_preserves_public_signature():
+    signature = inspect.signature(torch_chunk_gated_delta_rule)
+    assert tuple(signature.parameters) == (
+        "q",
+        "k",
+        "v",
+        "g",
+        "beta",
+        "chunk_size",
+        "initial_state",
+        "output_final_state",
+        "use_qk_l2norm_in_kernel",
+        "cu_seqlens",
+        "cp_context",
+        "scale",
+    )
 
 
 def test_fused_pre_gdr_split_batched_recv_send_works():
@@ -348,6 +378,56 @@ class TestGatedDeltaNet:
                 msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
             )
 
+    @pytest.mark.flaky_in_dev  # Issue #5473
+    def test_selective_recompute_gdn_norm_out(self):
+        """Output-discarding 'gdn_norm_out' recompute must preserve outputs and gradients."""
+        gdn = self.gdn
+        gdn.train()
+
+        micro_batch_size = 1 if self.linear_cp_mode == "chunkwise" and self.cp_size > 1 else 2
+        seq_length = 64
+        torch.manual_seed(1234)
+        base_input = torch.randn(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        def run(recompute_norm_out):
+            gdn.recompute_gdn = False
+            gdn.recompute_norm_out = recompute_norm_out
+            gdn.norm_out_checkpoint = None
+            gdn.zero_grad(set_to_none=True)
+            hidden_states = base_input.clone().detach().requires_grad_(True)
+            output, _ = gdn(hidden_states, None)
+            output.float().square().mean().backward()
+            param_grads = {
+                name: param.grad.detach().clone()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            return output.detach().clone(), hidden_states.grad.detach().clone(), param_grads
+
+        try:
+            out_ref, dinput_ref, pgrad_ref = run(recompute_norm_out=False)
+            out_rc, dinput_rc, pgrad_rc = run(recompute_norm_out=True)
+        finally:
+            gdn.recompute_norm_out = False
+            gdn.norm_out_checkpoint = None
+
+        torch.testing.assert_close(out_rc, out_ref, rtol=1e-4, atol=1e-4)
+        torch.testing.assert_close(dinput_rc, dinput_ref, rtol=1e-4, atol=1e-4)
+        assert pgrad_ref.keys() == pgrad_rc.keys(), "recompute changed the set of grad params"
+        assert len(pgrad_ref) > 0, "expected at least one parameter gradient"
+        for name in pgrad_ref:
+            torch.testing.assert_close(
+                pgrad_rc[name],
+                pgrad_ref[name],
+                rtol=1e-4,
+                atol=1e-4,
+                msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
+            )
+
     def test_gpu_forward_rejects_sbhd_chunkwise_cp_batch_gt_one(self):
         if not (self.linear_cp_mode == "chunkwise" and self.cp_size > 1):
             pytest.skip("Only chunkwise CP with CP>1 uses the FLA CP batch guard.")
@@ -385,6 +465,105 @@ class TestGatedDeltaNet:
         with pytest.raises(ValueError, match=expected_error):
             gdn(hidden_states, None)
 
+    def test_deterministic_mode(self):
+        if self.cp_size > 1:
+            pytest.skip(
+                "deterministic_mode uses torch_chunk_gated_delta_rule, which does not support CP."
+            )
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        det_config = copy.deepcopy(self.transformer_config)
+        det_config.deterministic_mode = True
+
+        gdn_submodules = get_experimental_attention_variant_module_spec(
+            config=det_config
+        ).submodules
+
+        model_parallel_cuda_manual_seed(42)
+        torch.manual_seed(42)
+        gdn = (
+            GatedDeltaNet(
+                det_config,
+                submodules=gdn_submodules,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            .cuda()
+            .bfloat16()
+        )
+
+        # deterministic_mode must select the torch-native kernel, not FLA.
+        assert gdn.gated_delta_rule is torch_chunk_gated_delta_rule
+
+        micro_batch_size = 2
+        seq_length = 64
+        torch.manual_seed(0)
+        base_input = torch.randn(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        def run():
+            hidden_states = base_input.clone().requires_grad_(True)
+            output, _ = gdn(hidden_states, None)
+            output.float().sum().backward()
+            grads = {
+                name: param.grad.detach().clone()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            gdn.zero_grad(set_to_none=True)
+            return output.detach().clone(), grads, hidden_states.grad.detach().clone()
+
+        out1, grads1, input_grad1 = run()
+        out2, grads2, input_grad2 = run()
+
+        rank = torch.distributed.get_rank()
+        assert torch.equal(out1, out2), f"Output not reproducible ({rank=})"
+        assert torch.equal(input_grad1, input_grad2), f"Input grad not reproducible ({rank=})"
+        assert set(grads1.keys()) == set(grads2.keys())
+        for name in grads1:
+            assert torch.equal(
+                grads1[name], grads2[name]
+            ), f"Grad not reproducible for {name} ({rank=})"
+
+    def test_module_construction(self):
+        gdn = self.gdn
+        assert gdn.in_proj_dim == 2 * gdn.qk_dim + 2 * gdn.v_dim + 2 * gdn.num_value_heads
+        assert gdn.A_log.shape == (gdn.num_value_heads // self.tp_size,)
+        assert gdn.dt_bias.shape == (gdn.num_value_heads // self.tp_size,)
+
+    def test_sharded_state_dict_splits_gdn_parameters(self):
+        sharded_sd = self.gdn.sharded_state_dict(prefix="gdn.")
+
+        in_proj_weight = sharded_sd["gdn.in_proj.weight"]
+        conv1d_weight = sharded_sd["gdn.conv1d.weight"]
+        assert isinstance(in_proj_weight, ShardedTensorFactory)
+        assert isinstance(conv1d_weight, ShardedTensorFactory)
+
+        in_proj_chunks = in_proj_weight.build()
+        assert tuple(chunk.key for chunk in in_proj_chunks) == tuple(
+            f"gdn.in_proj.weight.{name}" for name in self.gdn.in_proj_split_names
+        )
+        assert sum(chunk.data.numel() for chunk in in_proj_chunks) == in_proj_weight.data.numel()
+
+        conv1d_chunks = conv1d_weight.build()
+        assert tuple(chunk.key for chunk in conv1d_chunks) == (
+            "gdn.conv1d.weight.query",
+            "gdn.conv1d.weight.key",
+            "gdn.conv1d.weight.value",
+        )
+        assert sum(chunk.data.numel() for chunk in conv1d_chunks) == conv1d_weight.data.numel()
+
     def test_jit_compiled_helpers(self):
         import torch._dynamo
 
@@ -392,64 +571,60 @@ class TestGatedDeltaNet:
         batch = 2
         seq_len = 16
 
+        device = torch.cuda.current_device()
         num_v_heads_local = gdn.num_value_heads // gdn.tp_size // self.cp_size_headwise
+        qk_dim_local = gdn.qk_dim_local_tp // self.cp_size_headwise
+        v_dim_local = gdn.v_dim_local_tp // self.cp_size_headwise
 
-        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // self.cp_size_headwise
         qkv = torch.randn(
-            batch, seq_len, qkv_last_dim, device=torch.cuda.current_device(), dtype=torch.bfloat16
+            batch, seq_len, 2 * qk_dim_local + v_dim_local, device=device, dtype=torch.bfloat16
         )
         gate = torch.randn(
             batch,
             seq_len,
             num_v_heads_local,
             gdn.value_head_dim,
-            device=torch.cuda.current_device(),
+            device=device,
             dtype=torch.bfloat16,
         )
-        beta = torch.randn(
-            batch,
-            seq_len,
-            num_v_heads_local,
-            device=torch.cuda.current_device(),
-            dtype=torch.bfloat16,
-        )
-        alpha = torch.randn(
-            batch,
-            seq_len,
-            num_v_heads_local,
-            device=torch.cuda.current_device(),
-            dtype=torch.bfloat16,
-        )
+        gate_feats = (
+            torch.randn(batch, seq_len, num_v_heads_local, device=device, dtype=torch.bfloat16),
+            torch.randn(batch, seq_len, num_v_heads_local, device=device, dtype=torch.bfloat16),
+        )  # beta, alpha
 
         # Disable dynamo so coverage.py can trace through the method bodies,
         # which are normally wrapped by @jit_fuser (torch.compile).
+        A_log_mock = torch.randn(num_v_heads_local, device=device, dtype=torch.bfloat16)
+        dt_bias_mock = torch.randn(num_v_heads_local, device=device, dtype=torch.bfloat16)
+
         with torch._dynamo.config.patch(disable=True):
-            query, key, value, gate_out, beta_out, alpha_out = (
-                gdn._prepare_qkv_for_gated_delta_rule(
-                    qkv, gate, beta, alpha, batch, seq_len, cp_size_headwise=self.cp_size_headwise
-                )
+            kernel_inputs = gdn._prepare_input_for_gated_delta_rule(
+                qkv,
+                gate,
+                A_log_mock,
+                dt_bias_mock,
+                batch,
+                seq_len,
+                *gate_feats,
+                cp_size_headwise=self.cp_size_headwise,
             )
+
+        query = kernel_inputs["q"]
+        key = kernel_inputs["k"]
+        value = kernel_inputs["v"]
+        g = kernel_inputs["g"]
+        gate_out = kernel_inputs["gate"]
+        beta_out = kernel_inputs["beta"]
 
         assert query.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert key.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)
         assert value.shape == (batch, seq_len, num_v_heads_local, gdn.value_head_dim)
-        assert query.is_contiguous()
-        assert key.is_contiguous()
-        assert value.is_contiguous()
-
-        A_log_mock = torch.randn(
-            num_v_heads_local, device=torch.cuda.current_device(), dtype=torch.bfloat16
-        )
-        dt_bias_mock = torch.randn(
-            num_v_heads_local, device=torch.cuda.current_device(), dtype=torch.bfloat16
-        )
-
-        with torch._dynamo.config.patch(disable=True):
-            g, beta_sig = gdn._compute_g_and_beta(A_log_mock, dt_bias_mock, alpha, beta)
+        for t in (query, key, value, gate_out, beta_out):
+            assert t.is_contiguous()
 
         assert g.dtype == torch.float32
-        assert g.shape == alpha.shape
-        assert beta_sig.shape == beta.shape
+        assert g.shape == (batch, seq_len, num_v_heads_local)
+        assert beta_out.shape == (batch, seq_len, num_v_heads_local)
 
     def test_fused_pre_gated_delta_rule_headwise_cp_uses_cp_local_parameters(self):
         if not HAVE_FUSED_PRE_GDR:
@@ -500,11 +675,7 @@ class TestGatedDeltaNet:
             "fused_streamed_pre_gated_delta_rule",
             side_effect=fake_fused_streamed_pre_gated_delta_rule,
         ):
-            gdn._fused_streamed_pre_gated_delta_rule(
-                qkvzba,
-                cp_size_headwise=self.cp_size_headwise,
-                cp_group_headwise=gdn.pg_collection.cp,
-            )
+            gdn._fused_streamed_pre_gated_delta_rule(qkvzba, cp_group_headwise=gdn.pg_collection.cp)
 
         assert captured["qkvzba"] is qkvzba
         assert captured["conv1d_weight"].shape == (
