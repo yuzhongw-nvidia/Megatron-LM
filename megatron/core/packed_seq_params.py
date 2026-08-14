@@ -678,18 +678,9 @@ def pad_sequence_for_thd(
         cp_group=packed_seq_params.cp_group,
         cp_partition_mode=packed_seq_params.cp_partition_mode,
         total_tokens=local_target_len if target_cu_entries is None else None,
-        pad_between_seqs=(
-            # CUDA Graph capture bakes this Python branch into the captured
-            # kernels, so static inputs use the conservative batch-independent
-            # True (see Notes in the docstring).
-            True
-            if target_cu_entries is not None
-            else (
-                has_inter_sequence_padding
-                if has_dummy_padding_seq
-                else (True if has_non_dummy_padding_tail else packed_seq_params.pad_between_seqs)
-            )
-        ),
+        # Temporary precision ablation: present padded boundaries to TE as
+        # ordinary sequence extents while preserving MCore's real metadata.
+        pad_between_seqs=False,
     )
 
     # True marks padded local token slots for routing/loss paths.
