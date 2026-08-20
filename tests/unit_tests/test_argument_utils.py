@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import signal
 from argparse import ArgumentError, ArgumentParser, Namespace
@@ -656,6 +656,21 @@ class TestArgumentGroupFactoryArgparseMeta:
 
 class TestMegatronNetworkArgumentGeneration:
     """Test Megatron's TransformerConfig-derived argument group."""
+
+    def test_gated_attention_projection_granularity_cli_choices(self):
+        """The TransformerConfig Literal provides the public CLI contract."""
+        from megatron.training.arguments import _add_network_size_args
+
+        parser = ArgumentParser(exit_on_error=False)
+        _add_network_size_args(parser)
+
+        assert parser.parse_args([]).gated_attention_proj_granularity == "elementwise"
+        for granularity in ("elementwise", "headwise"):
+            args = parser.parse_args(["--gated-attention-proj-granularity", granularity])
+            assert args.gated_attention_proj_granularity == granularity
+
+        with pytest.raises(ArgumentError, match="invalid choice"):
+            parser.parse_args(["--gated-attention-proj-granularity", "tokenwise"])
 
     def test_transformer_callback_fields_are_not_registered_as_cli_args(self):
         """Callback fields are runtime hooks, not CLI-provided values."""

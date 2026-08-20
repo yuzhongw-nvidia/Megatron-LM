@@ -54,6 +54,7 @@ def _make_gpt_args(
     args.group_query_attention = False
     args.num_query_groups = num_attention_heads
     args.attention_output_gate = False
+    args.gated_attention_proj_granularity = "elementwise"
     args.multi_latent_attention = False
     # MoE / MTP disabled.
     args.num_experts = None
@@ -114,6 +115,7 @@ def _make_ling_hybrid_args(pattern):
     args.kv_lora_rank = 256
     args.v_head_dim = 64
     args.attention_output_gate = True
+    args.gated_attention_proj_granularity = "headwise"
     return args
 
 
@@ -397,6 +399,21 @@ class TestHybridMatchesStandard:
 
         self._assert_match(configure)
 
+    @pytest.mark.parametrize("gate_granularity", ("elementwise", "headwise"))
+    def test_mla_output_gate(self, gate_granularity):
+        def configure(args):
+            args.multi_latent_attention = True
+            args.group_query_attention = False
+            args.q_lora_rank = 256
+            args.qk_head_dim = 64
+            args.qk_pos_emb_head_dim = 32
+            args.kv_lora_rank = 256
+            args.v_head_dim = 64
+            args.attention_output_gate = True
+            args.gated_attention_proj_granularity = gate_granularity
+
+        self._assert_match(configure)
+
 
 class TestLingHybridAttentionFlops:
     """KDA and MLA layers must contribute to Ling-V3 Tiny MFU accounting."""
@@ -445,6 +462,26 @@ class TestLingHybridAttentionFlops:
             * (args.qk_head_dim + args.qk_pos_emb_head_dim + args.v_head_dim)
         )
         assert flops_full - flops_half == expected_delta
+
+    def test_mla_gate_granularity_changes_only_projection_work(self):
+        args = _make_ling_hybrid_args("+")
+        batch_size = 2
+        total_tokens = batch_size * args.seq_length
+
+        args.gated_attention_proj_granularity = "headwise"
+        headwise_flops = num_floating_point_operations(args, batch_size)
+        args.gated_attention_proj_granularity = "elementwise"
+        elementwise_flops = num_floating_point_operations(args, batch_size)
+
+        expected_delta = (
+            3
+            * 2
+            * total_tokens
+            * args.hidden_size
+            * args.num_attention_heads
+            * (args.v_head_dim - 1)
+        )
+        assert elementwise_flops - headwise_flops == expected_delta
 
 
 class TestPaddingRemoval:

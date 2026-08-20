@@ -48,6 +48,42 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
+class TestAttentionOutputGateGranularity:
+    """Protect the regular-attention granularity and numerical contracts."""
+
+    @staticmethod
+    def _config(**kwargs):
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            **kwargs,
+        )
+
+    def test_regular_attention_defaults_to_elementwise(self):
+        config = self._config(attention_output_gate=True)
+        assert config.gated_attention_proj_granularity == "elementwise"
+
+    def test_regular_attention_rejects_headwise_projection(self):
+        with pytest.raises(ValueError, match="Regular attention does not support headwise"):
+            self._config(attention_output_gate=True, gated_attention_proj_granularity="headwise")
+
+    def test_rejects_unknown_projection_granularity(self):
+        with pytest.raises(ValueError, match="must be either 'elementwise' or 'headwise'"):
+            self._config(gated_attention_proj_granularity="tokenwise")
+
+    def test_elementwise_gate_matches_fp32_sigmoid_reference(self):
+        attention = object.__new__(SelfAttention)
+        core_output = torch.linspace(-2, 2, 24, dtype=torch.bfloat16).reshape(2, 1, 12)
+        gate = torch.linspace(3, -3, 24, dtype=torch.bfloat16).reshape(2, 1, 12)
+
+        actual = attention._apply_output_gate(core_output, gate)
+        reference = (core_output * torch.sigmoid(gate.float())).to(core_output.dtype)
+
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("output_gate", [False, True])
 @pytest.mark.parametrize(
     ("transformer_impl", "fallback_to_eager_attn"),

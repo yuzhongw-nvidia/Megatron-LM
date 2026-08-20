@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -607,6 +607,7 @@ def num_floating_point_operations(
         qk_pos_emb_head_dim,
         v_head_dim,
         attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
     ):
         """Calculate FLOPs for a Multi-Latent Attention (MLA) layer.
 
@@ -626,13 +627,24 @@ def num_floating_point_operations(
             q_term = q_lora_rank * (
                 hidden_size + num_heads * (qk_head_dim + qk_pos_emb_head_dim) + 1
             )
+        gate_projection_size = 0
+        if attention_output_gate:
+            if gated_attention_proj_granularity == "elementwise":
+                gate_projection_size = num_heads * v_head_dim
+            elif gated_attention_proj_granularity == "headwise":
+                gate_projection_size = num_heads
+            else:
+                raise ValueError(
+                    "gated_attention_proj_granularity must be either 'elementwise' or "
+                    f"'headwise', got {gated_attention_proj_granularity!r}."
+                )
         # Token-linear part (q lora+rope+norm, kv lora+rope+norm, output proj).
         token_linear = fma * (
             q_term
             + kv_lora_rank * (hidden_size + num_heads * (qk_head_dim + v_head_dim) + 1)
             + hidden_size * qk_pos_emb_head_dim
             + (num_heads * v_head_dim) * hidden_size
-            + (hidden_size * num_heads if attention_output_gate else 0)
+            + hidden_size * gate_projection_size
         )
         # Core attention (L^2) part: QK^T and (softmax(QK^T))V. /2 (causal) cancels *2 (FMA).
         core = fma * (
@@ -760,6 +772,7 @@ def num_floating_point_operations(
         qk_pos_emb_head_dim=0,
         v_head_dim=0,
         attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
         experimental_attention_variant=None,
         dsv4_n_layers_r0=0,
         dsv4_n_layers_r4=0,
@@ -810,6 +823,7 @@ def num_floating_point_operations(
                     qk_pos_emb_head_dim,
                     v_head_dim,
                     attention_output_gate,
+                    gated_attention_proj_granularity,
                 )
             else:
                 plain_attn_layer_flops = attn_layer_flops(
@@ -834,6 +848,7 @@ def num_floating_point_operations(
                     qk_pos_emb_head_dim,
                     v_head_dim,
                     attention_output_gate,
+                    gated_attention_proj_granularity,
                 )
 
         kda_flops_total = 0
@@ -995,6 +1010,20 @@ def num_floating_point_operations(
                         + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                         + 1
                     )
+                gate_projection_size = 0
+                if args.attention_output_gate:
+                    gate_granularity = getattr(
+                        args, "gated_attention_proj_granularity", "elementwise"
+                    )
+                    if gate_granularity == "elementwise":
+                        gate_projection_size = args.num_attention_heads * args.v_head_dim
+                    elif gate_granularity == "headwise":
+                        gate_projection_size = args.num_attention_heads
+                    else:
+                        raise ValueError(
+                            "gated_attention_proj_granularity must be either 'elementwise' or "
+                            f"'headwise', got {gate_granularity!r}."
+                        )
                 # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
                 standard_self_attn_term = (
                     forward_backward_expansion_factor
@@ -1012,6 +1041,8 @@ def num_floating_point_operations(
                         + args.hidden_size * args.qk_pos_emb_head_dim
                         ## o proj
                         + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                        ## output gate proj
+                        + gate_projection_size * args.hidden_size
                     )
                 )
                 # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
@@ -1324,6 +1355,9 @@ def num_floating_point_operations(
             qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
             v_head_dim=args.v_head_dim,
             attention_output_gate=getattr(args, "attention_output_gate", False),
+            gated_attention_proj_granularity=getattr(
+                args, "gated_attention_proj_granularity", "elementwise"
+            ),
             experimental_attention_variant=args.experimental_attention_variant,
             dsv4_n_layers_r0=dsv4_n_layers_r0,
             dsv4_n_layers_r4=dsv4_n_layers_r4,
