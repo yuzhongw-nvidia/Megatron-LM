@@ -24,6 +24,7 @@ class _VarlenMetadata:
     num_sequences: int
     num_chunks: int
     uniform_sequence_length: int
+    has_partial_chunks: bool
 
     @property
     def cu_seqlens(self) -> torch.Tensor:
@@ -98,6 +99,7 @@ def _prepare_varlen_metadata(
     total_tokens: int,
     chunk_size: int,
     chunk_offsets: torch.Tensor | None = None,
+    num_chunks: int | None = None,
 ) -> _VarlenMetadata:
     if not isinstance(cu_seqlens, torch.Tensor):
         raise TypeError("cu_seqlens must be a torch.Tensor")
@@ -121,6 +123,7 @@ def _prepare_varlen_metadata(
             (not uses_supplied_chunk_offsets and not cached.uses_supplied_chunk_offsets)
             or (uses_supplied_chunk_offsets and cached.metadata.chunk_offsets is chunk_offsets)
         )
+        and (num_chunks is None or cached.metadata.num_chunks == num_chunks)
     ):
         return cached.metadata
 
@@ -132,11 +135,14 @@ def _prepare_varlen_metadata(
                 f"[0, {total_tokens}], got {values}"
             )
         lengths = [end - start for start, end in zip(values, values[1:])]
-        if any(length <= 0 or length % chunk_size for length in lengths):
-            raise ValueError(
-                "sequence lengths must be positive multiples of " f"{chunk_size}, got {lengths}"
-            )
-        expected_offsets = [offset // chunk_size for offset in values]
+        if any(length <= 0 for length in lengths):
+            raise ValueError(f"sequence lengths must be positive, got {lengths}")
+        chunks_per_sequence = [
+            (length + chunk_size - 1) // chunk_size for length in lengths
+        ]
+        expected_offsets = [0]
+        for chunks in chunks_per_sequence:
+            expected_offsets.append(expected_offsets[-1] + chunks)
         if chunk_offsets is None:
             chunk_offsets = torch.tensor(
                 expected_offsets, dtype=torch.int32, device=cu_seqlens.device
@@ -147,24 +153,38 @@ def _prepare_varlen_metadata(
             )
             if not bool(torch.equal(chunk_offsets, expected)):
                 raise ValueError(
-                    "chunk_offsets must equal cu_seqlens // chunk_size, "
+                    "chunk_offsets must equal the per-sequence chunk prefix, "
                     f"got {chunk_offsets.tolist()} for cu_seqlens {values}"
                 )
         num_sequences = len(lengths)
-        num_chunks = sum(lengths) // chunk_size
+        expected_num_chunks = sum(chunks_per_sequence)
+        if num_chunks is not None and num_chunks != expected_num_chunks:
+            raise ValueError(f"num_chunks must be {expected_num_chunks}, got {num_chunks}")
+        num_chunks = expected_num_chunks
+        has_partial_chunks = any(length % chunk_size for length in lengths)
         uniform_sequence_length = (
-            lengths[0] if lengths and all(length == lengths[0] for length in lengths) else 0
+            lengths[0]
+            if lengths
+            and not has_partial_chunks
+            and all(length == lengths[0] for length in lengths)
+            else 0
         )
     else:
         num_sequences = cu_seqlens.numel() - 1
         if num_sequences < 1:
             raise ValueError("cu_seqlens must contain at least one sequence")
-        if total_tokens % chunk_size:
-            raise ValueError(f"total_tokens must be divisible by {chunk_size}")
+        if num_chunks is None or num_chunks < 1:
+            raise ValueError("num_chunks is required for CUDA cu_seqlens")
         if chunk_offsets is None:
-            chunk_offsets = (cu_seqlens // chunk_size).contiguous()
-        num_chunks = total_tokens // chunk_size
-        uniform_sequence_length = total_tokens if num_sequences == 1 else 0
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            chunks_per_sequence = (lengths + chunk_size - 1) // chunk_size
+            chunk_offsets = torch.empty_like(cu_seqlens)
+            chunk_offsets[0] = 0
+            torch.cumsum(chunks_per_sequence, dim=0, out=chunk_offsets[1:])
+        has_partial_chunks = num_chunks * chunk_size != total_tokens
+        uniform_sequence_length = (
+            total_tokens if num_sequences == 1 and not has_partial_chunks else 0
+        )
 
     def remove_cached_owner(owner_ref):
         current = _METADATA_CACHE.get(key)
@@ -178,6 +198,7 @@ def _prepare_varlen_metadata(
         num_sequences=num_sequences,
         num_chunks=num_chunks,
         uniform_sequence_length=uniform_sequence_length,
+        has_partial_chunks=has_partial_chunks,
     )
     _METADATA_CACHE[key] = _MetadataEntry(
         owner=owner_ref,
@@ -211,7 +232,21 @@ def _require_tensor(
 
 
 def _validate_inputs(
-    *, q, k, v, a, g, beta, do, dht, h, scale, cu_seqlens, chunk_size, state_v_first
+    *,
+    q,
+    k,
+    v,
+    a,
+    g,
+    beta,
+    do,
+    dht,
+    h,
+    scale,
+    cu_seqlens,
+    chunk_size,
+    state_v_first,
+    num_chunks,
 ) -> None:
     if not isinstance(q, torch.Tensor):
         raise TypeError(f"q must be a torch.Tensor, got {type(q).__name__}")
@@ -245,7 +280,7 @@ def _validate_inputs(
         "dht", dht, dtype=torch.float32, shape=(num_sequences, _H, _D, _D), device=device
     )
     _require_tensor(
-        "h", h, dtype=torch.bfloat16, shape=(1, total_tokens // _BT, _H, _D, _D), device=device
+        "h", h, dtype=torch.bfloat16, shape=(1, num_chunks, _H, _D, _D), device=device
     )
     _require_tensor(
         "cu_seqlens", cu_seqlens, dtype=torch.int32, shape=(num_sequences + 1,), device=device
@@ -290,6 +325,21 @@ def fused_gdr_bwd(
     if dht is None:
         raise NotImplementedError("dht=None is not supported")
     normalized_scale = float(_D**-0.5 if scale is None else scale)
+    if not isinstance(q, torch.Tensor):
+        raise TypeError(f"q must be a torch.Tensor, got {type(q).__name__}")
+    if q.ndim != 4:
+        raise ValueError(f"q must be rank 4, got rank {q.ndim}")
+    if not isinstance(h, torch.Tensor):
+        raise TypeError(f"h must be a torch.Tensor, got {type(h).__name__}")
+    if h.ndim != 5:
+        raise ValueError(f"h must be rank 5, got rank {h.ndim}")
+    metadata = _prepare_varlen_metadata(
+        cu_seqlens,
+        total_tokens=q.shape[1],
+        chunk_size=chunk_size,
+        chunk_offsets=chunk_offsets,
+        num_chunks=h.shape[1],
+    )
     _validate_inputs(
         q=q,
         k=k,
@@ -304,12 +354,7 @@ def fused_gdr_bwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         state_v_first=state_v_first,
-    )
-    metadata = _prepare_varlen_metadata(
-        cu_seqlens,
-        total_tokens=q.shape[1],
-        chunk_size=chunk_size,
-        chunk_offsets=chunk_offsets,
+        num_chunks=metadata.num_chunks,
     )
     outputs = _allocate_outputs(q, k, v, g, beta, dht)
     _launch_fused_gdr_bwd_out(

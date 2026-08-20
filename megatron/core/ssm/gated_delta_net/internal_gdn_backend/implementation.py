@@ -140,7 +140,11 @@ def _packed_chunk_metadata(
     chunk_indices = prepare_chunk_indices(
         cu_seqlens, _CHUNK_SIZE, cu_seqlens_cpu=cu_seqlens_cpu
     )
-    chunk_offsets = (cu_seqlens // _CHUNK_SIZE).contiguous()
+    sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    chunks_per_sequence = (sequence_lengths + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+    chunk_offsets = torch.empty_like(cu_seqlens)
+    chunk_offsets[0] = 0
+    torch.cumsum(chunks_per_sequence, dim=0, out=chunk_offsets[1:])
 
     def remove_cached_owner(owner_ref):
         current = _packed_chunk_metadata_cache.get(key)
@@ -344,15 +348,10 @@ def _fused_bwd_support_reason(
             bounds = offsets.detach().tolist()
             if bounds[0] != 0 or bounds[-1] != q.shape[1]:
                 return "cu_seqlens bounds do not match the packed token count"
-            if any(
-                end <= start or (end - start) % _CHUNK_SIZE
-                for start, end in zip(bounds, bounds[1:])
-            ):
-                return "every packed sequence length must be a positive multiple of 64"
+            if any(end <= start for start, end in zip(bounds, bounds[1:])):
+                return "every packed sequence length must be positive"
             num_sequences = len(bounds) - 1
         elif trust_device_cu_seqlens:
-            if q.shape[1] % _CHUNK_SIZE:
-                return "packed token count must be divisible by 64"
             num_sequences = cu_seqlens.numel() - 1
         else:
             return "packed cu_seqlens host metadata is required for validation"
@@ -388,13 +387,11 @@ def _fused_bwd_zero_dht(device: torch.device, num_sequences: int) -> torch.Tenso
     return cached
 
 
-def _prepare_fused_bwd_h(
-    h: torch.Tensor, *, total_chunks: int, num_heads: int, head_size: int
-) -> torch.Tensor:
+def _prepare_fused_bwd_h(h: torch.Tensor, *, num_heads: int, head_size: int) -> torch.Tensor:
     """Normalize saved or recomputed chunk states to the fused-backward layout."""
     return (
         h.detach()
-        .reshape(total_chunks, num_heads, head_size, head_size)
+        .reshape(-1, num_heads, head_size, head_size)
         .to(torch.bfloat16)
         .contiguous()
     )
@@ -433,9 +430,7 @@ def _call_fused_gdr_bwd_cute(
         h = _recompute_fused_bwd_h(
             k=k, v=v, g=g, beta=beta, A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
         )
-    launch_h = _prepare_fused_bwd_h(
-        h, total_chunks=total_tokens // _CHUNK_SIZE, num_heads=num_heads, head_size=head_size
-    ).unsqueeze(0)
+    launch_h = _prepare_fused_bwd_h(h, num_heads=num_heads, head_size=head_size).unsqueeze(0)
     launch_g = g.detach().reshape(1, total_tokens, num_heads).to(torch.float32).contiguous()
     launch_beta = beta.detach().reshape(1, total_tokens, num_heads).to(torch.float32).contiguous()
     launch_dht = (
@@ -504,6 +499,21 @@ def _aligned_sequence_lengths(
         return False
     lengths = offsets[1:] - offsets[:-1]
     return bool((lengths > 0).all().item() and (lengths % _CHUNK_SIZE == 0).all().item())
+
+
+def _positive_sequence_lengths(
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_cpu: torch.Tensor | None,
+    *,
+    trust_device_cu_seqlens: bool = False,
+) -> bool:
+    offsets = _host_cu_seqlens(cu_seqlens, cu_seqlens_cpu)
+    if offsets is None:
+        return trust_device_cu_seqlens
+    if offsets.numel() < 2:
+        return False
+    lengths = offsets[1:] - offsets[:-1]
+    return bool((lengths > 0).all().item())
 
 
 def _cutedsl_support_reason(
@@ -665,7 +675,7 @@ def _can_use_fused_bwd_forward(
         and cu_seqlens.dtype == torch.int32
         and cu_seqlens.is_contiguous()
         and cu_seqlens.numel() >= 2
-        and _aligned_sequence_lengths(
+        and _positive_sequence_lengths(
             cu_seqlens,
             cu_seqlens_cpu,
             trust_device_cu_seqlens=trust_device_cu_seqlens,
