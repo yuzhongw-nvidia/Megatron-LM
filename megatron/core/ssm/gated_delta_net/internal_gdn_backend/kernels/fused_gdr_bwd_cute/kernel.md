@@ -50,6 +50,16 @@ path, so the flag has no effect there.
 
 ### Context parallelism
 
+Dense BTHD inputs keep their native `[B, T_local, H, D]` layout through the
+rank-local FLA forward and backward computations. Only the CP boundary-state
+preprocessing is applied per batch element, because that primitive consumes
+one local sequence at a time. The resulting small boundary states are joined;
+the large token tensors and saved chunk states are not concatenated. Before
+the fused launch, tensors are flattened as views and a cached dense
+`cu_seqlens=[0, T_local, ..., B*T_local]` tensor describes the logical
+sequences. This avoids host metadata reads and their stream synchronization in
+the steady-state path.
+
 For context parallelism, the internal backend keeps the established FLA CP
 forward path. During backward it first runs the FLA CP preprocessing sequence:
 recompute `w`/`u`, reconstruct the local recurrent state when needed, compute
@@ -197,6 +207,9 @@ allows 10% noise relative to FLA. JIT time is excluded.
   restores their gradient dtypes afterward.
 - When no final-state gradient is supplied, the adapter reuses a cached zero
   `dht` tensor of the required logical batch shape.
+- Uniform dense-batch offsets are cached by device, batch size, and local
+  sequence length. Packed variable-length metadata retains the identity/version
+  cache described below.
 - Metadata is cached by `cu_seqlens` identity and tensor version; in-place
   mutation invalidates the cached entry.
 - Unsupported shapes and dtypes fall back only in `auto` mode. `cute` mode is

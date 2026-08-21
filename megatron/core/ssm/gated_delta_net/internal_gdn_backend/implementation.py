@@ -304,6 +304,83 @@ def _fla_backward(
     return dq, dk, dv, db, dg
 
 
+def _dense_cp_cu_seqlens(cp_context: object) -> torch.Tensor:
+    """Return the one-sequence local offsets used only by CP boundary kernels."""
+    cu_seqlens = getattr(cp_context, "cu_seqlens", None)
+    if cu_seqlens is None or cu_seqlens.numel() != 2:
+        raise ValueError(
+            "native dense-B CP requires cp_context.cu_seqlens with one local sequence"
+        )
+    return cu_seqlens
+
+
+def _fla_cp_forward_preprocess_dense_batch(
+    *,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor,
+    cp_context: object,
+) -> torch.Tensor:
+    """Build one CP boundary state per dense batch element."""
+    cp_cu_seqlens = _dense_cp_cu_seqlens(cp_context)
+    states = []
+    for batch_index in range(k.shape[0]):
+        batch_slice = slice(batch_index, batch_index + 1)
+        states.append(
+            _call_fla_compat(
+                chunk_gated_delta_rule_fwd_h_pre_process,
+                k=k[batch_slice],
+                w=w[batch_slice],
+                u=u[batch_slice],
+                g=g[batch_slice],
+                cu_seqlens=cp_cu_seqlens,
+                initial_state=None,
+                context=cp_context,
+                use_exp2=True,
+                transpose_state_layout=False,
+            )
+        )
+    return torch.cat(states, dim=0)
+
+
+def _fla_cp_backward_preprocess_dense_batch(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    w: torch.Tensor,
+    do: torch.Tensor,
+    dv: torch.Tensor,
+    g: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    cp_context: object,
+) -> torch.Tensor:
+    """Build one CP terminal gradient per dense batch element."""
+    cp_cu_seqlens = _dense_cp_cu_seqlens(cp_context)
+    terminal_gradients = []
+    for batch_index in range(q.shape[0]):
+        batch_slice = slice(batch_index, batch_index + 1)
+        batch_dht, _ = _call_fla_compat(
+            chunk_gated_delta_rule_bwd_dhu_pre_process,
+            q=q[batch_slice],
+            k=k[batch_slice],
+            w=w[batch_slice],
+            do=do[batch_slice],
+            dv=dv[batch_slice],
+            g=g[batch_slice],
+            scale=scale,
+            cu_seqlens=cp_cu_seqlens,
+            dht=None,
+            initial_state=initial_state[batch_slice],
+            context=cp_context,
+            use_exp2=True,
+            transpose_state_layout=False,
+        )
+        terminal_gradients.append(batch_dht)
+    return torch.cat(terminal_gradients, dim=0)
+
+
 def _fla_cp_backward_preprocess(
     *,
     q: torch.Tensor,
@@ -360,22 +437,37 @@ def _fla_cp_backward_preprocess(
         chunk_indices=chunk_indices,
         use_exp2=True,
     )
-    dht, _ = _call_fla_compat(
-        chunk_gated_delta_rule_bwd_dhu_pre_process,
-        q=q,
-        k=k,
-        w=w,
-        do=do,
-        dv=dv,
-        g=g,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        dht=dht,
-        initial_state=expanded_initial_state,
-        context=cp_context,
-        use_exp2=True,
-        transpose_state_layout=False,
-    )
+    if q.shape[0] > 1 and cu_seqlens is None:
+        if dht is not None:
+            raise ValueError("native dense-B CP requires dht=None before boundary preprocessing")
+        dht = _fla_cp_backward_preprocess_dense_batch(
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            scale=scale,
+            initial_state=expanded_initial_state,
+            cp_context=cp_context,
+        )
+    else:
+        dht, _ = _call_fla_compat(
+            chunk_gated_delta_rule_bwd_dhu_pre_process,
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            dht=dht,
+            initial_state=expanded_initial_state,
+            context=cp_context,
+            use_exp2=True,
+            transpose_state_layout=False,
+        )
     return dht, h
 
 
@@ -872,18 +964,23 @@ def _fla_forward_for_fused_bwd(
         w, u = _call_fla_compat(recompute_w_u_fwd, A=A, **intra_kwargs)
     initial_state = None
     if cp_context is not None:
-        initial_state = _call_fla_compat(
-            chunk_gated_delta_rule_fwd_h_pre_process,
-            k=k,
-            w=w,
-            u=u,
-            g=g,
-            cu_seqlens=cu_seqlens,
-            initial_state=None,
-            context=cp_context,
-            use_exp2=True,
-            transpose_state_layout=False,
-        )
+        if q.shape[0] > 1 and cu_seqlens is None:
+            initial_state = _fla_cp_forward_preprocess_dense_batch(
+                k=k, w=w, u=u, g=g, cp_context=cp_context
+            )
+        else:
+            initial_state = _call_fla_compat(
+                chunk_gated_delta_rule_fwd_h_pre_process,
+                k=k,
+                w=w,
+                u=u,
+                g=g,
+                cu_seqlens=cu_seqlens,
+                initial_state=None,
+                context=cp_context,
+                use_exp2=True,
+                transpose_state_layout=False,
+            )
     h, v_new, _ = _call_fla_compat(
         chunk_gated_delta_rule_fwd_h,
         k=k,
@@ -1263,10 +1360,14 @@ def chunk_gated_delta_rule(
         cp_cu_seqlens = getattr(cp_context, "cu_seqlens", None)
         if cp_cu_seqlens is None:
             raise ValueError("cp_context.cu_seqlens is required for context parallel GDR")
-        cu_seqlens = cp_cu_seqlens
-        cp_cu_seqlens_cpu = getattr(cp_context, "cu_seqlens_cpu", None)
-        if cp_cu_seqlens_cpu is not None:
-            cu_seqlens_cpu = cp_cu_seqlens_cpu
+        if q.shape[0] > 1:
+            cu_seqlens = None
+            cu_seqlens_cpu = None
+        else:
+            cu_seqlens = cp_cu_seqlens
+            cp_cu_seqlens_cpu = getattr(cp_context, "cu_seqlens_cpu", None)
+            if cp_cu_seqlens_cpu is not None:
+                cu_seqlens_cpu = cp_cu_seqlens_cpu
 
     reason = _cutedsl_support_reason(
         q=q,
