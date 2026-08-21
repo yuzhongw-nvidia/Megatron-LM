@@ -46,8 +46,27 @@ activation-memory/compute tradeoff for both forward implementations:
   gates, and beta before launching the fused backward.
 
 The standalone `gdn_gdr_backend="fla"` backend bypasses this internal autograd
-path, so the flag has no effect there. The GB200 E2E test asserts that both
-fused kernels run and compares the full forward-plus-backward path with FLA.
+path, so the flag has no effect there.
+
+### Context parallelism
+
+For context parallelism, the internal backend keeps the established FLA CP
+forward path. During backward it first runs the FLA CP preprocessing sequence:
+recompute `w`/`u`, reconstruct the local recurrent state when needed, compute
+the local `dv`, and run the CP AllGather/merge preprocessing to produce the
+rank-local boundary gradient `dht`. It then passes that `dht` and the saved or
+recomputed local state to `fused_gdr_bwd`. The collective communication remains
+outside the CuTe DSL kernel.
+
+This is a correctness-first integration and intentionally duplicates local
+`dv` and recurrent-state work that the fused kernel performs again. CP inputs
+must satisfy the fused backward contract (BF16, 64 heads, head dimension 128);
+`auto` falls back to the CP-aware FLA backward when they do not, while `cute`
+reports the unsupported contract explicitly. CP4 E2E validation must verify
+that both FLA merged preprocess kernels and the fused backward are invoked.
+The existing non-CP GB200 E2E test asserts that both CuTe DSL forward and
+backward kernels run; CP instead validates the FLA-forward/fused-backward path
+against FLA.
 
 ## Package structure
 

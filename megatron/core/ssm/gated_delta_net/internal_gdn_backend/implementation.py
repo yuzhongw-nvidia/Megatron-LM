@@ -23,6 +23,12 @@ from fla.ops.common.chunk_delta_h import (
 )
 from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+from fla.ops.cp.chunk_delta_h import (
+    chunk_gated_delta_rule_bwd_dhu_pre_process,
+    chunk_gated_delta_rule_fwd_h_pre_process,
+    compress_h0,
+    expand_h0,
+)
 from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule as fla_chunk_gated_delta_rule
 from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
 from fla.ops.utils import chunk_local_cumsum, solve_tril
@@ -201,35 +207,63 @@ def _fla_backward(
     do: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
     chunk_indices: torch.Tensor | None,
+    dht: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    cp_context: object | None = None,
 ):
     """Recompose the FLA v0.5.1 backward from its public kernel primitives."""
     common = {"cu_seqlens": cu_seqlens, "chunk_indices": chunk_indices}
-    w, u = _call_fla_compat(recompute_w_u_fwd, k=k, v=v, beta=beta, A=A, g=g, **common)
+    w, u = _call_fla_compat(
+        recompute_w_u_fwd, k=k, v=v, beta=beta, A=A, g=g, use_exp2=True, **common
+    )
+    if cp_context is not None:
+        initial_state = expand_h0(initial_state, context=cp_context)
     h, v_new, _ = _call_fla_compat(
         chunk_gated_delta_rule_fwd_h,
         k=k,
         w=w,
         u=u,
         g=g,
-        initial_state=None,
+        initial_state=initial_state,
         output_final_state=False,
         transpose_state_layout=False,
+        use_exp2=True,
         **common,
     )
-    dv = _call_fla_compat(chunk_bwd_dv_local, q=q, k=k, g=g, do=do, scale=scale, **common)
+    dv = _call_fla_compat(
+        chunk_bwd_dv_local, q=q, k=k, g=g, do=do, scale=scale, use_exp2=True, **common
+    )
+    if cp_context is not None:
+        dht, initial_state = _call_fla_compat(
+            chunk_gated_delta_rule_bwd_dhu_pre_process,
+            q=q,
+            k=k,
+            w=w,
+            do=do,
+            dv=dv,
+            g=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            dht=dht,
+            initial_state=initial_state,
+            context=cp_context,
+            use_exp2=True,
+            transpose_state_layout=False,
+        )
     dh, _dh0, dv = _call_fla_compat(
         chunk_gated_delta_rule_bwd_dhu,
         q=q,
         k=k,
         w=w,
         g=g,
-        h0=None,
-        dht=None,
+        h0=initial_state,
+        dht=dht,
         do=do,
         dv=dv,
         scale=scale,
         transpose_state_layout=False,
         use_cute=False,
+        use_exp2=True,
         **common,
     )
     dq, dk, dw, dg = _call_fla_compat(
@@ -246,10 +280,21 @@ def _fla_backward(
         scale=scale,
         transpose_state_layout=False,
         use_cute=False,
+        use_exp2=True,
         **common,
     )
     dk2, dv, db, dg2 = _call_fla_compat(
-        prepare_wy_repr_bwd, k=k, v=v, beta=beta, g=g, A=A, dw=dw, du=dv, use_cute=False, **common
+        prepare_wy_repr_bwd,
+        k=k,
+        v=v,
+        beta=beta,
+        g=g,
+        A=A,
+        dw=dw,
+        du=dv,
+        use_cute=False,
+        use_exp2=True,
+        **common,
     )
     dk.add_(dk2)
     dg.add_(dg2)
@@ -257,6 +302,81 @@ def _fla_backward(
         dg, chunk_size=_CHUNK_SIZE, reverse=True, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
     )
     return dq, dk, dv, db, dg
+
+
+def _fla_cp_backward_preprocess(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    scale: float,
+    do: torch.Tensor,
+    dht: torch.Tensor | None,
+    cu_seqlens: torch.Tensor | None,
+    chunk_indices: torch.Tensor | None,
+    initial_state: torch.Tensor | None,
+    cp_context: object,
+    h: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Use FLA's CP prefix to produce the fused kernel's boundary state."""
+    w, u = _call_fla_compat(
+        recompute_w_u_fwd,
+        k=k,
+        v=v,
+        beta=beta,
+        A=A,
+        g=g,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        use_exp2=True,
+    )
+    expanded_initial_state = expand_h0(initial_state, context=cp_context)
+    if h is None:
+        h, _v_new, _ = _call_fla_compat(
+            chunk_gated_delta_rule_fwd_h,
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=expanded_initial_state,
+            output_final_state=False,
+            save_new_value=True,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=True,
+            transpose_state_layout=False,
+        )
+    dv = _call_fla_compat(
+        chunk_bwd_dv_local,
+        q=q,
+        k=k,
+        g=g,
+        do=do,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        use_exp2=True,
+    )
+    dht, _ = _call_fla_compat(
+        chunk_gated_delta_rule_bwd_dhu_pre_process,
+        q=q,
+        k=k,
+        w=w,
+        do=do,
+        dv=dv,
+        g=g,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+        dht=dht,
+        initial_state=expanded_initial_state,
+        context=cp_context,
+        use_exp2=True,
+        transpose_state_layout=False,
+    )
+    return dht, h
 
 
 def _recompute_fused_bwd_h(
@@ -569,8 +689,10 @@ def _cutedsl_support_reason(
         return "in-kernel beta transformation is not supported"
     if state_v_first or "transpose_state_layout" in kwargs:
         return "V-first state layout is not supported"
-    if cp_context is not None:
-        return "context parallel is not supported"
+    if cp_context is not None and not _can_use_fused_bwd_forward(
+        q, k, v, g, beta, cu_seqlens, cu_seqlens_cpu
+    ):
+        return "context parallel fused backward requires bf16 BTHD with H=64 and D=128"
     extra_kwargs = dict(kwargs)
     if extra_kwargs.get("use_gate_in_kernel", False):
         return "in-kernel gate activation is not supported"
@@ -694,8 +816,16 @@ def _fla_forward_for_fused_bwd(
     cu_seqlens: torch.Tensor | None,
     cu_seqlens_cpu: torch.Tensor | None,
     packed_metadata: _PackedChunkMetadata | None = None,
+    cp_context: object | None = None,
     save_fused_bwd_state: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor | None,
+    torch.Tensor | None,
+]:
     """Prepare the exact FLA state consumed by latest-main's fused backward."""
     chunk_indices = None
     if cu_seqlens is not None:
@@ -740,13 +870,27 @@ def _fla_forward_for_fused_bwd(
             output_dtype=k.dtype,
         )
         w, u = _call_fla_compat(recompute_w_u_fwd, A=A, **intra_kwargs)
+    initial_state = None
+    if cp_context is not None:
+        initial_state = _call_fla_compat(
+            chunk_gated_delta_rule_fwd_h_pre_process,
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            initial_state=None,
+            context=cp_context,
+            use_exp2=True,
+            transpose_state_layout=False,
+        )
     h, v_new, _ = _call_fla_compat(
         chunk_gated_delta_rule_fwd_h,
         k=k,
         w=w,
         u=u,
         g=g,
-        initial_state=None,
+        initial_state=initial_state,
         output_final_state=False,
         save_new_value=True,
         cu_seqlens=cu_seqlens,
@@ -771,11 +915,13 @@ def _fla_forward_for_fused_bwd(
     if save_fused_bwd_state:
         saved_h = _prepare_fused_bwd_h(
             h,
-            total_chunks=q.shape[0] * q.shape[1] // _CHUNK_SIZE,
             num_heads=q.shape[2],
             head_size=q.shape[3],
         )
-    return g, output, A, saved_h, chunk_indices
+    saved_initial_state = (
+        compress_h0(initial_state, context=cp_context) if cp_context is not None else None
+    )
+    return g, output, A, saved_h, chunk_indices, saved_initial_state
 
 
 def _cutedsl_forward(
@@ -892,6 +1038,8 @@ def _cutedsl_backward(
     cu_seqlens: torch.Tensor | None,
     chunk_indices: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None = None,
+    initial_state: torch.Tensor | None = None,
+    cp_context: object | None = None,
     h: torch.Tensor | None = None,
     cu_seqlens_cpu: torch.Tensor | None = None,
     trust_device_cu_seqlens: bool = False,
@@ -910,6 +1058,23 @@ def _cutedsl_backward(
         trust_device_cu_seqlens=trust_device_cu_seqlens,
     )
     if reason is None:
+        if cp_context is not None:
+            dht, h = _fla_cp_backward_preprocess(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A=A,
+                scale=scale,
+                do=do,
+                dht=dht,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                initial_state=initial_state,
+                cp_context=cp_context,
+                h=h,
+            )
         return _call_fused_gdr_bwd_cute(
             q=q,
             k=k,
@@ -938,6 +1103,9 @@ def _cutedsl_backward(
         do=do,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
+        dht=dht,
+        initial_state=initial_state,
+        cp_context=cp_context,
     )
 
 
@@ -958,6 +1126,7 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cu_seqlens: torch.LongTensor | None,
         cu_seqlens_cpu: torch.LongTensor | None,
         recompute_h: bool,
+        cp_context: object | None,
     ):
         mode = _backend_mode()
         trust_device_cu_seqlens = True
@@ -968,18 +1137,22 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
         saved_h = None
         packed_metadata = _packed_chunk_metadata(cu_seqlens, cu_seqlens_cpu)
         chunk_offsets = packed_metadata.chunk_offsets if packed_metadata is not None else None
-        if mode != "cute" and use_fused_bwd:
-            g, output, A, saved_h, chunk_indices = _fla_forward_for_fused_bwd(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                scale=scale,
-                cu_seqlens=cu_seqlens,
-                cu_seqlens_cpu=cu_seqlens_cpu,
-                packed_metadata=packed_metadata,
-                save_fused_bwd_state=save_fused_bwd_state,
+        saved_initial_state = None
+        if cp_context is not None or (mode != "cute" and use_fused_bwd):
+            g, output, A, saved_h, chunk_indices, saved_initial_state = (
+                _fla_forward_for_fused_bwd(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    scale=scale,
+                    cu_seqlens=cu_seqlens,
+                    cu_seqlens_cpu=cu_seqlens_cpu,
+                    packed_metadata=packed_metadata,
+                    cp_context=cp_context,
+                    save_fused_bwd_state=save_fused_bwd_state,
+                )
             )
         else:
             g, output, A, saved_h, chunk_indices, chunk_offsets = _cutedsl_forward(
@@ -995,9 +1168,11 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
                 save_fused_bwd_state=save_fused_bwd_state,
             )
         ctx.save_for_backward(
-            q, k, v, g, beta, A, saved_h, cu_seqlens, chunk_indices, chunk_offsets
+            q, k, v, g, beta, A, saved_h, saved_initial_state,
+            cu_seqlens, chunk_indices, chunk_offsets
         )
         ctx.scale = scale
+        ctx.cp_context = cp_context
         ctx.cu_seqlens_cpu = cu_seqlens_cpu
         ctx.trust_device_cu_seqlens = trust_device_cu_seqlens
         return output.to(q.dtype), None
@@ -1006,7 +1181,10 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
     @input_guard
     @autocast_custom_bwd
     def backward(ctx, do: torch.Tensor, dht: torch.Tensor | None):
-        q, k, v, g, beta, A, saved_h, cu_seqlens, chunk_indices, chunk_offsets = ctx.saved_tensors
+        (
+            q, k, v, g, beta, A, saved_h, initial_state,
+            cu_seqlens, chunk_indices, chunk_offsets,
+        ) = ctx.saved_tensors
         dq, dk, dv, db, dg = _cutedsl_backward(
             q=q,
             k=k,
@@ -1020,11 +1198,15 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
+            initial_state=initial_state,
+            cp_context=ctx.cp_context,
             h=saved_h,
             cu_seqlens_cpu=ctx.cu_seqlens_cpu,
             trust_device_cu_seqlens=ctx.trust_device_cu_seqlens,
         )
-        return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, None, None, None
+        return (
+            dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, None, None, None, None
+        )
 
 
 @torch.compiler.disable
@@ -1077,6 +1259,15 @@ def chunk_gated_delta_rule(
             cp_context=cp_context,
             **kwargs,
         )
+    if cp_context is not None:
+        cp_cu_seqlens = getattr(cp_context, "cu_seqlens", None)
+        if cp_cu_seqlens is None:
+            raise ValueError("cp_context.cu_seqlens is required for context parallel GDR")
+        cu_seqlens = cp_cu_seqlens
+        cp_cu_seqlens_cpu = getattr(cp_context, "cu_seqlens_cpu", None)
+        if cp_cu_seqlens_cpu is not None:
+            cu_seqlens_cpu = cp_cu_seqlens_cpu
+
     reason = _cutedsl_support_reason(
         q=q,
         k=k,
@@ -1118,5 +1309,5 @@ def chunk_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
     return InternalChunkGatedDeltaRuleFunction.apply(
-        q, k, v, g, beta, scale, cu_seqlens, cu_seqlens_cpu, recompute_h
+        q, k, v, g, beta, scale, cu_seqlens, cu_seqlens_cpu, recompute_h, cp_context
     )

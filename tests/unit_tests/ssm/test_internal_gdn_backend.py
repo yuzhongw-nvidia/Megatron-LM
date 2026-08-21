@@ -134,11 +134,20 @@ def test_cute_mode_dispatches_to_local_autograd_function(
         implementation, "InternalChunkGatedDeltaRuleFunction", SimpleNamespace(apply=apply)
     )
 
-    result = implementation.chunk_gated_delta_rule(**inputs, scale=scale, recompute_h=recompute_h)
+    local_cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    cp_context = SimpleNamespace(
+        group=object(),
+        cu_seqlens=local_cu_seqlens,
+        cu_seqlens_cpu=local_cu_seqlens.cpu(),
+    )
+    result = implementation.chunk_gated_delta_rule(
+        **inputs, scale=scale, recompute_h=recompute_h, cp_context=cp_context
+    )
     assert result is expected
 
     assert calls[0][5] == expected_scale
     assert calls[0][8] is recompute_h
+    assert calls[0][9] is cp_context
 
 
 @pytest.mark.parametrize("mode", ["auto", "cute"])
@@ -153,7 +162,7 @@ def test_forward_save_h_policy_is_shared_by_fla_and_cute(monkeypatch, mode, reco
     def fla_forward(**kwargs):
         seen.append(kwargs["save_fused_bwd_state"])
         h = saved_h if kwargs["save_fused_bwd_state"] else None
-        return kwargs["g"], q, torch.empty(1), h, None
+        return kwargs["g"], q, torch.empty(1), h, None, None
 
     def cute_forward(**kwargs):
         seen.append(kwargs["save_fused_bwd_state"])
@@ -181,6 +190,7 @@ def test_forward_save_h_policy_is_shared_by_fla_and_cute(monkeypatch, mode, reco
         None,
         None,
         recompute_h,
+        None,
     )
 
     assert output is q and final_state is None
@@ -211,12 +221,14 @@ def test_fla_forward_can_save_fused_backward_h(monkeypatch, save_fused_bwd_state
     )
     monkeypatch.setattr(implementation, "chunk_fwd_o", lambda **kwargs: kwargs["q"])
 
-    _g, output, _A, saved_h, _chunk_indices = implementation._fla_forward_for_fused_bwd(
-        **inputs,
-        scale=0.5,
-        cu_seqlens=None,
-        cu_seqlens_cpu=None,
-        save_fused_bwd_state=save_fused_bwd_state,
+    _g, output, _A, saved_h, _chunk_indices, _initial_state = (
+        implementation._fla_forward_for_fused_bwd(
+            **inputs,
+            scale=0.5,
+            cu_seqlens=None,
+            cu_seqlens_cpu=None,
+            save_fused_bwd_state=save_fused_bwd_state,
+        )
     )
 
     assert output is inputs["q"]
