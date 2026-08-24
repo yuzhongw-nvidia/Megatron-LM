@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Input/output checkpointing."""
 
@@ -1974,6 +1974,7 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
 
     # MoE latent projection.
     _set_arg('moe_latent_size', force=True)
+    _set_arg('moe_latent_up_projection_rmsnorm', force=True)
 
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:

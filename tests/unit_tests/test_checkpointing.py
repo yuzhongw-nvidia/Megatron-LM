@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
 from types import SimpleNamespace
@@ -24,6 +24,7 @@ from megatron.training.checkpointing import (
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
+    load_args_from_checkpoint,
     load_checkpoint,
     read_metadata,
     save_checkpoint,
@@ -72,6 +73,29 @@ class MockState:
     def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
         self._called_metadata.append(metadata)
         return self.state_dict()
+
+
+def test_load_args_restores_latent_rmsnorm_from_checkpoint():
+    """The latent dimension and its RMSNorm up-projection are reconstructed together."""
+    checkpoint_args = SimpleNamespace(moe_latent_size=16, moe_latent_up_projection_rmsnorm=True)
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_latent_size=None,
+        moe_latent_up_projection_rmsnorm=False,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_latent_size == 16
+    assert restored_args.moe_latent_up_projection_rmsnorm is True
 
 
 def create_checkpoint(load_path, ckpt_format):
