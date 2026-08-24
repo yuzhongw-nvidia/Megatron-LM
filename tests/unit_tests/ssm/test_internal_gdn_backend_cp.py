@@ -378,3 +378,30 @@ def test_dense_cu_seqlens_reuses_cached_tensor():
 
     assert first is second
     assert first.tolist() == [0, 64, 128]
+
+
+def test_cp_fused_backward_accepts_partial_dense_sequence():
+    implementation = _implementation()
+    shape = (2, 65, 64, 128)
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    g = torch.empty(shape[:-1], dtype=torch.float32)
+
+    assert implementation._can_use_fused_bwd_forward(
+        q,
+        torch.empty_like(q),
+        torch.empty_like(q),
+        g,
+        torch.empty_like(g),
+        None,
+        None,
+    )
+
+
+def test_dense_chunk_metadata_uses_ceil_chunks_for_partial_sequence():
+    implementation = _implementation()
+    implementation._clear_dense_chunk_metadata_cache_for_test()
+
+    metadata = implementation._dense_chunk_metadata(2, 65, torch.device("cpu"))
+
+    assert metadata.cu_seqlens.tolist() == [0, 65, 130]
+    assert metadata.chunk_offsets.tolist() == [0, 2, 4]

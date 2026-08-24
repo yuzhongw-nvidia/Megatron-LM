@@ -796,26 +796,27 @@ def _cutedsl_support_reason(
             extra_kwargs.pop(name, None)
     if extra_kwargs:
         return f"extra options are not supported: {sorted(extra_kwargs)}"
-    if cu_seqlens is None:
-        if q.shape[1] % _CHUNK_SIZE:
-            return "sequence length must be a multiple of 64"
-    else:
-        if q.shape[0] != 1:
-            return "packed variable length inputs require batch size 1"
-        if not _aligned_sequence_lengths(
-            cu_seqlens,
-            cu_seqlens_cpu,
-            trust_device_cu_seqlens=trust_device_cu_seqlens,
-        ):
-            return "every packed sequence length must be a positive multiple of 64"
+    if cp_context is None:
+        if cu_seqlens is None:
+            if q.shape[1] % _CHUNK_SIZE:
+                return "sequence length must be a multiple of 64"
+        else:
+            if q.shape[0] != 1:
+                return "packed variable length inputs require batch size 1"
+            if not _aligned_sequence_lengths(
+                cu_seqlens,
+                cu_seqlens_cpu,
+                trust_device_cu_seqlens=trust_device_cu_seqlens,
+            ):
+                return "every packed sequence length must be a positive multiple of 64"
     return None
 
 
 def _dense_chunk_metadata(
     batch_size: int, seqlen: int, device: torch.device
 ) -> _DenseChunkMetadata:
-    if seqlen % _CHUNK_SIZE:
-        raise ValueError("dense sequence length must be a multiple of 64")
+    if batch_size < 1 or seqlen < 1:
+        raise ValueError("dense batch size and sequence length must be positive")
     device = torch.device(device)
     if device.type == "cuda" and device.index is None:
         device = torch.device("cuda", torch.cuda.current_device())
@@ -835,7 +836,7 @@ def _dense_chunk_metadata(
     cu_seqlens = torch.arange(
         0, (batch_size + 1) * seqlen, seqlen, device=device, dtype=torch.int32
     )
-    chunks_per_sequence = seqlen // _CHUNK_SIZE
+    chunks_per_sequence = (seqlen + _CHUNK_SIZE - 1) // _CHUNK_SIZE
     chunk_offsets = torch.arange(
         0,
         (batch_size + 1) * chunks_per_sequence,
@@ -883,7 +884,7 @@ def _can_use_fused_bwd_forward(
     if any(not tensor.is_contiguous() for tensor in (q, k, v)):
         return False
     if cu_seqlens is None:
-        return q.shape[0] >= 1 and q.shape[1] % _CHUNK_SIZE == 0
+        return q.shape[0] >= 1 and q.shape[1] >= 1
     return (
         q.shape[0] == 1
         and cu_seqlens.dtype == torch.int32
