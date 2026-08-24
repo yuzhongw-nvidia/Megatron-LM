@@ -544,8 +544,8 @@ def _fused_bwd_support_reason(
         num_sequences = q.shape[0]
         if num_sequences < 1:
             return "dense fused backward requires a positive batch size"
-        if q.shape[1] % _CHUNK_SIZE:
-            return "sequence length must be divisible by 64"
+        if q.shape[1] < 1:
+            return "dense fused backward requires a positive sequence length"
     else:
         if q.shape[0] != 1:
             return "packed fused backward requires batch size 1"

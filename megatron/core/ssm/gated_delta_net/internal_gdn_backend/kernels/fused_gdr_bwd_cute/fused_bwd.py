@@ -173,8 +173,15 @@ def _prepare_varlen_metadata(
         num_sequences = cu_seqlens.numel() - 1
         if num_sequences < 1:
             raise ValueError("cu_seqlens must contain at least one sequence")
-        if num_chunks is None or num_chunks < 1:
-            raise ValueError("num_chunks is required for CUDA cu_seqlens")
+        if num_chunks is None:
+            if total_tokens % chunk_size:
+                raise ValueError(
+                    "num_chunks is required for CUDA cu_seqlens when total_tokens "
+                    f"is not divisible by {chunk_size}"
+                )
+            num_chunks = total_tokens // chunk_size
+        elif num_chunks < 1:
+            raise ValueError("num_chunks must be positive")
         if chunk_offsets is None:
             lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             chunks_per_sequence = (lengths + chunk_size - 1) // chunk_size
