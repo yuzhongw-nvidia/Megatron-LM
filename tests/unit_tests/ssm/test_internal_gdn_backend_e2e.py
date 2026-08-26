@@ -37,40 +37,24 @@ def _make_inputs(device):
     return inputs, torch.randn(shape, device=device, dtype=torch.bfloat16)
 
 
-def _forward_backward(
-    implementation, inputs, grad_output, recompute_h=False, cp_context=None, split_cp_batch=False
-):
-    batch_indices = range(_BATCH_SIZE) if split_cp_batch and cp_context is not None else (None,)
-    outputs = []
-    for batch_index in batch_indices:
-        batch_slice = (
-            slice(batch_index, batch_index + 1) if batch_index is not None else slice(None)
-        )
-        output, _ = implementation.chunk_gated_delta_rule(
-            q=inputs[0][batch_slice],
-            k=inputs[1][batch_slice],
-            v=inputs[2][batch_slice],
-            g=inputs[3][batch_slice],
-            beta=inputs[4][batch_slice],
-            scale=_HEAD_DIM**-0.5,
-            recompute_h=recompute_h,
-            cp_context=cp_context,
-        )
-        outputs.append(output)
-    output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+def _forward_backward(implementation, inputs, grad_output, recompute_h=False, cp_context=None):
+    output, _ = implementation.chunk_gated_delta_rule(
+        q=inputs[0],
+        k=inputs[1],
+        v=inputs[2],
+        g=inputs[3],
+        beta=inputs[4],
+        scale=_HEAD_DIM**-0.5,
+        recompute_h=recompute_h,
+        cp_context=cp_context,
+    )
     gradients = torch.autograd.grad(output, inputs, grad_outputs=grad_output)
     return output, gradients
 
 
-def _median_gpu_ms(implementation, inputs, grad_output, cp_context=None, split_cp_batch=False):
+def _median_gpu_ms(implementation, inputs, grad_output, cp_context=None):
     for _ in range(2):
-        _forward_backward(
-            implementation,
-            inputs,
-            grad_output,
-            cp_context=cp_context,
-            split_cp_batch=split_cp_batch,
-        )
+        _forward_backward(implementation, inputs, grad_output, cp_context=cp_context)
     torch.cuda.synchronize()
 
     samples = []
@@ -78,13 +62,7 @@ def _median_gpu_ms(implementation, inputs, grad_output, cp_context=None, split_c
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        _forward_backward(
-            implementation,
-            inputs,
-            grad_output,
-            cp_context=cp_context,
-            split_cp_batch=split_cp_batch,
-        )
+        _forward_backward(implementation, inputs, grad_output, cp_context=cp_context)
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end))
@@ -130,7 +108,7 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
     inputs, grad_output = _make_inputs(device)
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")
     reference_output, reference_gradients = _forward_backward(
-        implementation, inputs, grad_output, cp_context=cp_context, split_cp_batch=True
+        implementation, inputs, grad_output, cp_context=cp_context
     )
 
     calls = {"fwd": 0, "bwd": 0}
@@ -264,9 +242,7 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
         )
 
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")
-    fla_ms = _median_gpu_ms(
-        implementation, inputs, grad_output, cp_context=cp_context, split_cp_batch=True
-    )
+    fla_ms = _median_gpu_ms(implementation, inputs, grad_output, cp_context=cp_context)
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "cute")
     cute_ms = _median_gpu_ms(implementation, inputs, grad_output, cp_context=cp_context)
     if cp_context is not None:
@@ -292,7 +268,7 @@ def test_internal_gdr_cute_matches_and_outperforms_fla(monkeypatch, cp_size, req
     )
 
 
-@pytest.mark.parametrize("local_seqlen", [8192, 8191], ids=["aligned", "tail"])
+@pytest.mark.parametrize("local_seqlen", [8192, 8190], ids=["aligned", "tail"])
 def test_gated_delta_net_dense_batch_cp4_matches_fla(monkeypatch, local_seqlen, request):
     """Exercise the real SBHD model entry with dense B=2 and chunkwise CP4."""
     if not torch.cuda.is_available():
@@ -372,7 +348,7 @@ def test_gated_delta_net_dense_batch_cp4_matches_fla(monkeypatch, local_seqlen, 
     )
     grad_output = torch.randn_like(base_input)
 
-    def execute(*, split_batch, capture_gdr_inputs):
+    def execute(*, capture_gdr_inputs):
         gdn.zero_grad(set_to_none=True)
         hidden = base_input.detach().clone().requires_grad_(True)
         captured = []
@@ -386,11 +362,7 @@ def test_gated_delta_net_dense_batch_cp4_matches_fla(monkeypatch, local_seqlen, 
 
         gdn.gated_delta_rule = captured_rule if capture_gdr_inputs else original_rule
         try:
-            if split_batch:
-                outputs = [gdn(hidden[:, index : index + 1], None)[0] for index in range(2)]
-                output = torch.cat(outputs, dim=1)
-            else:
-                output, _ = gdn(hidden, None)
+            output, _ = gdn(hidden, None)
             output.backward(grad_output)
         finally:
             gdn.gated_delta_rule = original_rule
@@ -403,9 +375,7 @@ def test_gated_delta_net_dense_batch_cp4_matches_fla(monkeypatch, local_seqlen, 
         return output.detach(), hidden.grad.detach(), captured_grads
 
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")
-    reference_output, reference_dinput, reference_grads = execute(
-        split_batch=True, capture_gdr_inputs=True
-    )
+    reference_output, reference_dinput, reference_grads = execute(capture_gdr_inputs=True)
 
     calls = {"pre": 0, "fwd": 0, "bwd": 0}
     original_pre = gdn._fused_streamed_pre_gated_delta_rule
@@ -429,9 +399,7 @@ def test_gated_delta_net_dense_batch_cp4_matches_fla(monkeypatch, local_seqlen, 
         path_guard.setattr(implementation, "_fla_forward_for_fused_bwd", tracked_cp_forward)
         path_guard.setattr(gdn, "_fused_streamed_pre_gated_delta_rule", tracked_pre)
         path_guard.setattr(implementation, "_call_fused_gdr_bwd_cute", tracked_backward)
-        actual_output, actual_dinput, actual_grads = execute(
-            split_batch=False, capture_gdr_inputs=True
-        )
+        actual_output, actual_dinput, actual_grads = execute(capture_gdr_inputs=True)
     assert calls == {"pre": 1, "fwd": 1, "bwd": 1}
 
     def assert_distributed_close(name, actual, expected, *, tolerance):
@@ -461,25 +429,25 @@ def test_gated_delta_net_dense_batch_cp4_matches_fla(monkeypatch, local_seqlen, 
     for name, actual, expected in zip(("q", "k", "v", "g", "beta"), actual_grads, reference_grads):
         assert_distributed_close(name, actual, expected, tolerance=1e-1)
 
-    def median_model_ms(*, split_batch):
+    def median_model_ms():
         for _ in range(2):
-            execute(split_batch=split_batch, capture_gdr_inputs=False)
+            execute(capture_gdr_inputs=False)
         torch.cuda.synchronize()
         samples = []
         for _ in range(3):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            execute(split_batch=split_batch, capture_gdr_inputs=False)
+            execute(capture_gdr_inputs=False)
             end.record()
             end.synchronize()
             samples.append(start.elapsed_time(end))
         return median(samples)
 
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "fla")
-    fla_ms = median_model_ms(split_batch=True)
+    fla_ms = median_model_ms()
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "cute")
-    cute_ms = median_model_ms(split_batch=False)
+    cute_ms = median_model_ms()
     timings = torch.tensor([fla_ms, cute_ms], device=device)
     torch.distributed.all_reduce(timings, op=torch.distributed.ReduceOp.MAX, group=cp_group)
     fla_ms, cute_ms = timings.tolist()
@@ -487,7 +455,7 @@ def test_gated_delta_net_dense_batch_cp4_matches_fla(monkeypatch, local_seqlen, 
     if torch.distributed.get_rank(group=cp_group) == 0:
         print(
             f"GatedDeltaNet CP4 B=2 local_T={local_seqlen} global_T={local_seqlen * 4}: "
-            f"FLA per-batch={fla_ms:.3f} ms, dense fused-bwd={cute_ms:.3f} ms, "
+            f"FLA dense-dispatch={fla_ms:.3f} ms, dense fused-bwd={cute_ms:.3f} ms, "
             f"speedup={fla_ms / cute_ms:.2f}x"
         )
     assert cute_ms <= fla_ms * 1.10

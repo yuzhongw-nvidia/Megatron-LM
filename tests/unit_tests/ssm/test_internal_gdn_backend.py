@@ -103,6 +103,50 @@ def test_auto_mode_falls_back_for_unsupported_inputs(monkeypatch):
     assert implementation.chunk_gated_delta_rule(**_inputs()) is expected
 
 
+@pytest.mark.parametrize("mode", ["fla", "auto"])
+def test_dense_batch_cp_fla_dispatch_slices_only_the_gdr_operator(monkeypatch, mode):
+    implementation = _implementation()
+    base = torch.arange(2 * 2 * 3 * 4, dtype=torch.float32).reshape(2, 2, 3, 4)
+    inputs = {
+        "q": base,
+        "k": torch.empty_like(base),
+        "v": torch.empty_like(base),
+        "g": torch.empty(base.shape[:-1]),
+        "beta": torch.empty(base.shape[:-1]),
+    }
+    local_cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    cp_context = SimpleNamespace(
+        group=object(), cu_seqlens=local_cu_seqlens, cu_seqlens_cpu=local_cu_seqlens
+    )
+    calls = []
+
+    def fla(**kwargs):
+        assert kwargs["q"].shape[0] == 1, "FLA CP requires one physical batch slice"
+        calls.append(kwargs)
+        return kwargs["q"] + len(calls), None
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", mode)
+    monkeypatch.setattr(implementation, "fla_chunk_gated_delta_rule", fla)
+    if mode == "fla":
+        monkeypatch.setattr(
+            implementation,
+            "_cutedsl_support_reason",
+            lambda **_kwargs: pytest.fail("explicit FLA mode must bypass CuTe support checks"),
+        )
+    else:
+        monkeypatch.setattr(
+            implementation, "_cutedsl_support_reason", lambda **_kwargs: "unsupported test input"
+        )
+
+    output, final_state = implementation.chunk_gated_delta_rule(**inputs, cp_context=cp_context)
+
+    assert final_state is None
+    assert len(calls) == 2
+    assert all(call["cp_context"] is cp_context for call in calls)
+    torch.testing.assert_close(output[0], base[0] + 1)
+    torch.testing.assert_close(output[1], base[1] + 2)
+
+
 def test_public_dispatch_does_not_trust_unvalidated_device_cu_seqlens(monkeypatch):
     implementation = _implementation()
     expected = (torch.empty(1), None)
@@ -121,7 +165,7 @@ def test_public_dispatch_does_not_trust_unvalidated_device_cu_seqlens(monkeypatc
     assert seen["trust_device_cu_seqlens"] is False
 
 
-def test_public_dispatch_trusts_prevalidated_chunk_offsets(monkeypatch):
+def test_public_dispatch_does_not_trust_device_only_chunk_offsets(monkeypatch):
     implementation = _implementation()
     expected = (torch.empty(1), None)
     seen = {}
@@ -142,7 +186,55 @@ def test_public_dispatch_trusts_prevalidated_chunk_offsets(monkeypatch):
         )
         is expected
     )
+    assert seen["trust_device_cu_seqlens"] is False
+
+
+def test_public_dispatch_trusts_validated_cpu_metadata(monkeypatch):
+    implementation = _implementation()
+    expected = (torch.empty(1), None)
+    seen = {}
+
+    def support_reason(**kwargs):
+        seen.update(kwargs)
+        return "unsupported test input"
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.setattr(implementation, "_cutedsl_support_reason", support_reason)
+    monkeypatch.setattr(implementation, "fla_chunk_gated_delta_rule", lambda **_kwargs: expected)
+
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    cu_seqlens_cpu = cu_seqlens.clone()
+    assert (
+        implementation.chunk_gated_delta_rule(
+            **_inputs(), cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu
+        )
+        is expected
+    )
     assert seen["trust_device_cu_seqlens"] is True
+
+
+def test_standard_thd_batch_factory_populates_trusted_cpu_metadata():
+    from megatron.core.utils import get_thd_batch_on_this_cp_rank
+
+    cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
+    _, packed_seq_params = get_thd_batch_on_this_cp_rank(
+        {"tokens": torch.empty(1, 8, dtype=torch.long)},
+        cu_seqlens,
+        cu_seqlens_padded,
+        torch.tensor([4]),
+        cp_size=1,
+        cp_rank=0,
+    )
+
+    assert packed_seq_params.cu_seqlens_q_cpu is packed_seq_params.cu_seqlens_kv_cpu
+    assert packed_seq_params.cu_seqlens_q_padded_cpu is packed_seq_params.cu_seqlens_kv_padded_cpu
+    torch.testing.assert_close(packed_seq_params.cu_seqlens_q_cpu, cu_seqlens)
+    torch.testing.assert_close(packed_seq_params.cu_seqlens_q_padded_cpu, cu_seqlens_padded)
+    assert packed_seq_params.cu_seqlens_q_version == cu_seqlens._version
+    assert packed_seq_params.cu_seqlens_kv_version == cu_seqlens._version
+    assert packed_seq_params.cu_seqlens_q_padded_version == cu_seqlens_padded._version
+    assert packed_seq_params.cu_seqlens_kv_padded_version == cu_seqlens_padded._version
 
 
 def test_cute_mode_rejects_unsupported_inputs(monkeypatch):

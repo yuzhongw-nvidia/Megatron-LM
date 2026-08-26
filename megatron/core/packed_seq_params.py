@@ -37,6 +37,14 @@ class PackedSeqParams:
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
+    cu_seqlens_q_cpu: Tensor = None
+    cu_seqlens_kv_cpu: Tensor = None
+    cu_seqlens_q_padded_cpu: Tensor = None
+    cu_seqlens_kv_padded_cpu: Tensor = None
+    cu_seqlens_q_version: Optional[int] = None
+    cu_seqlens_kv_version: Optional[int] = None
+    cu_seqlens_q_padded_version: Optional[int] = None
+    cu_seqlens_kv_padded_version: Optional[int] = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

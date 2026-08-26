@@ -3,6 +3,7 @@
 import copy
 import inspect
 import os
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -16,6 +17,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, torch_chunk_gated_delta_rule
+from megatron.core.ssm.gated_delta_net.gdn import _current_cpu_metadata
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -790,6 +792,7 @@ class TestGDNCuSeqlensResolve:
     def mock_gdn(self):
         class MockGDN:
             _resolve_cu_seqlens = GatedDeltaNet._resolve_cu_seqlens
+            _resolve_cu_seqlens_metadata = GatedDeltaNet._resolve_cu_seqlens_metadata
 
         return MockGDN()
 
@@ -803,6 +806,31 @@ class TestGDNCuSeqlensResolve:
         actual = torch.tensor([0, 504, 1008], dtype=torch.int32)
         result = mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
         assert torch.equal(result, actual)
+
+    def test_trusted_cpu_metadata_avoids_device_value_reads(self, mock_gdn):
+        trusted_cpu = torch.tensor([0, 504, 1008], dtype=torch.int32)
+        device_offsets = SimpleNamespace(
+            ndim=1,
+            shape=trusted_cpu.shape,
+            dtype=trusted_cpu.dtype,
+            numel=lambda: trusted_cpu.numel(),
+        )
+
+        resolved, resolved_cpu = mock_gdn._resolve_cu_seqlens_metadata(
+            None, device_offsets, None, trusted_cpu, 1008, "cu_seqlens_q", cp_size=2
+        )
+
+        assert resolved is device_offsets
+        assert resolved_cpu is trusted_cpu
+
+    def test_in_place_mutation_invalidates_cpu_metadata(self):
+        device_offsets = torch.tensor([0, 64], dtype=torch.int32)
+        cpu_offsets = device_offsets.clone()
+        recorded_version = device_offsets._version
+
+        assert _current_cpu_metadata(device_offsets, cpu_offsets, recorded_version) is cpu_offsets
+        device_offsets[1] = 32
+        assert _current_cpu_metadata(device_offsets, cpu_offsets, recorded_version) is None
 
     def test_raises_when_padding_mismatch(self, mock_gdn):
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)

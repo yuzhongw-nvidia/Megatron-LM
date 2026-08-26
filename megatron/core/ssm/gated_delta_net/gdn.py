@@ -33,6 +33,13 @@ from megatron.core.ssm.gated_delta_net.internal_gdn_backend import (
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 
+def _current_cpu_metadata(device_offsets, cpu_offsets, recorded_version):
+    """Return a CPU mirror only while it matches the device tensor version."""
+    if cpu_offsets is None or recorded_version != getattr(device_offsets, "_version", None):
+        return None
+    return cpu_offsets
+
+
 class GatedDeltaNet(_GDNBase):
     # pylint: disable=missing-class-docstring
     def _setup_variant_attrs(self):
@@ -180,36 +187,87 @@ class GatedDeltaNet(_GDNBase):
                 "conversion must be handled before calling GatedDeltaNet."
             )
 
-        validated_chunk_offsets_q = None
+        cu_seqlens_q_cpu = None
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
 
-            # Resolve cu_seqlens with alignment padding handling.
-            cu_seqlens_q = self._resolve_cu_seqlens(
+            # Resolve and validate host metadata once per device-tensor version.
+            q_is_padded = packed_seq_params.cu_seqlens_q_padded is not None
+            q_source = (
+                packed_seq_params.cu_seqlens_q_padded
+                if q_is_padded
+                else packed_seq_params.cu_seqlens_q
+            )
+            q_cpu = (
+                packed_seq_params.cu_seqlens_q_padded_cpu
+                if q_is_padded
+                else packed_seq_params.cu_seqlens_q_cpu
+            )
+            q_version = (
+                packed_seq_params.cu_seqlens_q_padded_version
+                if q_is_padded
+                else packed_seq_params.cu_seqlens_q_version
+            )
+            q_cpu = _current_cpu_metadata(q_source, q_cpu, q_version)
+            cu_seqlens_q, cu_seqlens_q_cpu = self._resolve_cu_seqlens_metadata(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
+                q_cpu if q_is_padded else None,
+                q_cpu if not q_is_padded else None,
                 seq_len_global,
                 "cu_seqlens_q",
                 cp_size=cp_size_runtime,
             )
-            cu_seqlens_kv = self._resolve_cu_seqlens(
+            if q_is_padded:
+                packed_seq_params.cu_seqlens_q_padded_cpu = cu_seqlens_q_cpu
+                packed_seq_params.cu_seqlens_q_padded_version = q_source._version
+            else:
+                packed_seq_params.cu_seqlens_q_cpu = cu_seqlens_q_cpu
+                packed_seq_params.cu_seqlens_q_version = q_source._version
+
+            kv_is_padded = packed_seq_params.cu_seqlens_kv_padded is not None
+            cu_seqlens_kv_source = (
+                packed_seq_params.cu_seqlens_kv_padded
+                if kv_is_padded
+                else packed_seq_params.cu_seqlens_kv
+            )
+            cu_seqlens_kv_cpu = (
+                packed_seq_params.cu_seqlens_kv_padded_cpu
+                if kv_is_padded
+                else packed_seq_params.cu_seqlens_kv_cpu
+            )
+            cu_seqlens_kv_version = (
+                packed_seq_params.cu_seqlens_kv_padded_version
+                if kv_is_padded
+                else packed_seq_params.cu_seqlens_kv_version
+            )
+            cu_seqlens_kv_cpu = _current_cpu_metadata(
+                cu_seqlens_kv_source, cu_seqlens_kv_cpu, cu_seqlens_kv_version
+            )
+            if cu_seqlens_kv_source is cu_seqlens_q and cu_seqlens_kv_cpu is None:
+                cu_seqlens_kv_cpu = cu_seqlens_q_cpu
+            cu_seqlens_kv, cu_seqlens_kv_cpu = self._resolve_cu_seqlens_metadata(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
+                cu_seqlens_kv_cpu if kv_is_padded else None,
+                cu_seqlens_kv_cpu if not kv_is_padded else None,
                 seq_len_global,
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+            if kv_is_padded:
+                packed_seq_params.cu_seqlens_kv_padded_cpu = cu_seqlens_kv_cpu
+                packed_seq_params.cu_seqlens_kv_padded_version = cu_seqlens_kv_source._version
+            else:
+                packed_seq_params.cu_seqlens_kv_cpu = cu_seqlens_kv_cpu
+                packed_seq_params.cu_seqlens_kv_version = cu_seqlens_kv_source._version
+            assert torch.equal(cu_seqlens_q_cpu, cu_seqlens_kv_cpu), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+                f"but got {cu_seqlens_q_cpu=} and {cu_seqlens_kv_cpu=}"
             )
-            sequence_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-            validated_chunk_offsets_q = torch.empty_like(cu_seqlens_q)
-            validated_chunk_offsets_q[0] = 0
-            torch.cumsum((sequence_lengths + 63) // 64, dim=0, out=validated_chunk_offsets_q[1:])
             num_packed_seqs = cu_seqlens_q.shape[0] - 1
             assert num_packed_seqs > 0, (
                 "Number of packed sequences must be greater than 0, "
@@ -276,7 +334,7 @@ class GatedDeltaNet(_GDNBase):
                     cp_size_chunkwise,
                     cp_group_chunkwise,
                     cu_seqlens_q,
-                    validated_chunk_offsets_q,
+                    cu_seqlens_q_cpu,
                     packed_seq_params,
                     chunkwise_cp_context,
                 )
@@ -292,7 +350,7 @@ class GatedDeltaNet(_GDNBase):
                 cp_size_chunkwise,
                 cp_group_chunkwise,
                 cu_seqlens_q,
-                validated_chunk_offsets_q,
+                cu_seqlens_q_cpu,
                 packed_seq_params,
                 chunkwise_cp_context,
             )
@@ -314,7 +372,7 @@ class GatedDeltaNet(_GDNBase):
         cp_size_chunkwise,
         cp_group_chunkwise,
         cu_seqlens_q,
-        validated_chunk_offsets_q,
+        cu_seqlens_q_cpu,
         packed_seq_params,
         chunkwise_cp_context,
     ):
@@ -402,8 +460,8 @@ class GatedDeltaNet(_GDNBase):
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        if validated_chunk_offsets_q is not None and self.config.gdn_gdr_backend == "internal":
-            kernel_inputs["validated_chunk_offsets"] = validated_chunk_offsets_q
+        if cu_seqlens_q_cpu is not None and self.config.gdn_gdr_backend == "internal":
+            kernel_inputs["cu_seqlens_cpu"] = cu_seqlens_q_cpu
         core_attn_out, _ = self.gated_delta_rule(
             **kernel_inputs,
             initial_state=None,

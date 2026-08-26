@@ -196,6 +196,29 @@ def _call_fla_compat(function, **kwargs):
     return function(**kwargs)
 
 
+def _call_fla_gated_delta_rule(**kwargs):
+    """Call FLA's GDR operator, slicing dense CP batches as required by FLA v0.5.x."""
+    q = kwargs["q"]
+    cp_context = kwargs.get("cp_context")
+    if cp_context is None or q.shape[0] == 1:
+        return _call_fla_compat(fla_chunk_gated_delta_rule, **kwargs)
+
+    outputs = []
+    for batch_idx in range(q.shape[0]):
+        batch_kwargs = dict(kwargs)
+        for name in ("q", "k", "v", "g", "beta"):
+            batch_kwargs[name] = kwargs[name][batch_idx : batch_idx + 1]
+        # FLA replaces packed offsets with the CP context offsets. Passing the
+        # caller's dense-batch metadata here would describe a different layout.
+        batch_kwargs["cu_seqlens"] = None
+        batch_kwargs["cu_seqlens_cpu"] = None
+        output, final_state = _call_fla_compat(fla_chunk_gated_delta_rule, **batch_kwargs)
+        if final_state is not None:
+            raise RuntimeError("Dense-batch CP FLA fallback does not support final states.")
+        outputs.append(output)
+    return torch.cat(outputs, dim=0), None
+
+
 def _fla_backward(
     *,
     q: torch.Tensor,
@@ -710,15 +733,18 @@ def _host_cu_seqlens(
 
 
 def _aligned_sequence_lengths(
-    cu_seqlens: torch.Tensor,
-    cu_seqlens_cpu: torch.Tensor | None,
-    *,
-    trust_device_cu_seqlens: bool = False,
+    cu_seqlens: torch.Tensor, cu_seqlens_cpu: torch.Tensor | None, *, total_tokens: int
 ) -> bool:
     offsets = _host_cu_seqlens(cu_seqlens, cu_seqlens_cpu)
     if offsets is None:
-        return trust_device_cu_seqlens
-    if offsets.numel() < 2:
+        return False
+    if (
+        offsets.device.type != "cpu"
+        or offsets.shape != cu_seqlens.shape
+        or offsets.numel() < 2
+        or offsets[0].item() != 0
+        or offsets[-1].item() != total_tokens
+    ):
         return False
     lengths = offsets[1:] - offsets[:-1]
     return bool((lengths > 0).all().item() and (lengths % _CHUNK_SIZE == 0).all().item())
@@ -814,11 +840,7 @@ def _cutedsl_support_reason(
         else:
             if q.shape[0] != 1:
                 return "packed variable length inputs require batch size 1"
-            if not _aligned_sequence_lengths(
-                cu_seqlens,
-                cu_seqlens_cpu,
-                trust_device_cu_seqlens=trust_device_cu_seqlens,
-            ):
+            if not _aligned_sequence_lengths(cu_seqlens, cu_seqlens_cpu, total_tokens=q.shape[1]):
                 return "every packed sequence length must be a positive multiple of 64"
     return None
 
@@ -1239,7 +1261,7 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
         cp_context: object | None,
     ):
         mode = _backend_mode()
-        trust_device_cu_seqlens = validated_chunk_offsets is not None
+        trust_device_cu_seqlens = cu_seqlens_cpu is not None
         if validated_chunk_offsets is not None and (
             cu_seqlens is None
             or validated_chunk_offsets.shape != cu_seqlens.shape
@@ -1383,8 +1405,7 @@ def chunk_gated_delta_rule(
 
     mode = _backend_mode()
     if mode == "fla":
-        return _call_fla_compat(
-            fla_chunk_gated_delta_rule,
+        return _call_fla_gated_delta_rule(
             q=q,
             k=k,
             v=v,
@@ -1432,13 +1453,12 @@ def chunk_gated_delta_rule(
         cu_seqlens_cpu=cu_seqlens_cpu,
         cp_context=cp_context,
         kwargs=kwargs,
-        trust_device_cu_seqlens=validated_chunk_offsets is not None,
+        trust_device_cu_seqlens=cu_seqlens_cpu is not None,
     )
     if reason is not None:
         if mode == "cute":
             raise RuntimeError(f"Internal CuTe DSL GDR path is unavailable: {reason}")
-        return _call_fla_compat(
-            fla_chunk_gated_delta_rule,
+        return _call_fla_gated_delta_rule(
             q=q,
             k=k,
             v=v,

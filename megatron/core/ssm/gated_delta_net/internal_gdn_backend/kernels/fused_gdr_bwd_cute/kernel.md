@@ -54,7 +54,11 @@ path, so the flag has no effect there.
 chunkwise CP uses the internal backend. It builds one single-sequence context
 from `[0, T_global]` and reuses that context for every batch slice in causal-conv
 and pre-GDR processing. FLA and torch GDR backends still reject this dense CP
-layout. After preprocessing, BTHD inputs keep their native
+layout when selected directly through `gdn_gdr_backend`. Inside the internal
+backend, however, explicit runtime `fla` mode and unsupported-shape `auto`
+fallback slice only the FLA GDR operator by batch and concatenate its outputs;
+the surrounding GatedDeltaNet layer remains a single dense-batch invocation.
+After preprocessing, BTHD inputs keep their native
 `[B, T_local, H, D]` layout. Only the CP boundary-state preprocessing is applied
 per batch element, because that primitive consumes one local sequence at a
 time. The resulting small boundary states are joined;
@@ -79,8 +83,12 @@ must satisfy the fused backward contract (BF16, 64 heads, head dimension 128);
 reports the unsupported contract explicitly. CP4 E2E validation must verify
 that both FLA merged preprocess kernels and the fused backward are invoked.
 The GB200 E2E coverage exercises the real `GatedDeltaNet.forward` entry for CP4,
-B=2 with local T=8192 and T=8191, and compares output plus all five GDR input
-gradients against per-batch FLA CP execution. The non-CP case asserts that both
+B=2 with local T=8192 and T=8190, and compares output plus all five GDR input
+gradients against the production dense-batch FLA CP dispatch. Local T=8190
+corresponds to global T=32760, which is divisible by the standard training
+partitioner's `2 * CP` requirement. Odd local lengths such as T=8191 remain
+valid module/kernel-level coverage, but are not reachable through that standard
+dense training partitioner. The non-CP case asserts that both
 CuTe DSL forward and backward kernels run; CP validates the
 FLA-forward/fused-backward path against FLA.
 
@@ -197,8 +205,12 @@ the arbitrary packed-batch contract, and the named layout/storage structure.
 They do not duplicate a large shape sweep.
 
 `tests/unit_tests/ssm/test_internal_gdn_backend_e2e.py` is marked
-`launch_on_gb200` and runs one explicit-`cute` full-fused E2E case (`B=2`, `T=8192`,
-`H=64`, `D=128`, BF16). Deterministic Q/K/V inputs use standard deviation 0.1
+`launch_on_gb200`. It runs the non-CP explicit-`cute` full-fused case
+(`B=2`, `T=8192`, `H=64`, `D=128`, BF16), plus real GatedDeltaNet CP4 cases at
+local T=8192 and local T=8190. The CP cases assert that the merged FLA CP
+preprocessing and fused CuTe backward both execute, while their FLA references
+exercise the production dense-batch fallback rather than splitting the whole
+model invocation. Deterministic Q/K/V inputs use standard deviation 0.1
 to keep the long recurrence finite, and backward uses a fixed BF16 random
 `grad_output` without normalization by tensor size. It compares output and all
 five input gradients with FLA: output uses `atol=rtol=1e-2`, Q/K/V gradients
@@ -217,16 +229,19 @@ allows 10% noise relative to FLA. JIT time is excluded.
   sequence length. Packed variable-length metadata retains the identity/version
   cache described below.
 - Metadata is cached by `cu_seqlens` identity and tensor version; in-place
-  mutation invalidates the cached entry. Device-only packed offsets are trusted
-  only when the validated upper GDN path supplies matching chunk offsets; direct
-  calls without CPU or validated metadata fall back in `auto` mode and fail in
-  `cute` mode.
+  mutation invalidates the cached entry. Standard packed-batch construction
+  supplies a trusted CPU mirror once, which GatedDeltaNet validates and reuses
+  across layers. Q/KV validation and equality checks therefore do not observe
+  CUDA results in Python. Chunk offsets are generated lazily only by the
+  internal path and reuse the identity/version cache. Device-only offsets are
+  not treated as validated metadata; direct calls without a CPU mirror fall
+  back in `auto` mode and fail in `cute` mode.
 - Unsupported shapes and dtypes fall back only in `auto` mode. `cute` mode is
   useful in CI and debugging because it turns accidental fallback into an
   explicit failure.
 - Performance results are not hard-coded here. Reports should identify the
   commit, GPU, CUDA/CuTe DSL versions, shape, warmup count, sample count, and
-whether JIT time is included.
+  whether JIT time is included.
 
 For layout-only development, run the CPU contract test first, then compile the
 SM100 probe and both uniform and packed-variable specializations on GB200.
