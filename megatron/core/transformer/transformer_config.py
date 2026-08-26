@@ -17,6 +17,7 @@ from megatron.core._rank_utils import warn_single_rank
 from megatron.core.activations import squared_relu
 from megatron.core.context_parallel import CPLayout
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
@@ -598,13 +599,13 @@ class TransformerConfig(ModelParallelConfig):
     """Number of value and gate heads for the gated delta net."""
 
     kda_f_lora_rank: Optional[int] = None
-    """Rank of KDA's bias-free F-decay projection. Defaults to ``linear_key_head_dim``."""
-
-    kda_use_full_rank_gate: bool = True
-    """Use a full-rank output gate in KDA. When False, use a bias-free low-rank gate."""
+    """Rank of KDA's bias-free low-rank F-decay projection; None keeps it full-rank."""
 
     kda_gate_lora_rank: Optional[int] = None
-    """Rank of KDA's low-rank output gate; defaults to ``linear_value_head_dim`` when used."""
+    """Rank of KDA's bias-free low-rank output gate; None keeps it full-rank.
+
+    When both KDA ranks are None, KDA uses its legacy fused input projection.
+    """
 
     kda_safe_gate: bool = False
     """Whether the KDA kernel should use bounded gate values."""
@@ -2538,20 +2539,23 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError("KDA requires equal key and value head counts.")
                 if self.linear_key_head_dim != self.linear_value_head_dim:
                     raise ValueError("KDA requires equal key and value head dimensions.")
-                if self.kda_f_lora_rank is None:
-                    self.kda_f_lora_rank = self.linear_key_head_dim
-                if self.kda_f_lora_rank <= 0:
+                if self.kda_f_lora_rank is not None and self.kda_f_lora_rank <= 0:
                     raise ValueError(
                         f"KDA requires kda_f_lora_rank > 0, got {self.kda_f_lora_rank}."
                     )
-                if not self.kda_use_full_rank_gate:
-                    if self.kda_gate_lora_rank is None:
-                        self.kda_gate_lora_rank = self.linear_value_head_dim
-                    if self.kda_gate_lora_rank <= 0:
-                        raise ValueError(
-                            "KDA requires kda_gate_lora_rank > 0, "
-                            f"got {self.kda_gate_lora_rank}."
-                        )
+                if self.kda_gate_lora_rank is not None and self.kda_gate_lora_rank <= 0:
+                    raise ValueError(
+                        "KDA requires kda_gate_lora_rank > 0, " f"got {self.kda_gate_lora_rank}."
+                    )
+                if self.fp8:
+                    fp8_align_size = get_fp8_align_size(self.fp8_recipe)
+                    for field_name in ("kda_f_lora_rank", "kda_gate_lora_rank"):
+                        rank = getattr(self, field_name)
+                        if rank is not None and rank % fp8_align_size != 0:
+                            raise ValueError(
+                                f"KDA requires {field_name} to be a multiple of "
+                                f"{fp8_align_size} under FP8, got {rank}."
+                            )
                 if self.kda_safe_gate:
                     if self.kda_lower_bound is None:
                         raise ValueError("KDA requires kda_lower_bound when kda_safe_gate=True.")
