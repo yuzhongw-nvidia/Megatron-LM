@@ -180,6 +180,7 @@ class GatedDeltaNet(_GDNBase):
                 "conversion must be handled before calling GatedDeltaNet."
             )
 
+        validated_chunk_offsets_q = None
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
@@ -205,6 +206,10 @@ class GatedDeltaNet(_GDNBase):
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
             )
+            sequence_lengths = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            validated_chunk_offsets_q = torch.empty_like(cu_seqlens_q)
+            validated_chunk_offsets_q[0] = 0
+            torch.cumsum((sequence_lengths + 63) // 64, dim=0, out=validated_chunk_offsets_q[1:])
             num_packed_seqs = cu_seqlens_q.shape[0] - 1
             assert num_packed_seqs > 0, (
                 "Number of packed sequences must be greater than 0, "
@@ -216,14 +221,27 @@ class GatedDeltaNet(_GDNBase):
 
         if cp_size_chunkwise > 1:
             if cu_seqlens_q is None:
-                cache_key = (seq_len_global, batch)
+                device = hidden_states.device
+                device_index = device.index
+                if device.type == "cuda" and device_index is None:
+                    device_index = torch.cuda.current_device()
+                stream_id = (
+                    int(torch.cuda.current_stream(device).cuda_stream)
+                    if device.type == "cuda"
+                    else None
+                )
+                cache_key = (
+                    device.type,
+                    device_index,
+                    id(cp_group_chunkwise),
+                    stream_id,
+                    seq_len_global,
+                    self.conv_kernel_dim,
+                )
                 cached = self._chunkwise_cp_context_cache.get(cache_key)
                 if cached is None:
-                    cached_cu_seqlens = (
-                        torch.arange(
-                            batch + 1, device=torch.cuda.current_device(), dtype=torch.long
-                        )
-                        * seq_len_global
+                    cached_cu_seqlens = torch.tensor(
+                        [0, seq_len_global], device=device, dtype=torch.long
                     )
                     cached_ctx = build_cp_context(
                         cu_seqlens=cached_cu_seqlens,
@@ -232,6 +250,10 @@ class GatedDeltaNet(_GDNBase):
                     )
                     cached = (cached_cu_seqlens, cached_ctx)
                     self._chunkwise_cp_context_cache[cache_key] = cached
+                    if len(self._chunkwise_cp_context_cache) > 64:
+                        self._chunkwise_cp_context_cache.popitem(last=False)
+                else:
+                    self._chunkwise_cp_context_cache.move_to_end(cache_key)
                 cu_seqlens_q, chunkwise_cp_context = cached
             else:
                 chunkwise_cp_context = build_cp_context(
@@ -254,6 +276,7 @@ class GatedDeltaNet(_GDNBase):
                     cp_size_chunkwise,
                     cp_group_chunkwise,
                     cu_seqlens_q,
+                    validated_chunk_offsets_q,
                     packed_seq_params,
                     chunkwise_cp_context,
                 )
@@ -269,6 +292,7 @@ class GatedDeltaNet(_GDNBase):
                 cp_size_chunkwise,
                 cp_group_chunkwise,
                 cu_seqlens_q,
+                validated_chunk_offsets_q,
                 packed_seq_params,
                 chunkwise_cp_context,
             )
@@ -290,6 +314,7 @@ class GatedDeltaNet(_GDNBase):
         cp_size_chunkwise,
         cp_group_chunkwise,
         cu_seqlens_q,
+        validated_chunk_offsets_q,
         packed_seq_params,
         chunkwise_cp_context,
     ):
@@ -309,12 +334,13 @@ class GatedDeltaNet(_GDNBase):
             packed_seq_params,
         )
 
+        dense_batched_cp = cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1
+        if dense_batched_cp and self.config.gdn_gdr_backend != "internal":
+            raise ValueError(
+                "GDN chunkwise CP with SBHD batch>1 requires gdn_gdr_backend='internal'."
+            )
+
         if self.gdn_pre_gated_delta_rule_fusion:
-            if cp_size_chunkwise > 1 and batch > 1:
-                raise ValueError(
-                    "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-                    "when cp_context is used. Use packed THD input or micro_batch_size=1."
-                )
             if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
                 raise ValueError(
                     "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
@@ -333,44 +359,51 @@ class GatedDeltaNet(_GDNBase):
                 if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
                 else None
             )
+            fused_pre_kwargs = {
+                "cu_seqlens_q": fused_cu_seqlens_q,
+                "seq_idx": seq_idx,
+                "cp_group": cp_group_chunkwise if cp_size_chunkwise > 1 else None,
+                "cp_group_headwise": cp_group_headwise,
+            }
             query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
-                qkvzba,
-                cu_seqlens_q=fused_cu_seqlens_q,
-                seq_idx=seq_idx,
-                cp_group=cp_group_chunkwise if cp_size_chunkwise > 1 else None,
-                cp_group_headwise=cp_group_headwise,
+                qkvzba, **fused_pre_kwargs
             )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
         else:
             nvtx_range_push(suffix="pre_gated_delta_rule")
-            if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
-                # TODO: If additional gated delta rule backends are added, handle this
-                # SBHD + chunkwise CP + batch>1 case per backend instead of
-                # unconditionally rejecting it.
-                raise ValueError(
-                    "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-                    "when cp_context is used. Use packed THD input or micro_batch_size=1."
-                )
             if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
                 raise ValueError(
                     "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
                     "chunk-local causal-conv inputs can change later chunk numerics."
                 )
-            query, key, value, gate, beta, g = self.pre_gated_delta_rule(
-                qkvzba,
-                batch,
+            pre_args = (
                 seq_len_post_headwise,
                 cp_size_headwise,
                 cp_group_headwise,
                 cu_seqlens_q,
                 chunkwise_cp_context,
-                packed_seq_params=packed_seq_params,
             )
+            if dense_batched_cp:
+                prepared = [
+                    self.pre_gated_delta_rule(
+                        qkvzba[:, batch_idx : batch_idx + 1], 1, *pre_args, packed_seq_params=None
+                    )
+                    for batch_idx in range(batch)
+                ]
+                query, key, value, gate, beta, g = (
+                    torch.cat(tensors, dim=0) for tensors in zip(*prepared)
+                )
+            else:
+                query, key, value, gate, beta, g = self.pre_gated_delta_rule(
+                    qkvzba, batch, *pre_args, packed_seq_params=packed_seq_params
+                )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
+        if validated_chunk_offsets_q is not None and self.config.gdn_gdr_backend == "internal":
+            kernel_inputs["validated_chunk_offsets"] = validated_chunk_offsets_q
         core_attn_out, _ = self.gated_delta_rule(
             **kernel_inputs,
             initial_state=None,

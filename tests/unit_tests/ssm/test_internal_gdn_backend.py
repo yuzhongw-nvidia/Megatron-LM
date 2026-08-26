@@ -103,6 +103,48 @@ def test_auto_mode_falls_back_for_unsupported_inputs(monkeypatch):
     assert implementation.chunk_gated_delta_rule(**_inputs()) is expected
 
 
+def test_public_dispatch_does_not_trust_unvalidated_device_cu_seqlens(monkeypatch):
+    implementation = _implementation()
+    expected = (torch.empty(1), None)
+    seen = {}
+
+    def support_reason(**kwargs):
+        seen.update(kwargs)
+        return "unsupported test input"
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.setattr(implementation, "_cutedsl_support_reason", support_reason)
+    monkeypatch.setattr(implementation, "fla_chunk_gated_delta_rule", lambda **_kwargs: expected)
+
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    assert implementation.chunk_gated_delta_rule(**_inputs(), cu_seqlens=cu_seqlens) is expected
+    assert seen["trust_device_cu_seqlens"] is False
+
+
+def test_public_dispatch_trusts_prevalidated_chunk_offsets(monkeypatch):
+    implementation = _implementation()
+    expected = (torch.empty(1), None)
+    seen = {}
+
+    def support_reason(**kwargs):
+        seen.update(kwargs)
+        return "unsupported test input"
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.setattr(implementation, "_cutedsl_support_reason", support_reason)
+    monkeypatch.setattr(implementation, "fla_chunk_gated_delta_rule", lambda **_kwargs: expected)
+
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    chunk_offsets = torch.tensor([0, 1], dtype=torch.int32)
+    assert (
+        implementation.chunk_gated_delta_rule(
+            **_inputs(), cu_seqlens=cu_seqlens, validated_chunk_offsets=chunk_offsets
+        )
+        is expected
+    )
+    assert seen["trust_device_cu_seqlens"] is True
+
+
 def test_cute_mode_rejects_unsupported_inputs(monkeypatch):
     implementation = _implementation()
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "cute")
@@ -149,8 +191,9 @@ def test_cute_mode_dispatches_to_local_autograd_function(
     assert result is expected
 
     assert calls[0][5] == expected_scale
-    assert calls[0][8] is recompute_h
-    assert calls[0][9] is cp_context
+    assert calls[0][8] is None
+    assert calls[0][9] is recompute_h
+    assert calls[0][10] is cp_context
 
 
 @pytest.mark.parametrize("use_saved_h", [False, True])
@@ -555,6 +598,7 @@ def test_forward_save_h_policy_is_shared_by_fla_and_cute(monkeypatch, mode, reco
         0.5,
         None,
         None,
+        None,
         recompute_h,
         None,
     )
@@ -941,6 +985,24 @@ def test_fused_backward_zero_dht_cache_is_stream_scoped(monkeypatch):
 
     assert second is not first
     assert third is first
+
+
+def test_fused_backward_zero_dht_cache_evicts_to_byte_budget(monkeypatch):
+    implementation = _implementation()
+
+    implementation._fused_bwd_zero_dht_cache.clear()
+    monkeypatch.setattr(implementation, "_FUSED_BWD_ZERO_DHT_CACHE_MAX_BYTES", 5 * 1024 * 1024)
+    stream_keys = iter([(0, 1), (0, 2)])
+    monkeypatch.setattr(
+        implementation, "_current_stream_cache_key", lambda _device: next(stream_keys)
+    )
+
+    first = implementation._fused_bwd_zero_dht(torch.device("cpu"), 1)
+    second = implementation._fused_bwd_zero_dht(torch.device("cpu"), 1)
+
+    assert second is not first
+    assert len(implementation._fused_bwd_zero_dht_cache) == 1
+    assert next(iter(implementation._fused_bwd_zero_dht_cache.values())) is second
 
 
 @pytest.mark.parametrize("use_saved_h", [False, True])

@@ -50,10 +50,14 @@ path, so the flag has no effect there.
 
 ### Context parallelism
 
-Dense BTHD inputs keep their native `[B, T_local, H, D]` layout through the
-rank-local FLA forward and backward computations. Only the CP boundary-state
-preprocessing is applied per batch element, because that primitive consumes
-one local sequence at a time. The resulting small boundary states are joined;
+`GatedDeltaNet.forward` supports dense SBHD micro-batches with `B > 1` when
+chunkwise CP uses the internal backend. It builds one single-sequence context
+from `[0, T_global]` and reuses that context for every batch slice in causal-conv
+and pre-GDR processing. FLA and torch GDR backends still reject this dense CP
+layout. After preprocessing, BTHD inputs keep their native
+`[B, T_local, H, D]` layout. Only the CP boundary-state preprocessing is applied
+per batch element, because that primitive consumes one local sequence at a
+time. The resulting small boundary states are joined;
 the large token tensors and saved chunk states are not concatenated. Before
 the fused launch, tensors are flattened as views and a cached dense
 `cu_seqlens=[0, T_local, ..., B*T_local]` tensor describes the logical
@@ -74,9 +78,11 @@ must satisfy the fused backward contract (BF16, 64 heads, head dimension 128);
 `auto` falls back to the CP-aware FLA backward when they do not, while `cute`
 reports the unsupported contract explicitly. CP4 E2E validation must verify
 that both FLA merged preprocess kernels and the fused backward are invoked.
-The existing non-CP GB200 E2E test asserts that both CuTe DSL forward and
-backward kernels run; CP instead validates the FLA-forward/fused-backward path
-against FLA.
+The GB200 E2E coverage exercises the real `GatedDeltaNet.forward` entry for CP4,
+B=2 with local T=8192 and T=8191, and compares output plus all five GDR input
+gradients against per-batch FLA CP execution. The non-CP case asserts that both
+CuTe DSL forward and backward kernels run; CP validates the
+FLA-forward/fused-backward path against FLA.
 
 ## Package structure
 
@@ -205,13 +211,16 @@ allows 10% noise relative to FLA. JIT time is excluded.
 
 - The adapter promotes gate and beta data to FP32 at the low-level boundary and
   restores their gradient dtypes afterward.
-- When no final-state gradient is supplied, the adapter reuses a cached zero
-  `dht` tensor of the required logical batch shape.
+- When no final-state gradient is supplied, the adapter reuses a stream-scoped
+  zero-`dht` tensor. This LRU cache is bounded to 256 MiB.
 - Uniform dense-batch offsets are cached by device, batch size, and local
   sequence length. Packed variable-length metadata retains the identity/version
   cache described below.
 - Metadata is cached by `cu_seqlens` identity and tensor version; in-place
-  mutation invalidates the cached entry.
+  mutation invalidates the cached entry. Device-only packed offsets are trusted
+  only when the validated upper GDN path supplies matching chunk offsets; direct
+  calls without CPU or validated metadata fall back in `auto` mode and fail in
+  `cute` mode.
 - Unsupported shapes and dtypes fall back only in `auto` mode. `cute` mode is
   useful in CI and debugging because it turns accidental fallback into an
   explicit failure.

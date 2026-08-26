@@ -420,6 +420,7 @@ class _SbhdLayoutRedistributionPlan:
     input_segment_counts: tuple[int, ...]
     output_segment_counts: tuple[int, ...]
     receive_permutation: tuple[int, ...]
+    received_segment_ids: tuple[int, ...]
 
 
 def _sbhd_segments_per_rank(tp_size: int) -> int:
@@ -593,6 +594,7 @@ def _build_sbhd_layout_redistribution_plan(
         input_segment_counts=input_segment_counts,
         output_segment_counts=tuple(output_segment_counts),
         receive_permutation=receive_permutation,
+        received_segment_ids=tuple(received_ids),
     )
 
 
@@ -638,21 +640,60 @@ def _redistribute_sbhd_layout(
     input_contiguous = input_.contiguous()
     local_seq_len = input_contiguous.shape[0]
     local_segment_count = _sbhd_segments_per_rank(tp_size=tp_size)
-    if local_seq_len % local_segment_count != 0:
-        raise ValueError(
-            "SBHD CP layout conversion requires the sequence length local to each TP×CP rank to "
-            f"be divisible by {local_segment_count}, got {local_seq_len}"
-        )
-    segment_len = local_seq_len // local_segment_count
-    segment_shape = (local_segment_count, segment_len, *input_contiguous.shape[1:])
-    segments = input_contiguous.reshape(segment_shape)
+    if local_seq_len % local_segment_count == 0:
+        segment_len = local_seq_len // local_segment_count
+        segment_shape = (local_segment_count, segment_len, *input_contiguous.shape[1:])
+        segments = input_contiguous.reshape(segment_shape)
 
-    if plan.send_slots == tuple(range(local_segment_count)):
-        send_buffer = input_contiguous
-    else:
-        send_buffer = segments.flip(0).reshape(input_contiguous.shape)
-    input_split_sizes = [count * segment_len for count in plan.input_segment_counts]
-    output_split_sizes = [count * segment_len for count in plan.output_segment_counts]
+        if plan.send_slots == tuple(range(local_segment_count)):
+            send_buffer = input_contiguous
+        else:
+            send_buffer = segments.flip(0).reshape(input_contiguous.shape)
+        input_split_sizes = [count * segment_len for count in plan.input_segment_counts]
+        output_split_sizes = [count * segment_len for count in plan.output_segment_counts]
+        received = all_to_all(
+            group=communication_group,
+            input_=send_buffer,
+            output_split_sizes_=output_split_sizes,
+            input_split_sizes=input_split_sizes,
+        )
+
+        received_segments = received.reshape(segment_shape)
+        if plan.receive_permutation == tuple(range(local_segment_count)):
+            output = received
+        else:
+            output = received_segments.flip(0).reshape(input_contiguous.shape)
+        return output.contiguous()
+
+    source_ids = _local_sbhd_segment_ids(
+        layout=source_layout, cp_size=cp_size, cp_rank=cp_rank, tp_size=tp_size, tp_rank=tp_rank
+    )
+
+    def segment_length(segment_id: int) -> int:
+        return (local_seq_len + 1) // 2 if segment_id % 2 == 0 else local_seq_len // 2
+
+    source_lengths = [segment_length(segment_id) for segment_id in source_ids]
+    source_segments = input_contiguous.split(source_lengths, dim=0)
+    packed_ids = [source_ids[slot] for slot in plan.send_slots]
+    packed_segments = [source_segments[slot] for slot in plan.send_slots]
+    send_buffer = torch.cat(packed_segments, dim=0)
+
+    input_split_sizes = []
+    offset = 0
+    for count in plan.input_segment_counts:
+        input_split_sizes.append(
+            sum(segment_length(segment_id) for segment_id in packed_ids[offset : offset + count])
+        )
+        offset += count
+
+    received_ids = plan.received_segment_ids
+    output_split_sizes = []
+    offset = 0
+    for count in plan.output_segment_counts:
+        output_split_sizes.append(
+            sum(segment_length(segment_id) for segment_id in received_ids[offset : offset + count])
+        )
+        offset += count
     received = all_to_all(
         group=communication_group,
         input_=send_buffer,
@@ -660,9 +701,7 @@ def _redistribute_sbhd_layout(
         input_split_sizes=input_split_sizes,
     )
 
-    received_segments = received.reshape(segment_shape)
-    if plan.receive_permutation == tuple(range(local_segment_count)):
-        output = received
-    else:
-        output = received_segments.flip(0).reshape(input_contiguous.shape)
+    received_lengths = [segment_length(segment_id) for segment_id in received_ids]
+    received_segments = received.split(received_lengths, dim=0)
+    output = torch.cat([received_segments[index] for index in plan.receive_permutation], dim=0)
     return output.contiguous()

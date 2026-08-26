@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Protocol, Union
@@ -316,9 +317,9 @@ class _GDNBase(MegatronModule):
             tp_group=self.pg_collection.tp,
             name=(name + ".out_proj") if name is not None else None,
         )
-        # TODO: Packed sequence cu_seqlens can vary per batch; cache only static SBHD
-        # cp_context entries here and revisit routing metadata lifetime in the CP layout refactor.
-        self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
+        self._chunkwise_cp_context_cache: OrderedDict[
+            tuple[str, int | None, int, int | None, int, int], tuple[torch.Tensor, object]
+        ] = OrderedDict()
 
         self.reset_parameters()
 
@@ -486,6 +487,11 @@ class _GDNBase(MegatronModule):
         else:
             cu_seqlens = cu_seqlens_actual
 
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+            raise ValueError(f"GDN: {name} must be a 1D tensor with at least two offsets.")
+        if cu_seqlens[0].cpu().item() != 0:
+            raise ValueError(f"GDN: {name}[0] must be 0.")
+
         total_cu = cu_seqlens[-1].cpu().item()
         if total_cu != total_seq_len:
             raise ValueError(
@@ -495,6 +501,11 @@ class _GDNBase(MegatronModule):
             )
 
         seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        if (seq_lengths <= 0).any():
+            raise ValueError(
+                f"All per-sequence lengths in {name} must be positive, "
+                f"but got: {seq_lengths.tolist()}"
+            )
         if (seq_lengths % cp_size != 0).any():
             raise ValueError(
                 f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "

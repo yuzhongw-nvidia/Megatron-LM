@@ -408,7 +408,7 @@ class TestGatedDeltaNet:
             dtype=torch.bfloat16,
         )
 
-        with pytest.raises(ValueError, match="requires micro_batch_size == 1"):
+        with pytest.raises(ValueError, match="requires gdn_gdr_backend='internal'"):
             gdn(hidden_states, None)
 
     def test_gpu_forward_rejects_sbhd_conv_padding(self):
@@ -819,6 +819,16 @@ class TestGDNCuSeqlensResolve:
         actual = torch.tensor([0, 505, 1008], dtype=torch.int32)
         with pytest.raises(ValueError, match="must be divisible by cp_size"):
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
+
+    def test_raises_when_first_offset_is_not_zero(self, mock_gdn):
+        actual = torch.tensor([1, 504, 1008], dtype=torch.int32)
+        with pytest.raises(ValueError, match=r"cu_seqlens_q\[0\] must be 0"):
+            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
+
+    def test_raises_when_sequence_length_is_not_positive(self, mock_gdn):
+        actual = torch.tensor([0, 504, 504, 1008], dtype=torch.int32)
+        with pytest.raises(ValueError, match="must be positive"):
+            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
 
     def test_cp1_still_validates_total(self, mock_gdn):
         mock_gdn.cp_size = 1
