@@ -227,14 +227,16 @@ def test_standard_thd_batch_factory_populates_trusted_cpu_metadata():
         cp_rank=0,
     )
 
-    assert packed_seq_params.cu_seqlens_q_cpu is packed_seq_params.cu_seqlens_kv_cpu
-    assert packed_seq_params.cu_seqlens_q_padded_cpu is packed_seq_params.cu_seqlens_kv_padded_cpu
-    torch.testing.assert_close(packed_seq_params.cu_seqlens_q_cpu, cu_seqlens)
-    torch.testing.assert_close(packed_seq_params.cu_seqlens_q_padded_cpu, cu_seqlens_padded)
-    assert packed_seq_params.cu_seqlens_q_version == cu_seqlens._version
-    assert packed_seq_params.cu_seqlens_kv_version == cu_seqlens._version
-    assert packed_seq_params.cu_seqlens_q_padded_version == cu_seqlens_padded._version
-    assert packed_seq_params.cu_seqlens_kv_padded_version == cu_seqlens_padded._version
+    from megatron.core.packed_seq_params import get_packed_seq_cpu_metadata
+
+    q_cpu = get_packed_seq_cpu_metadata(packed_seq_params, "cu_seqlens_q")
+    kv_cpu = get_packed_seq_cpu_metadata(packed_seq_params, "cu_seqlens_kv")
+    q_padded_cpu = get_packed_seq_cpu_metadata(packed_seq_params, "cu_seqlens_q_padded")
+    kv_padded_cpu = get_packed_seq_cpu_metadata(packed_seq_params, "cu_seqlens_kv_padded")
+    assert q_cpu is kv_cpu
+    assert q_padded_cpu is kv_padded_cpu
+    torch.testing.assert_close(q_cpu, cu_seqlens)
+    torch.testing.assert_close(q_padded_cpu, cu_seqlens_padded)
 
 
 def test_cute_mode_rejects_unsupported_inputs(monkeypatch):

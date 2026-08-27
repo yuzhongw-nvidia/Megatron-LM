@@ -10,6 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core import packed_seq_params as packed_seq_params_module
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -17,7 +18,6 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, torch_chunk_gated_delta_rule
-from megatron.core.ssm.gated_delta_net.gdn import _current_cpu_metadata
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -823,14 +823,25 @@ class TestGDNCuSeqlensResolve:
         assert resolved is device_offsets
         assert resolved_cpu is trusted_cpu
 
-    def test_in_place_mutation_invalidates_cpu_metadata(self):
-        device_offsets = torch.tensor([0, 64], dtype=torch.int32)
-        cpu_offsets = device_offsets.clone()
-        recorded_version = device_offsets._version
+    @pytest.mark.parametrize("mutate", ["replace_device", "mutate_cpu"])
+    def test_metadata_binding_rejects_stale_tensor_owners(self, mutate):
+        bind = getattr(packed_seq_params_module, "bind_packed_seq_cpu_metadata", None)
+        resolve = getattr(packed_seq_params_module, "get_packed_seq_cpu_metadata", None)
+        assert bind is not None and resolve is not None
 
-        assert _current_cpu_metadata(device_offsets, cpu_offsets, recorded_version) is cpu_offsets
-        device_offsets[1] = 32
-        assert _current_cpu_metadata(device_offsets, cpu_offsets, recorded_version) is None
+        device_offsets = torch.tensor([0, 64], dtype=torch.int32)
+        params = packed_seq_params_module.PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=device_offsets
+        )
+        bind(params)
+        assert torch.equal(resolve(params, "cu_seqlens_q"), device_offsets)
+
+        if mutate == "replace_device":
+            params.cu_seqlens_q = device_offsets.clone()
+        else:
+            resolve(params, "cu_seqlens_q")[1] = 32
+
+        assert resolve(params, "cu_seqlens_q") is None
 
     def test_raises_when_padding_mismatch(self, mock_gdn):
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)

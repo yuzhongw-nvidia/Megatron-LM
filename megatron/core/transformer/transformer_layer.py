@@ -19,7 +19,11 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    bind_packed_seq_cpu_metadata,
+    ensure_packed_seq_cpu_metadata,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup, make_weakref
 from megatron.core.transformer.enums import (
@@ -1269,6 +1273,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 static_inputs["cu_seqlens_kv"] = cu_seqlens.clone()
                 static_inputs["cu_seqlens_q_padded"] = cu_seqlens.clone()
                 static_inputs["cu_seqlens_kv_padded"] = cu_seqlens.clone()
+                capture_params = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=static_inputs["cu_seqlens_q"],
+                    cu_seqlens_kv=static_inputs["cu_seqlens_kv"],
+                    cu_seqlens_q_padded=static_inputs["cu_seqlens_q_padded"],
+                    cu_seqlens_kv_padded=static_inputs["cu_seqlens_kv_padded"],
+                )
+                self._cuda_graph_packed_seq_cpu_metadata = ensure_packed_seq_cpu_metadata(
+                    capture_params
+                )
 
             slen_for_mask = self.config.max_seqlen_per_dp_cp_rank
             if self.config.sequence_parallel:
@@ -1346,8 +1360,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 submodules += [self.mlp.shared_experts]
         return submodules
 
-    @staticmethod
-    def _decompose_packed_seq_params_to_kwargs(kwargs):
+    def _decompose_packed_seq_params_to_kwargs(self, kwargs):
         """Decompose PackedSeqParams into individual tensor kwargs for CUDA graph.
 
         CUDA graph requires all inputs to be tensors. This extracts the cu_seqlens
@@ -1359,6 +1372,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params = kwargs.pop('packed_seq_params', None)
         if packed_seq_params is None:
             return
+        self._cuda_graph_packed_seq_cpu_metadata = ensure_packed_seq_cpu_metadata(packed_seq_params)
         kwargs['cu_seqlens_q'] = packed_seq_params.cu_seqlens_q
         kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
         kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
@@ -1393,6 +1407,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             # selection for THD to cuDNN fused attention.
             pad_between_seqs=True,
         )
+        cpu_metadata = getattr(self, '_cuda_graph_packed_seq_cpu_metadata', None)
+        if cpu_metadata is not None:
+            bind_packed_seq_cpu_metadata(packed_seq_params, cpu_metadata)
         kwargs['packed_seq_params'] = packed_seq_params
 
     def _te_cuda_graph_capture(self, *args, **kwargs):

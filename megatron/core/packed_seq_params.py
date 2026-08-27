@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Optional, Tuple, Union
+import weakref
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Dict, Literal, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -9,6 +10,105 @@ from torch import Tensor
 
 if TYPE_CHECKING:
     from megatron.core.context_parallel_layout import ThdCpRoute
+
+
+_CU_SEQLENS_FIELDS = (
+    "cu_seqlens_q",
+    "cu_seqlens_kv",
+    "cu_seqlens_q_padded",
+    "cu_seqlens_kv_padded",
+)
+
+
+@dataclass(frozen=True)
+class _PackedSeqCpuMetadata:
+    """Ownership information for a validated host mirror of one offsets tensor."""
+
+    device_owner: weakref.ReferenceType[Tensor]
+    device_version: int
+    cpu_offsets: Tensor
+    cpu_owner: weakref.ReferenceType[Tensor]
+    cpu_version: int
+
+
+def bind_packed_seq_cpu_metadata(
+    packed_seq_params: "PackedSeqParams", cpu_metadata: Optional[Dict[str, Tensor]] = None
+) -> None:
+    """Bind CPU mirrors to the current cu-seqlens tensor objects and versions.
+
+    ``cpu_metadata`` lets callers that already own trusted host offsets avoid a
+    device-to-host copy. Device tensors shared by multiple fields also share one
+    generated CPU mirror.
+    """
+    cpu_metadata = {} if cpu_metadata is None else cpu_metadata
+    generated_by_owner = {}
+    bindings = {}
+    for name in _CU_SEQLENS_FIELDS:
+        device_offsets = getattr(packed_seq_params, name)
+        if device_offsets is None:
+            continue
+        cpu_offsets = cpu_metadata.get(name)
+        if cpu_offsets is None:
+            cpu_offsets = generated_by_owner.get(id(device_offsets))
+        if cpu_offsets is None:
+            cpu_offsets = device_offsets.detach().to(device="cpu")
+            generated_by_owner[id(device_offsets)] = cpu_offsets
+        if cpu_offsets.device.type != "cpu":
+            raise ValueError(f"{name} CPU metadata must be on CPU.")
+        if (
+            cpu_offsets.shape != device_offsets.shape
+            or cpu_offsets.dtype != device_offsets.dtype
+            or not cpu_offsets.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} CPU metadata must match the device tensor shape and dtype "
+                "and be contiguous."
+            )
+        bindings[name] = _PackedSeqCpuMetadata(
+            device_owner=weakref.ref(device_offsets),
+            device_version=device_offsets._version,
+            cpu_offsets=cpu_offsets,
+            cpu_owner=weakref.ref(cpu_offsets),
+            cpu_version=cpu_offsets._version,
+        )
+    packed_seq_params._cu_seqlens_cpu_metadata = bindings
+
+
+def get_packed_seq_cpu_metadata(
+    packed_seq_params: "PackedSeqParams", name: str
+) -> Optional[Tensor]:
+    """Return a host mirror only while both tensor owners and versions match."""
+    if name not in _CU_SEQLENS_FIELDS:
+        raise ValueError(f"Unsupported cu-seqlens field: {name!r}.")
+    binding = packed_seq_params._cu_seqlens_cpu_metadata.get(name)
+    device_offsets = getattr(packed_seq_params, name)
+    if binding is None or device_offsets is None:
+        return None
+    cpu_offsets = binding.cpu_offsets
+    if (
+        binding.device_owner() is not device_offsets
+        or binding.device_version != device_offsets._version
+        or binding.cpu_owner() is not cpu_offsets
+        or binding.cpu_version != cpu_offsets._version
+    ):
+        return None
+    return cpu_offsets
+
+
+def ensure_packed_seq_cpu_metadata(packed_seq_params: "PackedSeqParams") -> Dict[str, Tensor]:
+    """Resolve all current host mirrors outside CUDA graph capture."""
+    for name in _CU_SEQLENS_FIELDS:
+        if (
+            getattr(packed_seq_params, name) is not None
+            and get_packed_seq_cpu_metadata(packed_seq_params, name) is None
+        ):
+            bind_packed_seq_cpu_metadata(packed_seq_params)
+            break
+    return {
+        name: cpu_offsets
+        for name in _CU_SEQLENS_FIELDS
+        if (cpu_offsets := get_packed_seq_cpu_metadata(packed_seq_params, name)) is not None
+    }
 
 
 @dataclass
@@ -37,14 +137,9 @@ class PackedSeqParams:
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
-    cu_seqlens_q_cpu: Tensor = None
-    cu_seqlens_kv_cpu: Tensor = None
-    cu_seqlens_q_padded_cpu: Tensor = None
-    cu_seqlens_kv_padded_cpu: Tensor = None
-    cu_seqlens_q_version: Optional[int] = None
-    cu_seqlens_kv_version: Optional[int] = None
-    cu_seqlens_q_padded_version: Optional[int] = None
-    cu_seqlens_kv_padded_version: Optional[int] = None
+    _cu_seqlens_cpu_metadata: Dict[str, _PackedSeqCpuMetadata] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -699,6 +794,7 @@ def pad_sequence_for_thd(
             )
         ),
     )
+    bind_packed_seq_cpu_metadata(padded_params)
 
     # True marks padded local token slots for routing/loss paths.
     tail_padding_mask = (

@@ -18,6 +18,7 @@ from megatron.core.datasets.data_schedule_utils import (
 )
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
+    bind_packed_seq_cpu_metadata,
     extend_thd_padding_before_cp_slice,
     get_thd_padding_kwargs,
     pad_sequence_for_thd,
@@ -382,7 +383,7 @@ class DpBalancedScheduler(BasePackingScheduler):
             ) = (None, None, None, None)
 
         # Broadcast to TP group (for non-TP-0 ranks)
-        (num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch) = (
+        num_micro_batches, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch = (
             broadcast_scalars(
                 [
                     num_micro_batches,
@@ -839,28 +840,12 @@ def get_batch_on_this_rank_for_sequence_packing(
     # loss paths (e.g. CSA indexer KL) can identify padding rows.
     # cu_seqlens_q/kv_padded hold the padded boundaries consumed by attention
     # kernels and THD partitioning.
-    cu_seqlens_cpu = cu_seqlens.detach().to(device="cpu")
-    cu_seqlens_padded_cpu = (
-        None if cu_seqlens_padded is None else cu_seqlens_padded.detach().to(device="cpu")
-    )
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
-        cu_seqlens_q_cpu=cu_seqlens_cpu,
-        cu_seqlens_kv_cpu=cu_seqlens_cpu,
-        cu_seqlens_q_padded_cpu=cu_seqlens_padded_cpu,
-        cu_seqlens_kv_padded_cpu=cu_seqlens_padded_cpu,
-        cu_seqlens_q_version=cu_seqlens._version,
-        cu_seqlens_kv_version=cu_seqlens._version,
-        cu_seqlens_q_padded_version=(
-            None if cu_seqlens_padded is None else cu_seqlens_padded._version
-        ),
-        cu_seqlens_kv_padded_version=(
-            None if cu_seqlens_padded is None else cu_seqlens_padded._version
-        ),
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
@@ -889,6 +874,8 @@ def get_batch_on_this_rank_for_sequence_packing(
                 cp_group=cp_group,
             )
         )
+    else:
+        bind_packed_seq_cpu_metadata(packed_seq_params)
 
     # "attention_mask" is not valid for sequence packing, so set it to None.
     return tokens, labels, loss_mask, None, position_ids, packed_seq_params, padding_mask

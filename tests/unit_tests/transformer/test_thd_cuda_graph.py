@@ -29,8 +29,12 @@ from pathlib import Path
 
 import pytest
 import torch
+from packaging.version import Version as PkgVersion
 
+from megatron.core import packed_seq_params as packed_seq_params_module
 from megatron.core.datasets.data_schedule import _build_thd_padding_mask
+from megatron.core.extensions import transformer_engine as transformer_engine_module
+from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
 from megatron.core.packed_seq_params import (
     PackedSeqParams,
     _resolve_thd_padding_lengths,
@@ -324,6 +328,29 @@ class TestPadSequenceForThd:
         assert p.cp_partition_mode == "contiguous"
         assert mask.shape == (1, 128)
         assert not mask[0, :total_T].any() and mask[0, total_T:].all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_padding_binds_cpu_metadata_to_returned_offsets(self):
+        bind = getattr(packed_seq_params_module, "bind_packed_seq_cpu_metadata", None)
+        resolve = getattr(packed_seq_params_module, "get_packed_seq_cpu_metadata", None)
+        assert bind is not None and resolve is not None
+
+        psp = _make_psp([50, 30])
+        bind(psp)
+        _, _, _, _, padded, _ = pad_sequence_for_thd(
+            torch.ones(1, 80, device="cuda"), None, None, None, psp, alignment=64
+        )
+
+        for name in (
+            "cu_seqlens_q",
+            "cu_seqlens_kv",
+            "cu_seqlens_q_padded",
+            "cu_seqlens_kv_padded",
+        ):
+            cpu_offsets = resolve(padded, name)
+            assert cpu_offsets is not None
+            torch.testing.assert_close(cpu_offsets, getattr(padded, name).cpu())
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -918,7 +945,7 @@ class TestDecomposeReconstruct:
         # Use the non-default mode so losing it during reconstruction is observable.
         layer.config.cp_partition_mode = "contiguous"
         kw = {'packed_seq_params': psp, 'other': 'kept'}
-        TransformerLayer._decompose_packed_seq_params_to_kwargs(kw)
+        layer._decompose_packed_seq_params_to_kwargs(kw)
         assert 'packed_seq_params' not in kw and 'cu_seqlens_q' in kw
         layer._reconstruct_packed_seq_params_from_kwargs(kw)
         r = kw['packed_seq_params']
@@ -927,6 +954,40 @@ class TestDecomposeReconstruct:
         assert r.cp_partition_mode == "contiguous"
         for k, v in orig.items():
             assert torch.equal(getattr(r, k), v)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("layer_type", [TransformerLayer, HyperConnectionHybridLayer])
+    def test_reconstruct_preserves_capture_static_cpu_metadata(self, layer_type):
+        bind = getattr(packed_seq_params_module, "bind_packed_seq_cpu_metadata", None)
+        resolve = getattr(packed_seq_params_module, "get_packed_seq_cpu_metadata", None)
+        assert bind is not None and resolve is not None
+
+        psp = _make_psp([100, 50, 30])
+        bind(psp)
+        layer = object.__new__(layer_type)
+        layer.config = type(
+            "Config",
+            (),
+            {
+                "max_seqlen_per_dp_cp_rank": 128,
+                "context_parallel_size": 1,
+                "cp_partition_mode": "zigzag",
+            },
+        )()
+        kw = {"packed_seq_params": psp}
+
+        layer._decompose_packed_seq_params_to_kwargs(kw)
+        layer._reconstruct_packed_seq_params_from_kwargs(kw)
+
+        reconstructed = kw["packed_seq_params"]
+        for name in (
+            "cu_seqlens_q",
+            "cu_seqlens_kv",
+            "cu_seqlens_q_padded",
+            "cu_seqlens_kv_padded",
+        ):
+            assert resolve(reconstructed, name) is not None
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -947,7 +1008,7 @@ class TestDecomposeReconstruct:
         layer = _build_layer(256, 4, 4, 1024, 128, 8)
         kw = {'packed_seq_params': psp}
 
-        TransformerLayer._decompose_packed_seq_params_to_kwargs(kw)
+        layer._decompose_packed_seq_params_to_kwargs(kw)
         layer._reconstruct_packed_seq_params_from_kwargs(kw)
 
         reconstructed = kw['packed_seq_params']
@@ -961,10 +1022,25 @@ class TestDecomposeReconstruct:
         layer = _build_layer(256, 4, 4, 1024, 128, 8)
         kw = {'hidden_states': torch.randn(10, 1, 256, device="cuda")}
         keys = set(kw.keys())
-        TransformerLayer._decompose_packed_seq_params_to_kwargs(kw)
+        layer._decompose_packed_seq_params_to_kwargs(kw)
         assert set(kw.keys()) == keys
         layer._reconstruct_packed_seq_params_from_kwargs(kw)
         assert set(kw.keys()) == keys
+
+
+def test_te_packed_seq_kwargs_use_an_explicit_allowlist():
+    get_fields = getattr(transformer_engine_module, "_get_te_packed_seq_params_fields", None)
+    assert get_fields is not None
+    assert get_fields(PkgVersion("2.10.0")) == {
+        "qkv_format",
+        "cu_seqlens_q",
+        "cu_seqlens_kv",
+        "cu_seqlens_q_padded",
+        "cu_seqlens_kv_padded",
+        "max_seqlen_q",
+        "max_seqlen_kv",
+        "pad_between_seqs",
+    }
 
 
 class TestStaticInputs:
@@ -987,6 +1063,63 @@ class TestStaticInputs:
 
         assert static_inputs["padding_mask"].shape == (1, 128)
         assert not static_inputs["padding_mask"].any()
+
+        graph_kwargs = {
+            name: static_inputs[name]
+            for name in (
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
+            )
+        }
+        layer._reconstruct_packed_seq_params_from_kwargs(graph_kwargs)
+        capture_params = graph_kwargs["packed_seq_params"]
+        for name in (
+            "cu_seqlens_q",
+            "cu_seqlens_kv",
+            "cu_seqlens_q_padded",
+            "cu_seqlens_kv_padded",
+        ):
+            assert (
+                packed_seq_params_module.get_packed_seq_cpu_metadata(capture_params, name)
+                is not None
+            )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hybrid_static_inputs_inherit_capture_cpu_metadata(self):
+        inner_layer = _build_layer(256, 4, 4, 1024, 128, 8)
+        inner_layer.config.sequence_packing_scheduler = "dp_balanced"
+        inner_layer.config.cuda_graph_impl = "transformer_engine"
+        inner_layer.config.num_residual_streams = 1
+        wrapper = object.__new__(HyperConnectionHybridLayer)
+        object.__setattr__(wrapper, "inner_layer", inner_layer)
+        object.__setattr__(wrapper, "config", inner_layer.config)
+
+        static_inputs = wrapper.get_layer_static_inputs(seq_length=128, micro_batch_size=1)
+        graph_kwargs = {
+            name: static_inputs[name]
+            for name in (
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
+            )
+        }
+        wrapper._reconstruct_packed_seq_params_from_kwargs(graph_kwargs)
+
+        capture_params = graph_kwargs["packed_seq_params"]
+        for name in (
+            "cu_seqlens_q",
+            "cu_seqlens_kv",
+            "cu_seqlens_q_padded",
+            "cu_seqlens_kv_padded",
+        ):
+            assert (
+                packed_seq_params_module.get_packed_seq_cpu_metadata(capture_params, name)
+                is not None
+            )
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

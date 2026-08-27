@@ -15,7 +15,12 @@ from megatron.core import tensor_parallel
 from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    bind_packed_seq_cpu_metadata,
+    get_packed_seq_cpu_metadata,
+    resolve_cp_group,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
@@ -31,13 +36,6 @@ from megatron.core.ssm.gated_delta_net.internal_gdn_backend import (
     chunk_gated_delta_rule as internal_chunk_gated_delta_rule,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
-
-
-def _current_cpu_metadata(device_offsets, cpu_offsets, recorded_version):
-    """Return a CPU mirror only while it matches the device tensor version."""
-    if cpu_offsets is None or recorded_version != getattr(device_offsets, "_version", None):
-        return None
-    return cpu_offsets
 
 
 class GatedDeltaNet(_GDNBase):
@@ -194,24 +192,17 @@ class GatedDeltaNet(_GDNBase):
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
 
-            # Resolve and validate host metadata once per device-tensor version.
+            # Bind once outside graph capture; ownership checks make stale host mirrors unusable.
             q_is_padded = packed_seq_params.cu_seqlens_q_padded is not None
-            q_source = (
-                packed_seq_params.cu_seqlens_q_padded
-                if q_is_padded
-                else packed_seq_params.cu_seqlens_q
-            )
-            q_cpu = (
-                packed_seq_params.cu_seqlens_q_padded_cpu
-                if q_is_padded
-                else packed_seq_params.cu_seqlens_q_cpu
-            )
-            q_version = (
-                packed_seq_params.cu_seqlens_q_padded_version
-                if q_is_padded
-                else packed_seq_params.cu_seqlens_q_version
-            )
-            q_cpu = _current_cpu_metadata(q_source, q_cpu, q_version)
+            q_name = "cu_seqlens_q_padded" if q_is_padded else "cu_seqlens_q"
+            q_cpu = get_packed_seq_cpu_metadata(packed_seq_params, q_name)
+            if q_cpu is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "PackedSeqParams CPU metadata must be bound before CUDA graph capture."
+                    )
+                bind_packed_seq_cpu_metadata(packed_seq_params)
+                q_cpu = get_packed_seq_cpu_metadata(packed_seq_params, q_name)
             cu_seqlens_q, cu_seqlens_q_cpu = self._resolve_cu_seqlens_metadata(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
@@ -221,34 +212,10 @@ class GatedDeltaNet(_GDNBase):
                 "cu_seqlens_q",
                 cp_size=cp_size_runtime,
             )
-            if q_is_padded:
-                packed_seq_params.cu_seqlens_q_padded_cpu = cu_seqlens_q_cpu
-                packed_seq_params.cu_seqlens_q_padded_version = q_source._version
-            else:
-                packed_seq_params.cu_seqlens_q_cpu = cu_seqlens_q_cpu
-                packed_seq_params.cu_seqlens_q_version = q_source._version
 
             kv_is_padded = packed_seq_params.cu_seqlens_kv_padded is not None
-            cu_seqlens_kv_source = (
-                packed_seq_params.cu_seqlens_kv_padded
-                if kv_is_padded
-                else packed_seq_params.cu_seqlens_kv
-            )
-            cu_seqlens_kv_cpu = (
-                packed_seq_params.cu_seqlens_kv_padded_cpu
-                if kv_is_padded
-                else packed_seq_params.cu_seqlens_kv_cpu
-            )
-            cu_seqlens_kv_version = (
-                packed_seq_params.cu_seqlens_kv_padded_version
-                if kv_is_padded
-                else packed_seq_params.cu_seqlens_kv_version
-            )
-            cu_seqlens_kv_cpu = _current_cpu_metadata(
-                cu_seqlens_kv_source, cu_seqlens_kv_cpu, cu_seqlens_kv_version
-            )
-            if cu_seqlens_kv_source is cu_seqlens_q and cu_seqlens_kv_cpu is None:
-                cu_seqlens_kv_cpu = cu_seqlens_q_cpu
+            kv_name = "cu_seqlens_kv_padded" if kv_is_padded else "cu_seqlens_kv"
+            cu_seqlens_kv_cpu = get_packed_seq_cpu_metadata(packed_seq_params, kv_name)
             cu_seqlens_kv, cu_seqlens_kv_cpu = self._resolve_cu_seqlens_metadata(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
@@ -258,12 +225,6 @@ class GatedDeltaNet(_GDNBase):
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
             )
-            if kv_is_padded:
-                packed_seq_params.cu_seqlens_kv_padded_cpu = cu_seqlens_kv_cpu
-                packed_seq_params.cu_seqlens_kv_padded_version = cu_seqlens_kv_source._version
-            else:
-                packed_seq_params.cu_seqlens_kv_cpu = cu_seqlens_kv_cpu
-                packed_seq_params.cu_seqlens_kv_version = cu_seqlens_kv_source._version
             assert torch.equal(cu_seqlens_q_cpu, cu_seqlens_kv_cpu), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
                 f"but got {cu_seqlens_q_cpu=} and {cu_seqlens_kv_cpu=}"

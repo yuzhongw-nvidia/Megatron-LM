@@ -43,7 +43,7 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, bind_packed_seq_cpu_metadata
 
 try:
     from packaging.version import Version as PkgVersion
@@ -2617,31 +2617,16 @@ def get_thd_batch_on_this_cp_rank(
     sequence dimension into multiple chunks, which are parallelized
     across GPUs in a context parallel group.
     """
-    cu_seqlens_cpu = cu_seqlens.detach().to(device="cpu")
-    cu_seqlens_padded_cpu = (
-        None if cu_seqlens_padded is None else cu_seqlens_padded.detach().to(device="cpu")
-    )
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
         cu_seqlens_q_padded=cu_seqlens_padded,
         cu_seqlens_kv_padded=cu_seqlens_padded,
-        cu_seqlens_q_cpu=cu_seqlens_cpu,
-        cu_seqlens_kv_cpu=cu_seqlens_cpu,
-        cu_seqlens_q_padded_cpu=cu_seqlens_padded_cpu,
-        cu_seqlens_kv_padded_cpu=cu_seqlens_padded_cpu,
-        cu_seqlens_q_version=cu_seqlens._version,
-        cu_seqlens_kv_version=cu_seqlens._version,
-        cu_seqlens_q_padded_version=(
-            None if cu_seqlens_padded is None else cu_seqlens_padded._version
-        ),
-        cu_seqlens_kv_padded_version=(
-            None if cu_seqlens_padded is None else cu_seqlens_padded._version
-        ),
         max_seqlen_q=int(max_seqlen[0].item()),
         max_seqlen_kv=int(max_seqlen[0].item()),
     )
+    bind_packed_seq_cpu_metadata(packed_seq_params)
 
     cp_size = parallel_state.get_context_parallel_world_size() if cp_size is None else cp_size
     cp_rank = parallel_state.get_context_parallel_rank() if cp_rank is None else cp_rank
