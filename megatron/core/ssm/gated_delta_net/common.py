@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Protocol, Union
@@ -316,9 +317,9 @@ class _GDNBase(MegatronModule):
             tp_group=self.pg_collection.tp,
             name=(name + ".out_proj") if name is not None else None,
         )
-        # TODO: Packed sequence cu_seqlens can vary per batch; cache only static SBHD
-        # cp_context entries here and revisit routing metadata lifetime in the CP layout refactor.
-        self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
+        self._chunkwise_cp_context_cache: OrderedDict[
+            tuple[str, int | None, int, int | None, int, int], tuple[torch.Tensor, object]
+        ] = OrderedDict()
 
         self.reset_parameters()
 
@@ -481,12 +482,48 @@ class _GDNBase(MegatronModule):
         self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
     ) -> torch.Tensor:
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
+        cu_seqlens, _ = self._resolve_cu_seqlens_metadata(
+            cu_seqlens_padded, cu_seqlens_actual, None, None, total_seq_len, name, cp_size=cp_size
+        )
+        return cu_seqlens
+
+    def _resolve_cu_seqlens_metadata(
+        self,
+        cu_seqlens_padded,
+        cu_seqlens_actual,
+        cu_seqlens_padded_cpu,
+        cu_seqlens_actual_cpu,
+        total_seq_len,
+        name,
+        cp_size: int = 1,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve device offsets and validate their trusted CPU metadata once."""
         if cu_seqlens_padded is not None:
             cu_seqlens = cu_seqlens_padded
+            cu_seqlens_cpu = cu_seqlens_padded_cpu
         else:
             cu_seqlens = cu_seqlens_actual
+            cu_seqlens_cpu = cu_seqlens_actual_cpu
 
-        total_cu = cu_seqlens[-1].cpu().item()
+        if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
+            raise ValueError(f"GDN: {name} must be a 1D tensor with at least two offsets.")
+        if cu_seqlens_cpu is None:
+            cu_seqlens_cpu = cu_seqlens.detach().to(device="cpu")
+        elif cu_seqlens_cpu.device.type != "cpu":
+            raise ValueError(f"GDN: trusted {name}_cpu metadata must be on CPU.")
+        if (
+            cu_seqlens_cpu.shape != cu_seqlens.shape
+            or cu_seqlens_cpu.dtype != cu_seqlens.dtype
+            or not cu_seqlens_cpu.is_contiguous()
+        ):
+            raise ValueError(
+                f"GDN: trusted {name}_cpu metadata must match {name} shape and dtype "
+                "and be contiguous."
+            )
+        if cu_seqlens_cpu[0].item() != 0:
+            raise ValueError(f"GDN: {name}[0] must be 0.")
+
+        total_cu = cu_seqlens_cpu[-1].item()
         if total_cu != total_seq_len:
             raise ValueError(
                 f"GDN: {name}[-1]={total_cu} does not match "
@@ -494,14 +531,19 @@ class _GDNBase(MegatronModule):
                 f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
             )
 
-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        seq_lengths = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
+        if (seq_lengths <= 0).any():
+            raise ValueError(
+                f"All per-sequence lengths in {name} must be positive, "
+                f"but got: {seq_lengths.tolist()}"
+            )
         if (seq_lengths % cp_size != 0).any():
             raise ValueError(
                 f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
                 f"but got lengths: {seq_lengths.tolist()}"
             )
 
-        return cu_seqlens
+        return cu_seqlens, cu_seqlens_cpu
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""

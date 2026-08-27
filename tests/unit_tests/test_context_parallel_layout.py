@@ -141,6 +141,78 @@ def test_sbhd_layout_redistribution_plan_reassembles_target_segments(
         )
 
 
+@pytest.mark.parametrize(
+    ("source_layout", "target_layout"), [("zigzag", "contiguous"), ("contiguous", "zigzag")]
+)
+def test_sbhd_layout_redistribution_supports_odd_local_length(
+    monkeypatch, source_layout, target_layout
+):
+    cp_size = 4
+    local_seq_len = 7
+    segment_lengths = [
+        (local_seq_len + 1) // 2 if segment_id % 2 == 0 else local_seq_len // 2
+        for segment_id in range(2 * cp_size)
+    ]
+    global_tokens = torch.arange(sum(segment_lengths))
+    global_segments = global_tokens.split(segment_lengths)
+    local_inputs = []
+    sends = [[None] * cp_size for _ in range(cp_size)]
+
+    for source_rank in range(cp_size):
+        source_ids = context_parallel_layout_conversion._local_sbhd_segment_ids(
+            layout=source_layout, cp_size=cp_size, cp_rank=source_rank
+        )
+        source_segments = [global_segments[segment_id] for segment_id in source_ids]
+        local_inputs.append(torch.cat(source_segments))
+        plan = context_parallel_layout_conversion._build_sbhd_layout_redistribution_plan(
+            source_layout=source_layout,
+            target_layout=target_layout,
+            cp_size=cp_size,
+            cp_rank=source_rank,
+        )
+        packed_segments = [source_segments[slot] for slot in plan.send_slots]
+        offset = 0
+        for destination, count in enumerate(plan.input_segment_counts):
+            destination_segments = packed_segments[offset : offset + count]
+            sends[source_rank][destination] = (
+                torch.cat(destination_segments)
+                if destination_segments
+                else torch.empty(0, dtype=global_tokens.dtype)
+            )
+            offset += count
+
+    for target_rank in range(cp_size):
+        received = torch.cat([sends[source_rank][target_rank] for source_rank in range(cp_size)])
+        expected_input_splits = [
+            sends[target_rank][destination].numel() for destination in range(cp_size)
+        ]
+        expected_output_splits = [
+            sends[source_rank][target_rank].numel() for source_rank in range(cp_size)
+        ]
+        expected_send = torch.cat(sends[target_rank])
+
+        def fake_all_to_all(*, input_, input_split_sizes, output_split_sizes_, **_kwargs):
+            assert torch.equal(input_, expected_send)
+            assert input_split_sizes == expected_input_splits
+            assert output_split_sizes_ == expected_output_splits
+            return received
+
+        monkeypatch.setattr(context_parallel_layout_conversion, "all_to_all", fake_all_to_all)
+        output = context_parallel_layout_conversion._redistribute_sbhd_layout(
+            input_=local_inputs[target_rank],
+            cp_group=_FakeGroup(cp_size, target_rank),
+            source_layout=source_layout,
+            target_layout=target_layout,
+            sequence_parallel=False,
+            tp_group=None,
+            tp_cp_group=None,
+        )
+        target_ids = context_parallel_layout_conversion._local_sbhd_segment_ids(
+            layout=target_layout, cp_size=cp_size, cp_rank=target_rank
+        )
+        assert torch.equal(output, torch.cat([global_segments[index] for index in target_ids]))
+
+
 def test_sbhd_layout_redistribution_rejects_odd_tensor_parallel_size():
     with pytest.raises(ValueError, match="even tensor-parallel size"):
         context_parallel_layout_conversion._sbhd_segments_per_rank(tp_size=3)

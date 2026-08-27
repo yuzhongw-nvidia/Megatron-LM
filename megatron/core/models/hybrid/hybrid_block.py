@@ -21,7 +21,11 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    bind_packed_seq_cpu_metadata,
+    ensure_packed_seq_cpu_metadata,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_parallel.random import MHCCheckpointManager
@@ -151,6 +155,11 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             static_inputs = self.inner_layer.get_layer_static_inputs(seq_length, micro_batch_size)
         else:
             static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        capture_cpu_metadata = getattr(
+            self.inner_layer, "_cuda_graph_packed_seq_cpu_metadata", None
+        )
+        if capture_cpu_metadata is not None:
+            self._cuda_graph_packed_seq_cpu_metadata = capture_cpu_metadata
         hs = static_inputs["hidden_states"]
         n = self.config.num_residual_streams
         static_inputs["hidden_states"] = torch.ones(
@@ -161,12 +170,12 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         )
         return static_inputs
 
-    @staticmethod
-    def _decompose_packed_seq_params_to_kwargs(kwargs):
+    def _decompose_packed_seq_params_to_kwargs(self, kwargs):
         """Decompose PackedSeqParams into tensor kwargs for TE CUDA graphs."""
         packed_seq_params = kwargs.pop('packed_seq_params', None)
         if packed_seq_params is None:
             return
+        self._cuda_graph_packed_seq_cpu_metadata = ensure_packed_seq_cpu_metadata(packed_seq_params)
         kwargs['cu_seqlens_q'] = packed_seq_params.cu_seqlens_q
         kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
         kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
@@ -190,6 +199,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             # between replay batches. Use the conservative THD-safe branch.
             pad_between_seqs=True,
         )
+        cpu_metadata = getattr(self, '_cuda_graph_packed_seq_cpu_metadata', None)
+        if cpu_metadata is not None:
+            bind_packed_seq_cpu_metadata(packed_seq_params, cpu_metadata)
         kwargs['packed_seq_params'] = packed_seq_params
 
     def __call__(self, *args, **kwargs):

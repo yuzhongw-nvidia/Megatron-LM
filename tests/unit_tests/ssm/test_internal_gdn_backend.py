@@ -103,6 +103,142 @@ def test_auto_mode_falls_back_for_unsupported_inputs(monkeypatch):
     assert implementation.chunk_gated_delta_rule(**_inputs()) is expected
 
 
+@pytest.mark.parametrize("mode", ["fla", "auto"])
+def test_dense_batch_cp_fla_dispatch_slices_only_the_gdr_operator(monkeypatch, mode):
+    implementation = _implementation()
+    base = torch.arange(2 * 2 * 3 * 4, dtype=torch.float32).reshape(2, 2, 3, 4)
+    inputs = {
+        "q": base,
+        "k": torch.empty_like(base),
+        "v": torch.empty_like(base),
+        "g": torch.empty(base.shape[:-1]),
+        "beta": torch.empty(base.shape[:-1]),
+    }
+    local_cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    cp_context = SimpleNamespace(
+        group=object(), cu_seqlens=local_cu_seqlens, cu_seqlens_cpu=local_cu_seqlens
+    )
+    calls = []
+
+    def fla(**kwargs):
+        assert kwargs["q"].shape[0] == 1, "FLA CP requires one physical batch slice"
+        calls.append(kwargs)
+        return kwargs["q"] + len(calls), None
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", mode)
+    monkeypatch.setattr(implementation, "fla_chunk_gated_delta_rule", fla)
+    if mode == "fla":
+        monkeypatch.setattr(
+            implementation,
+            "_cutedsl_support_reason",
+            lambda **_kwargs: pytest.fail("explicit FLA mode must bypass CuTe support checks"),
+        )
+    else:
+        monkeypatch.setattr(
+            implementation, "_cutedsl_support_reason", lambda **_kwargs: "unsupported test input"
+        )
+
+    output, final_state = implementation.chunk_gated_delta_rule(**inputs, cp_context=cp_context)
+
+    assert final_state is None
+    assert len(calls) == 2
+    assert all(call["cp_context"] is cp_context for call in calls)
+    torch.testing.assert_close(output[0], base[0] + 1)
+    torch.testing.assert_close(output[1], base[1] + 2)
+
+
+def test_public_dispatch_does_not_trust_unvalidated_device_cu_seqlens(monkeypatch):
+    implementation = _implementation()
+    expected = (torch.empty(1), None)
+    seen = {}
+
+    def support_reason(**kwargs):
+        seen.update(kwargs)
+        return "unsupported test input"
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.setattr(implementation, "_cutedsl_support_reason", support_reason)
+    monkeypatch.setattr(implementation, "fla_chunk_gated_delta_rule", lambda **_kwargs: expected)
+
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    assert implementation.chunk_gated_delta_rule(**_inputs(), cu_seqlens=cu_seqlens) is expected
+    assert seen["trust_device_cu_seqlens"] is False
+
+
+def test_public_dispatch_does_not_trust_device_only_chunk_offsets(monkeypatch):
+    implementation = _implementation()
+    expected = (torch.empty(1), None)
+    seen = {}
+
+    def support_reason(**kwargs):
+        seen.update(kwargs)
+        return "unsupported test input"
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.setattr(implementation, "_cutedsl_support_reason", support_reason)
+    monkeypatch.setattr(implementation, "fla_chunk_gated_delta_rule", lambda **_kwargs: expected)
+
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    chunk_offsets = torch.tensor([0, 1], dtype=torch.int32)
+    assert (
+        implementation.chunk_gated_delta_rule(
+            **_inputs(), cu_seqlens=cu_seqlens, validated_chunk_offsets=chunk_offsets
+        )
+        is expected
+    )
+    assert seen["trust_device_cu_seqlens"] is False
+
+
+def test_public_dispatch_trusts_validated_cpu_metadata(monkeypatch):
+    implementation = _implementation()
+    expected = (torch.empty(1), None)
+    seen = {}
+
+    def support_reason(**kwargs):
+        seen.update(kwargs)
+        return "unsupported test input"
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.setattr(implementation, "_cutedsl_support_reason", support_reason)
+    monkeypatch.setattr(implementation, "fla_chunk_gated_delta_rule", lambda **_kwargs: expected)
+
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    cu_seqlens_cpu = cu_seqlens.clone()
+    assert (
+        implementation.chunk_gated_delta_rule(
+            **_inputs(), cu_seqlens=cu_seqlens, cu_seqlens_cpu=cu_seqlens_cpu
+        )
+        is expected
+    )
+    assert seen["trust_device_cu_seqlens"] is True
+
+
+def test_standard_thd_batch_factory_populates_trusted_cpu_metadata():
+    from megatron.core.utils import get_thd_batch_on_this_cp_rank
+
+    cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
+    _, packed_seq_params = get_thd_batch_on_this_cp_rank(
+        {"tokens": torch.empty(1, 8, dtype=torch.long)},
+        cu_seqlens,
+        cu_seqlens_padded,
+        torch.tensor([4]),
+        cp_size=1,
+        cp_rank=0,
+    )
+
+    from megatron.core.packed_seq_params import get_packed_seq_cpu_metadata
+
+    q_cpu = get_packed_seq_cpu_metadata(packed_seq_params, "cu_seqlens_q")
+    kv_cpu = get_packed_seq_cpu_metadata(packed_seq_params, "cu_seqlens_kv")
+    q_padded_cpu = get_packed_seq_cpu_metadata(packed_seq_params, "cu_seqlens_q_padded")
+    kv_padded_cpu = get_packed_seq_cpu_metadata(packed_seq_params, "cu_seqlens_kv_padded")
+    assert q_cpu is kv_cpu
+    assert q_padded_cpu is kv_padded_cpu
+    torch.testing.assert_close(q_cpu, cu_seqlens)
+    torch.testing.assert_close(q_padded_cpu, cu_seqlens_padded)
+
+
 def test_cute_mode_rejects_unsupported_inputs(monkeypatch):
     implementation = _implementation()
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "cute")
@@ -116,8 +252,9 @@ def test_cute_mode_rejects_unsupported_inputs(monkeypatch):
 
 @pytest.mark.parametrize("recompute_h", [False, True])
 @pytest.mark.parametrize("scale, expected_scale", [(None, 0.5), (0.0, 0.0)])
+@pytest.mark.parametrize("use_cp", [False, True], ids=["non_cp", "cp"])
 def test_cute_mode_dispatches_to_local_autograd_function(
-    monkeypatch, scale, expected_scale, recompute_h
+    monkeypatch, scale, expected_scale, recompute_h, use_cp
 ):
     implementation = _implementation()
     inputs = _inputs()
@@ -134,11 +271,386 @@ def test_cute_mode_dispatches_to_local_autograd_function(
         implementation, "InternalChunkGatedDeltaRuleFunction", SimpleNamespace(apply=apply)
     )
 
-    result = implementation.chunk_gated_delta_rule(**inputs, scale=scale, recompute_h=recompute_h)
+    local_cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    cp_context = (
+        SimpleNamespace(
+            group=object(), cu_seqlens=local_cu_seqlens, cu_seqlens_cpu=local_cu_seqlens.cpu()
+        )
+        if use_cp
+        else None
+    )
+    result = implementation.chunk_gated_delta_rule(
+        **inputs, scale=scale, recompute_h=recompute_h, cp_context=cp_context
+    )
     assert result is expected
 
     assert calls[0][5] == expected_scale
-    assert calls[0][8] is recompute_h
+    assert calls[0][8] is None
+    assert calls[0][9] is recompute_h
+    assert calls[0][10] is cp_context
+
+
+@pytest.mark.parametrize("use_saved_h", [False, True])
+def test_cp_backward_preprocessing_produces_fused_dht_and_state(monkeypatch, use_saved_h):
+    implementation = _implementation()
+    shape = (1, 64, 2, 4)
+    scalar_shape = shape[:-1]
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    g = torch.empty(scalar_shape, dtype=torch.float32)
+    beta = torch.empty(scalar_shape, dtype=torch.float32)
+    A = torch.empty((*scalar_shape, 64), dtype=torch.bfloat16)
+    do = torch.empty_like(q)
+    compressed_initial_state = torch.empty((1, 2, 4, 4), dtype=torch.float32)
+    expanded_initial_state = torch.empty_like(compressed_initial_state)
+    recomputed_h = torch.empty((1, 1, 2, 4, 4), dtype=torch.float32)
+    saved_h = torch.empty((1, 2, 4, 4), dtype=torch.bfloat16)
+    expected_h = saved_h if use_saved_h else recomputed_h
+    expected_dht = torch.empty((1, 2, 4, 4), dtype=torch.float32)
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
+    dv = torch.empty_like(v)
+    cp_context = SimpleNamespace(group=object())
+    seen = {}
+
+    monkeypatch.setattr(implementation, "recompute_w_u_fwd", lambda **_kwargs: (w, u))
+    monkeypatch.setattr(
+        implementation, "expand_h0", lambda initial_state, *, context: expanded_initial_state
+    )
+
+    def fwd_h(**kwargs):
+        seen["fwd_h_initial_state"] = kwargs["initial_state"]
+        return recomputed_h, torch.empty_like(v), None
+
+    def cp_preprocess(**kwargs):
+        seen["cp_preprocess"] = kwargs
+        return expected_dht, None
+
+    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_fwd_h", fwd_h)
+    monkeypatch.setattr(implementation, "chunk_bwd_dv_local", lambda **_kwargs: dv)
+    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_bwd_dhu_pre_process", cp_preprocess)
+
+    actual_dht, actual_h = implementation._fla_cp_backward_preprocess(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A=A,
+        scale=0.5,
+        do=do,
+        dht=None,
+        cu_seqlens=None,
+        chunk_indices=None,
+        initial_state=compressed_initial_state,
+        cp_context=cp_context,
+        h=saved_h if use_saved_h else None,
+    )
+
+    assert actual_dht is expected_dht
+    assert actual_h is expected_h
+    assert ("fwd_h_initial_state" in seen) is not use_saved_h
+    if not use_saved_h:
+        assert seen["fwd_h_initial_state"] is expanded_initial_state
+    assert seen["cp_preprocess"]["w"] is w
+    assert seen["cp_preprocess"]["dv"] is dv
+    assert seen["cp_preprocess"]["initial_state"] is expanded_initial_state
+    assert seen["cp_preprocess"]["context"] is cp_context
+
+
+def test_cutedsl_cp_backward_feeds_preprocessed_dht_to_fused_kernel(monkeypatch):
+    implementation = _implementation()
+    shape = (1, 64, 64, 128)
+    scalar_shape = shape[:-1]
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    inputs = {
+        "q": q,
+        "k": torch.empty_like(q),
+        "v": torch.empty_like(q),
+        "g": torch.empty(scalar_shape, dtype=torch.float32),
+        "beta": torch.empty(scalar_shape, dtype=torch.float32),
+        "A": torch.empty((*scalar_shape, 64), dtype=torch.bfloat16),
+        "do": torch.empty_like(q),
+    }
+    cp_context = SimpleNamespace(group=object())
+    initial_state = torch.empty((1, 64, 128, 128), dtype=torch.float32)
+    cp_dht = torch.empty_like(initial_state)
+    cp_h = torch.empty((1, 64, 128, 128), dtype=torch.bfloat16)
+    expected = tuple(torch.empty(1) for _ in range(5))
+    seen = {}
+
+    monkeypatch.setattr(implementation, "_fused_bwd_support_reason", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        implementation, "_fla_cp_backward_preprocess", lambda **_kwargs: (cp_dht, cp_h)
+    )
+
+    def fused(**kwargs):
+        seen.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(implementation, "_call_fused_gdr_bwd_cute", fused)
+
+    result = implementation._cutedsl_backward(
+        **inputs,
+        scale=128**-0.5,
+        dht=None,
+        cu_seqlens=None,
+        chunk_indices=None,
+        initial_state=initial_state,
+        cp_context=cp_context,
+    )
+
+    assert result is expected
+    assert seen["dht"] is cp_dht
+    assert seen["h"] is cp_h
+
+
+def test_cutedsl_cp_auto_fallback_preserves_cp_boundary_inputs(monkeypatch):
+    implementation = _implementation()
+    shape = (1, 64, 64, 128)
+    scalar_shape = shape[:-1]
+    q = torch.empty(shape, dtype=torch.float32)
+    inputs = {
+        "q": q,
+        "k": torch.empty_like(q),
+        "v": torch.empty_like(q),
+        "g": torch.empty(scalar_shape),
+        "beta": torch.empty(scalar_shape),
+        "A": torch.empty((*scalar_shape, 64)),
+        "do": torch.empty_like(q),
+    }
+    cp_context = SimpleNamespace(group=object())
+    initial_state = torch.empty((1, 64, 128, 128), dtype=torch.float32)
+    dht = torch.empty_like(initial_state)
+    expected = tuple(torch.empty(1) for _ in range(5))
+    seen = {}
+
+    monkeypatch.setattr(
+        implementation, "_fused_bwd_support_reason", lambda **_kwargs: "unsupported"
+    )
+    monkeypatch.setattr(implementation, "_backend_mode", lambda: "auto")
+
+    def fla_backward(**kwargs):
+        seen.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(implementation, "_fla_backward", fla_backward)
+
+    result = implementation._cutedsl_backward(
+        **inputs,
+        scale=128**-0.5,
+        dht=dht,
+        cu_seqlens=None,
+        chunk_indices=None,
+        initial_state=initial_state,
+        cp_context=cp_context,
+    )
+
+    assert result is expected
+    assert seen["dht"] is dht
+    assert seen["initial_state"] is initial_state
+    assert seen["cp_context"] is cp_context
+
+
+def test_cp_fla_fallback_uses_exp2_gate_semantics(monkeypatch):
+    implementation = _implementation()
+    tensor = torch.zeros((1, 1, 1, 1), dtype=torch.float32)
+    dht = torch.zeros_like(tensor)
+    initial_state = torch.zeros_like(tensor)
+    calls = {}
+
+    def call_fla_compat(function, **kwargs):
+        calls[function] = kwargs
+        if function is implementation.recompute_w_u_fwd:
+            return tensor, tensor
+        if function is implementation.chunk_gated_delta_rule_fwd_h:
+            return tensor, tensor, None
+        if function is implementation.chunk_bwd_dv_local:
+            return tensor
+        if function is implementation.chunk_gated_delta_rule_bwd_dhu_pre_process:
+            return dht, initial_state
+        if function is implementation.chunk_gated_delta_rule_bwd_dhu:
+            return tensor, tensor, tensor
+        if function is implementation.chunk_bwd_dqkwg:
+            return tensor, tensor.clone(), tensor, tensor.clone()
+        if function is implementation.prepare_wy_repr_bwd:
+            return tensor, tensor, tensor, tensor
+        raise AssertionError(f"unexpected FLA primitive: {function}")
+
+    monkeypatch.setattr(implementation, "_call_fla_compat", call_fla_compat)
+    monkeypatch.setattr(implementation, "expand_h0", lambda state, *, context: state)
+    monkeypatch.setattr(implementation, "chunk_local_cumsum", lambda value, **_kwargs: value)
+
+    implementation._fla_backward(
+        q=tensor,
+        k=tensor,
+        v=tensor,
+        g=tensor,
+        beta=tensor,
+        A=tensor,
+        scale=1.0,
+        do=tensor,
+        cu_seqlens=None,
+        chunk_indices=None,
+        dht=dht,
+        initial_state=initial_state,
+        cp_context=SimpleNamespace(group=object()),
+    )
+
+    gate_primitives = (
+        implementation.recompute_w_u_fwd,
+        implementation.chunk_gated_delta_rule_fwd_h,
+        implementation.chunk_bwd_dv_local,
+        implementation.chunk_gated_delta_rule_bwd_dhu_pre_process,
+        implementation.chunk_gated_delta_rule_bwd_dhu,
+        implementation.chunk_bwd_dqkwg,
+        implementation.prepare_wy_repr_bwd,
+    )
+    assert all(calls[function]["use_exp2"] is True for function in gate_primitives)
+
+
+def test_dense_batch_cp_forward_batches_local_compute_and_slices_boundaries(monkeypatch):
+    implementation = _implementation()
+    shape = (2, 64, 2, 4)
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    g = torch.empty(shape[:-1], dtype=torch.float32)
+    beta = torch.empty(shape[:-1], dtype=torch.bfloat16)
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
+    A = torch.empty((*shape[:-1], 64), dtype=torch.bfloat16)
+    h = torch.empty((2, 1, 2, 4, 4), dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+    cp_context = SimpleNamespace(cu_seqlens=torch.tensor([0, 64], dtype=torch.int32))
+    calls = {"intra": [], "cp_boundary": [], "fwd_h": [], "output": []}
+
+    monkeypatch.setattr(implementation, "chunk_local_cumsum", lambda value, **_kwargs: value)
+
+    def intra(**kwargs):
+        calls["intra"].append(kwargs["k"].shape)
+        return w, u, A
+
+    def cp_boundary(**kwargs):
+        calls["cp_boundary"].append(kwargs["k"].shape)
+        return torch.empty((1, 2, 4, 4), dtype=torch.float32)
+
+    def fwd_h(**kwargs):
+        calls["fwd_h"].append((kwargs["k"].shape, kwargs["initial_state"].shape))
+        return h, u, None
+
+    def fwd_o(**kwargs):
+        calls["output"].append(kwargs["q"].shape)
+        return output
+
+    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_fwd_intra", intra)
+    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_fwd_h_pre_process", cp_boundary)
+    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_fwd_h", fwd_h)
+    monkeypatch.setattr(implementation, "chunk_fwd_o", fwd_o)
+    monkeypatch.setattr(implementation, "compress_h0", lambda state, *, context: state)
+
+    actual_g, actual_output, actual_A, saved_h, chunk_indices, initial_state = (
+        implementation._fla_forward_for_fused_bwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=0.5,
+            cu_seqlens=None,
+            cu_seqlens_cpu=None,
+            cp_context=cp_context,
+            save_fused_bwd_state=False,
+        )
+    )
+
+    assert actual_g is g
+    assert actual_output is output
+    assert actual_A is A
+    assert saved_h is None
+    assert chunk_indices is None
+    assert initial_state.shape == (2, 2, 4, 4)
+    assert calls == {
+        "intra": [torch.Size([2, 64, 2, 4])],
+        "cp_boundary": [torch.Size([1, 64, 2, 4])] * 2,
+        "fwd_h": [(torch.Size([2, 64, 2, 4]), torch.Size([2, 2, 4, 4]))],
+        "output": [torch.Size([2, 64, 2, 4])],
+    }
+
+
+def test_dense_batch_cp_backward_batches_local_compute_and_slices_boundaries(monkeypatch):
+    implementation = _implementation()
+    shape = (2, 64, 2, 4)
+    q = torch.zeros(shape, dtype=torch.bfloat16)
+    q[1].fill_(1)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    g = torch.empty(shape[:-1], dtype=torch.float32)
+    beta = torch.empty(shape[:-1], dtype=torch.bfloat16)
+    A = torch.empty((*shape[:-1], 64), dtype=torch.bfloat16)
+    do = torch.empty_like(q)
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
+    dv = torch.empty_like(v)
+    initial_state = torch.empty((2, 2, 4, 4), dtype=torch.float32)
+    h = torch.empty((2, 1, 2, 4, 4), dtype=torch.bfloat16)
+    cp_context = SimpleNamespace(cu_seqlens=torch.tensor([0, 64], dtype=torch.int32))
+    calls = {"recompute": [], "dv": [], "cp_boundary": []}
+
+    def recompute(**kwargs):
+        calls["recompute"].append(kwargs["k"].shape)
+        return w, u
+
+    def dv_local(**kwargs):
+        calls["dv"].append(kwargs["q"].shape)
+        return dv
+
+    def cp_boundary(**kwargs):
+        calls["cp_boundary"].append(kwargs["q"].shape)
+        batch_value = int(kwargs["q"][0, 0, 0, 0].item())
+        dht = torch.full((1, 2, 4, 4), batch_value, dtype=torch.float32)
+        return dht, None
+
+    monkeypatch.setattr(implementation, "recompute_w_u_fwd", recompute)
+    monkeypatch.setattr(implementation, "expand_h0", lambda state, *, context: state)
+    monkeypatch.setattr(implementation, "chunk_bwd_dv_local", dv_local)
+    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_bwd_dhu_pre_process", cp_boundary)
+
+    actual_dht, actual_h = implementation._fla_cp_backward_preprocess(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A=A,
+        scale=0.5,
+        do=do,
+        dht=None,
+        cu_seqlens=None,
+        chunk_indices=None,
+        initial_state=initial_state,
+        cp_context=cp_context,
+        h=h,
+    )
+
+    assert actual_h is h
+    assert actual_dht.shape == (2, 2, 4, 4)
+    assert torch.equal(actual_dht[:, 0, 0, 0], torch.tensor([0.0, 1.0]))
+    assert calls == {
+        "recompute": [torch.Size([2, 64, 2, 4])],
+        "dv": [torch.Size([2, 64, 2, 4])],
+        "cp_boundary": [torch.Size([1, 64, 2, 4])] * 2,
+    }
+
+
+def test_dense_cu_seqlens_reuses_cached_tensor():
+    implementation = _implementation()
+    first = implementation._dense_cu_seqlens(2, 64, torch.device("cpu"))
+    second = implementation._dense_cu_seqlens(2, 64, torch.device("cpu"))
+
+    assert first is second
+    assert first.tolist() == [0, 64, 128]
 
 
 @pytest.mark.parametrize("mode", ["auto", "cute"])
@@ -153,7 +665,7 @@ def test_forward_save_h_policy_is_shared_by_fla_and_cute(monkeypatch, mode, reco
     def fla_forward(**kwargs):
         seen.append(kwargs["save_fused_bwd_state"])
         h = saved_h if kwargs["save_fused_bwd_state"] else None
-        return kwargs["g"], q, torch.empty(1), h, None
+        return kwargs["g"], q, torch.empty(1), h, None, None
 
     def cute_forward(**kwargs):
         seen.append(kwargs["save_fused_bwd_state"])
@@ -180,7 +692,9 @@ def test_forward_save_h_policy_is_shared_by_fla_and_cute(monkeypatch, mode, reco
         0.5,
         None,
         None,
+        None,
         recompute_h,
+        None,
     )
 
     assert output is q and final_state is None
@@ -211,12 +725,14 @@ def test_fla_forward_can_save_fused_backward_h(monkeypatch, save_fused_bwd_state
     )
     monkeypatch.setattr(implementation, "chunk_fwd_o", lambda **kwargs: kwargs["q"])
 
-    _g, output, _A, saved_h, _chunk_indices = implementation._fla_forward_for_fused_bwd(
-        **inputs,
-        scale=0.5,
-        cu_seqlens=None,
-        cu_seqlens_cpu=None,
-        save_fused_bwd_state=save_fused_bwd_state,
+    _g, output, _A, saved_h, _chunk_indices, _initial_state = (
+        implementation._fla_forward_for_fused_bwd(
+            **inputs,
+            scale=0.5,
+            cu_seqlens=None,
+            cu_seqlens_cpu=None,
+            save_fused_bwd_state=save_fused_bwd_state,
+        )
     )
 
     assert output is inputs["q"]
@@ -332,11 +848,7 @@ def test_cutedsl_forward_uses_cached_dense_chunk_offsets(monkeypatch):
     monkeypatch.setattr(fused_gdr_fwd_cute, "chunk_gated_delta_rule_prefill_cute", launcher)
 
     _g, _output, _A, _saved_h, _chunk_indices, chunk_offsets = implementation._cutedsl_forward(
-        **inputs,
-        scale=0.5,
-        cu_seqlens=None,
-        cu_seqlens_cpu=None,
-        save_fused_bwd_state=True,
+        **inputs, scale=0.5, cu_seqlens=None, cu_seqlens_cpu=None, save_fused_bwd_state=True
     )
 
     assert seen["cu_seqlens"] is dense_metadata.cu_seqlens
@@ -569,6 +1081,24 @@ def test_fused_backward_zero_dht_cache_is_stream_scoped(monkeypatch):
     assert third is first
 
 
+def test_fused_backward_zero_dht_cache_evicts_to_byte_budget(monkeypatch):
+    implementation = _implementation()
+
+    implementation._fused_bwd_zero_dht_cache.clear()
+    monkeypatch.setattr(implementation, "_FUSED_BWD_ZERO_DHT_CACHE_MAX_BYTES", 5 * 1024 * 1024)
+    stream_keys = iter([(0, 1), (0, 2)])
+    monkeypatch.setattr(
+        implementation, "_current_stream_cache_key", lambda _device: next(stream_keys)
+    )
+
+    first = implementation._fused_bwd_zero_dht(torch.device("cpu"), 1)
+    second = implementation._fused_bwd_zero_dht(torch.device("cpu"), 1)
+
+    assert second is not first
+    assert len(implementation._fused_bwd_zero_dht_cache) == 1
+    assert next(iter(implementation._fused_bwd_zero_dht_cache.values())) is second
+
+
 @pytest.mark.parametrize("use_saved_h", [False, True])
 def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     batch_size = 3
@@ -744,9 +1274,7 @@ def test_fused_backward_varlen_metadata_cache_is_stream_scoped(monkeypatch):
     fused_bwd._clear_metadata_cache_for_test()
     cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32)
     stream_keys = iter([(0, 1), (0, 2), (0, 1)])
-    monkeypatch.setattr(
-        fused_bwd, "_current_stream_cache_key", lambda _tensor: next(stream_keys)
-    )
+    monkeypatch.setattr(fused_bwd, "_current_stream_cache_key", lambda _tensor: next(stream_keys))
 
     first = fused_bwd._prepare_varlen_metadata(cu_seqlens, total_tokens=128, chunk_size=64)
     second = fused_bwd._prepare_varlen_metadata(cu_seqlens, total_tokens=128, chunk_size=64)
@@ -796,17 +1324,17 @@ def test_fused_backward_support_reason_trusts_device_offsets_only_when_requested
         implementation._fused_bwd_support_reason(**kwargs)
         == "packed cu_seqlens host metadata is required for validation"
     )
-    assert implementation._fused_bwd_support_reason(
-        **kwargs, trust_device_cu_seqlens=True
-    ) is None
+    assert implementation._fused_bwd_support_reason(**kwargs, trust_device_cu_seqlens=True) is None
 
 
 @pytest.mark.parametrize(
     "dtype, batch_size, seqlen, offsets, expected_reason",
     [
         (torch.bfloat16, 2, 64, None, None),
+        (torch.bfloat16, 2, 65, None, None),
         (torch.float16, 2, 64, None, "fused backward requires bf16 inputs"),
         (torch.bfloat16, 1, 256, [0, 64, 192, 256], None),
+        (torch.bfloat16, 1, 257, [0, 65, 192, 257], None),
     ],
 )
 def test_fused_backward_shape_and_dtype_contract(
@@ -834,6 +1362,28 @@ def test_fused_backward_shape_and_dtype_contract(
     assert reason == expected_reason
 
 
+def test_fused_backward_metadata_uses_per_sequence_ceil_chunks():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_bwd_cute import (
+        fused_bwd,
+    )
+
+    offsets = torch.tensor([0, 65, 128], dtype=torch.int32)
+    metadata = fused_bwd._prepare_varlen_metadata(offsets, total_tokens=128, chunk_size=64)
+
+    assert metadata.chunk_offsets.tolist() == [0, 2, 3]
+    assert metadata.num_sequences == 2
+    assert metadata.num_chunks == 3
+    assert metadata.uniform_sequence_length == 0
+    assert metadata.has_partial_chunks is True
+
+    uniform_tail_offsets = torch.tensor([0, 65, 130], dtype=torch.int32)
+    uniform_tail = fused_bwd._prepare_varlen_metadata(
+        uniform_tail_offsets, total_tokens=130, chunk_size=64
+    )
+    assert uniform_tail.uniform_sequence_length == 0
+    assert uniform_tail.has_partial_chunks is True
+
+
 def test_fused_backward_kernel_uses_named_layout_contracts():
     package = (
         Path(__file__).parents[3]
@@ -841,11 +1391,7 @@ def test_fused_backward_kernel_uses_named_layout_contracts():
         / "fused_gdr_bwd_cute"
     )
     kernel_source = (package / "kernel.py").read_text()
-    for positional_wiring in (
-        "mma_variants[",
-        "packed_layouts[",
-        "tma_inputs[",
-    ):
+    for positional_wiring in ("mma_variants[", "packed_layouts[", "tma_inputs["):
         assert positional_wiring not in kernel_source
 
     layouts_tree = ast.parse((package / "layouts.py").read_text())

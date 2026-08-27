@@ -89,6 +89,16 @@ except ImportError:
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 
 
+def _get_te_packed_seq_params_fields(te_version: PkgVersion) -> Set[str]:
+    """Return only PackedSeqParams kwargs accepted by TE attention."""
+    fields = {"qkv_format", "cu_seqlens_q", "cu_seqlens_kv", "pad_between_seqs"}
+    if te_version >= PkgVersion("1.3.0"):
+        fields.update(("max_seqlen_q", "max_seqlen_kv"))
+    if te_version >= PkgVersion("1.10.0"):
+        fields.update(("cu_seqlens_q_padded", "cu_seqlens_kv_padded"))
+    return fields
+
+
 class TransformerEngineConfigType(enum.Enum):
     """Configuration object types in config dictionary"""
 
@@ -1733,33 +1743,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
             extra_kwargs["softmax_type"] = self.config.softmax_type
 
-        self.kept_packed_seq_params = set(
-            field.name for field in dataclasses.fields(PackedSeqParams)
-        )
-
-        if get_te_version() < PkgVersion("1.3.0"):
-            # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H
-            # copies (#555)
-            # These two arguments did not exist prior to 1.3.0
-            self.kept_packed_seq_params.discard("max_seqlen_q")
-            self.kept_packed_seq_params.discard("max_seqlen_kv")
-
-        if get_te_version() < PkgVersion("1.10.0"):
-            # TE 1.8.0 introduces cu_seqlens_padded which is the cu_seqlens with paddings counted
-            # in each individual sequence in THD format dataset
-            # These two arguments did not exist prior to 1.8.0. Full support added in 1.10.0 (#1012)
-            self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
-            self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
-
-        # These fields are MCore-only and should not be forwarded to TE attention.
-        # total_tokens and seq_idx are only for Mamba; tokens_per_sample is only for
-        # MoE sequence-level aux loss reshaping; cp_partition_mode and cp_partition_route
-        # are MCore CP metadata.
-        self.kept_packed_seq_params.discard("total_tokens")
-        self.kept_packed_seq_params.discard("seq_idx")
-        self.kept_packed_seq_params.discard("tokens_per_sample")
-        self.kept_packed_seq_params.discard("cp_partition_mode")
-        self.kept_packed_seq_params.discard("cp_partition_route")
+        self.kept_packed_seq_params = _get_te_packed_seq_params_fields(get_te_version())
 
         if config.qk_clip or config.log_max_attention_logit:
             # qk-clip is only supported in TE 2.9.0 and later

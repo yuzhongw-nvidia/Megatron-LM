@@ -46,8 +46,51 @@ activation-memory/compute tradeoff for both forward implementations:
   gates, and beta before launching the fused backward.
 
 The standalone `gdn_gdr_backend="fla"` backend bypasses this internal autograd
-path, so the flag has no effect there. The GB200 E2E test asserts that both
-fused kernels run and compares the full forward-plus-backward path with FLA.
+path, so the flag has no effect there.
+
+### Context parallelism
+
+`GatedDeltaNet.forward` supports dense SBHD micro-batches with `B > 1` when
+chunkwise CP uses the internal backend. It builds one single-sequence context
+from `[0, T_global]` and reuses that context for every batch slice in causal-conv
+and pre-GDR processing. FLA and torch GDR backends still reject this dense CP
+layout when selected directly through `gdn_gdr_backend`. Inside the internal
+backend, however, explicit runtime `fla` mode and unsupported-shape `auto`
+fallback slice only the FLA GDR operator by batch and concatenate its outputs;
+the surrounding GatedDeltaNet layer remains a single dense-batch invocation.
+After preprocessing, BTHD inputs keep their native
+`[B, T_local, H, D]` layout. Only the CP boundary-state preprocessing is applied
+per batch element, because that primitive consumes one local sequence at a
+time. The resulting small boundary states are joined;
+the large token tensors and saved chunk states are not concatenated. Before
+the fused launch, tensors are flattened as views and a cached dense
+`cu_seqlens=[0, T_local, ..., B*T_local]` tensor describes the logical
+sequences. This avoids host metadata reads and their stream synchronization in
+the steady-state path.
+
+For context parallelism, the internal backend keeps the established FLA CP
+forward path. During backward it first runs the FLA CP preprocessing sequence:
+recompute `w`/`u`, reconstruct the local recurrent state when needed, compute
+the local `dv`, and run the CP AllGather/merge preprocessing to produce the
+rank-local boundary gradient `dht`. It then passes that `dht` and the saved or
+recomputed local state to `fused_gdr_bwd`. The collective communication remains
+outside the CuTe DSL kernel.
+
+This is a correctness-first integration and intentionally duplicates local
+`dv` and recurrent-state work that the fused kernel performs again. CP inputs
+must satisfy the fused backward contract (BF16, 64 heads, head dimension 128);
+`auto` falls back to the CP-aware FLA backward when they do not, while `cute`
+reports the unsupported contract explicitly. CP4 E2E validation must verify
+that both FLA merged preprocess kernels and the fused backward are invoked.
+The GB200 E2E coverage exercises the real `GatedDeltaNet.forward` entry for CP4,
+B=2 with local T=8192 and T=8190, and compares output plus all five GDR input
+gradients against the production dense-batch FLA CP dispatch. Local T=8190
+corresponds to global T=32760, which is divisible by the standard training
+partitioner's `2 * CP` requirement. Odd local lengths such as T=8191 remain
+valid module/kernel-level coverage, but are not reachable through that standard
+dense training partitioner. The non-CP case asserts that both
+CuTe DSL forward and backward kernels run; CP validates the
+FLA-forward/fused-backward path against FLA.
 
 ## Package structure
 
@@ -77,11 +120,12 @@ fused kernels run and compares the full forward-plus-backward path with FLA.
 - `q`, `k`, `v`, and `do`: BF16 `[1, N, 64, 128]`.
 - `a`: BF16 `[1, N, 64, 64]`.
 - `g` and `beta`: FP32 `[1, N, 64]`.
-- `h`: BF16 `[1, N / 64, 64, 128, 128]`.
+- `h`: BF16 `[1, C, 64, 128, 128]`, where
+  `C = sum(ceil(sequence_length / 64))`.
 - `dht`: FP32 `[B, 64, 128, 128]`.
 - `cu_seqlens`: contiguous CUDA int32 `[B + 1]`, starts at zero, ends at `N`,
-  and describes `B` logical sequences. Each sequence length is a positive
-  multiple of 64.
+  and describes `B` positive-length logical sequences. Sequence lengths do
+  not need to be multiples of 64.
 - `chunk_size=64`, `state_v_first=False`, no grouped-query head mapping, and a
   finite positive `scale`.
 
@@ -99,6 +143,13 @@ The kernel launches one CTA for each logical `(sequence, head)` pair and walks
 that sequence's 64-token chunks in reverse. It keeps recurrent state gradients
 and MMA accumulators in TMEM while using TMA and mbarrier pipelines to stage
 Q/K/V, gates, beta, `A`, output gradients, and saved forward states.
+
+For a final partial chunk, the kernel computes `valid_tokens` from the logical
+sequence boundary. Invalid rows are neutralized in shared memory before use,
+the cumulative gate is extended from the last valid row, and every token
+gradient store is predicated by `valid_tokens`. No padded token tensor is
+allocated and no input is copied. The aligned specialization retains the
+existing unmasked TMA load/store path.
 
 The pinned MMA schedule has 16 dependency phases. In broad terms it:
 
@@ -154,8 +205,12 @@ the arbitrary packed-batch contract, and the named layout/storage structure.
 They do not duplicate a large shape sweep.
 
 `tests/unit_tests/ssm/test_internal_gdn_backend_e2e.py` is marked
-`launch_on_gb200` and runs one explicit-`cute` full-fused E2E case (`B=2`, `T=8192`,
-`H=64`, `D=128`, BF16). Deterministic Q/K/V inputs use standard deviation 0.1
+`launch_on_gb200`. It runs the non-CP explicit-`cute` full-fused case
+(`B=2`, `T=8192`, `H=64`, `D=128`, BF16), plus real GatedDeltaNet CP4 cases at
+local T=8192 and local T=8190. The CP cases assert that the merged FLA CP
+preprocessing and fused CuTe backward both execute, while their FLA references
+exercise the production dense-batch fallback rather than splitting the whole
+model invocation. Deterministic Q/K/V inputs use standard deviation 0.1
 to keep the long recurrence finite, and backward uses a fixed BF16 random
 `grad_output` without normalization by tensor size. It compares output and all
 five input gradients with FLA: output uses `atol=rtol=1e-2`, Q/K/V gradients
@@ -168,16 +223,25 @@ allows 10% noise relative to FLA. JIT time is excluded.
 
 - The adapter promotes gate and beta data to FP32 at the low-level boundary and
   restores their gradient dtypes afterward.
-- When no final-state gradient is supplied, the adapter reuses a cached zero
-  `dht` tensor of the required logical batch shape.
+- When no final-state gradient is supplied, the adapter reuses a stream-scoped
+  zero-`dht` tensor. This LRU cache is bounded to 256 MiB.
+- Uniform dense-batch offsets are cached by device, batch size, and local
+  sequence length. Packed variable-length metadata retains the identity/version
+  cache described below.
 - Metadata is cached by `cu_seqlens` identity and tensor version; in-place
-  mutation invalidates the cached entry.
+  mutation invalidates the cached entry. Standard packed-batch construction
+  supplies a trusted CPU mirror once, which GatedDeltaNet validates and reuses
+  across layers. Q/KV validation and equality checks therefore do not observe
+  CUDA results in Python. Chunk offsets are generated lazily only by the
+  internal path and reuse the identity/version cache. Device-only offsets are
+  not treated as validated metadata; direct calls without a CPU mirror fall
+  back in `auto` mode and fail in `cute` mode.
 - Unsupported shapes and dtypes fall back only in `auto` mode. `cute` mode is
   useful in CI and debugging because it turns accidental fallback into an
   explicit failure.
 - Performance results are not hard-coded here. Reports should identify the
   commit, GPU, CUDA/CuTe DSL versions, shape, warmup count, sample count, and
-whether JIT time is included.
+  whether JIT time is included.
 
 For layout-only development, run the CPU contract test first, then compile the
 SM100 probe and both uniform and packed-variable specializations on GB200.

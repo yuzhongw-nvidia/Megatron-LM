@@ -877,6 +877,43 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
         )
         assert fused_bias == unfused_bias
 
+    def test_fused_pre_gated_delta_rule_dense_batch_chunkwise_cp_matches_per_batch(self):
+        fused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)
+        seq_len_local = 32
+        batch = 2
+        qkvzba = torch.randn(
+            (seq_len_local, batch, fused_gdn.in_proj_dim),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with torch.no_grad():
+            per_batch = [
+                fused_gdn._fused_streamed_pre_gated_delta_rule(
+                    qkvzba[:, batch_idx : batch_idx + 1].contiguous(),
+                    cp_group=self.pg_collection.cp,
+                )
+                for batch_idx in range(batch)
+            ]
+            expected = tuple(torch.cat(tensors, dim=0) for tensors in zip(*per_batch))
+            actual = fused_gdn._fused_streamed_pre_gated_delta_rule(
+                qkvzba, cp_group=self.pg_collection.cp
+            )
+
+        rank = torch.distributed.get_rank()
+        for name, actual_tensor, expected_tensor in zip(
+            ("q", "k", "v", "gate", "beta", "g"), actual, expected
+        ):
+            torch.testing.assert_close(
+                actual_tensor,
+                expected_tensor,
+                atol=3e-3,
+                rtol=3e-3,
+                msg=lambda msg, tensor_name=name: (
+                    f"dense-batch CP fused pre-GDR mismatch for {tensor_name} ({rank=}): {msg}"
+                ),
+            )
+
     @pytest.mark.flaky_in_dev
     def test_fused_and_unfused_backward_chunkwise_cp_match(self):
         unfused_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=False)
@@ -1049,5 +1086,61 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
                 msg=lambda msg, param_name=name: (
                     f"partial-boundary packed CP fused grad mismatch for {param_name!r} "
                     f"({rank=}): {msg}"
+                ),
+            )
+
+    def test_fused_pre_gated_delta_rule_dense_batch_chunkwise_cp_backward_matches_per_batch(self):
+        reference_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)
+        actual_gdn = self._build_gdn(gdn_pre_gated_delta_rule_fusion=True)
+        actual_gdn.load_state_dict(reference_gdn.state_dict())
+        seq_len_local = 32
+        batch = 2
+        qkvzba = torch.randn(
+            (seq_len_local, batch, actual_gdn.in_proj_dim),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        actual_input = qkvzba.detach().clone().requires_grad_(True)
+        reference_input = qkvzba.detach().clone().requires_grad_(True)
+
+        actual = actual_gdn._fused_streamed_pre_gated_delta_rule(
+            actual_input, cp_group=self.pg_collection.cp
+        )
+        output_grads = tuple(torch.randn_like(output) for output in actual)
+
+        actual_loss = sum(
+            (output.float() * output_grad.float()).sum()
+            for output, output_grad in zip(actual, output_grads)
+        )
+        actual_loss.backward()
+        for batch_idx in range(batch):
+            outputs = reference_gdn._fused_streamed_pre_gated_delta_rule(
+                reference_input[:, batch_idx : batch_idx + 1], cp_group=self.pg_collection.cp
+            )
+            reference_loss = sum(
+                (output.float() * output_grad[batch_idx : batch_idx + 1].float()).sum()
+                for output, output_grad in zip(outputs, output_grads)
+            )
+            reference_loss.backward()
+
+        rank = torch.distributed.get_rank()
+        torch.testing.assert_close(
+            actual_input.grad,
+            reference_input.grad,
+            atol=5e-2,
+            rtol=5e-2,
+            msg=lambda msg: f"dense-batch CP fused pre-GDR input grad mismatch ({rank=}): {msg}",
+        )
+        for name in ("conv1d.weight", "A_log", "dt_bias"):
+            actual_grad = dict(actual_gdn.named_parameters())[name].grad
+            reference_grad = dict(reference_gdn.named_parameters())[name].grad
+            torch.testing.assert_close(
+                actual_grad,
+                reference_grad,
+                atol=5e-2,
+                rtol=5e-2,
+                msg=lambda msg, param_name=name: (
+                    f"dense-batch CP fused pre-GDR parameter grad mismatch for "
+                    f"{param_name} ({rank=}): {msg}"
                 ),
             )

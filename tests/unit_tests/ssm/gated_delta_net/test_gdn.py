@@ -3,12 +3,14 @@
 import copy
 import inspect
 import os
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core import packed_seq_params as packed_seq_params_module
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensorFactory
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -408,7 +410,7 @@ class TestGatedDeltaNet:
             dtype=torch.bfloat16,
         )
 
-        with pytest.raises(ValueError, match="requires micro_batch_size == 1"):
+        with pytest.raises(ValueError, match="requires gdn_gdr_backend='internal'"):
             gdn(hidden_states, None)
 
     def test_gpu_forward_rejects_sbhd_conv_padding(self):
@@ -790,6 +792,7 @@ class TestGDNCuSeqlensResolve:
     def mock_gdn(self):
         class MockGDN:
             _resolve_cu_seqlens = GatedDeltaNet._resolve_cu_seqlens
+            _resolve_cu_seqlens_metadata = GatedDeltaNet._resolve_cu_seqlens_metadata
 
         return MockGDN()
 
@@ -803,6 +806,42 @@ class TestGDNCuSeqlensResolve:
         actual = torch.tensor([0, 504, 1008], dtype=torch.int32)
         result = mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
         assert torch.equal(result, actual)
+
+    def test_trusted_cpu_metadata_avoids_device_value_reads(self, mock_gdn):
+        trusted_cpu = torch.tensor([0, 504, 1008], dtype=torch.int32)
+        device_offsets = SimpleNamespace(
+            ndim=1,
+            shape=trusted_cpu.shape,
+            dtype=trusted_cpu.dtype,
+            numel=lambda: trusted_cpu.numel(),
+        )
+
+        resolved, resolved_cpu = mock_gdn._resolve_cu_seqlens_metadata(
+            None, device_offsets, None, trusted_cpu, 1008, "cu_seqlens_q", cp_size=2
+        )
+
+        assert resolved is device_offsets
+        assert resolved_cpu is trusted_cpu
+
+    @pytest.mark.parametrize("mutate", ["replace_device", "mutate_cpu"])
+    def test_metadata_binding_rejects_stale_tensor_owners(self, mutate):
+        bind = getattr(packed_seq_params_module, "bind_packed_seq_cpu_metadata", None)
+        resolve = getattr(packed_seq_params_module, "get_packed_seq_cpu_metadata", None)
+        assert bind is not None and resolve is not None
+
+        device_offsets = torch.tensor([0, 64], dtype=torch.int32)
+        params = packed_seq_params_module.PackedSeqParams(
+            qkv_format="thd", cu_seqlens_q=device_offsets
+        )
+        bind(params)
+        assert torch.equal(resolve(params, "cu_seqlens_q"), device_offsets)
+
+        if mutate == "replace_device":
+            params.cu_seqlens_q = device_offsets.clone()
+        else:
+            resolve(params, "cu_seqlens_q")[1] = 32
+
+        assert resolve(params, "cu_seqlens_q") is None
 
     def test_raises_when_padding_mismatch(self, mock_gdn):
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
@@ -819,6 +858,16 @@ class TestGDNCuSeqlensResolve:
         actual = torch.tensor([0, 505, 1008], dtype=torch.int32)
         with pytest.raises(ValueError, match="must be divisible by cp_size"):
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
+
+    def test_raises_when_first_offset_is_not_zero(self, mock_gdn):
+        actual = torch.tensor([1, 504, 1008], dtype=torch.int32)
+        with pytest.raises(ValueError, match=r"cu_seqlens_q\[0\] must be 0"):
+            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
+
+    def test_raises_when_sequence_length_is_not_positive(self, mock_gdn):
+        actual = torch.tensor([0, 504, 504, 1008], dtype=torch.int32)
+        with pytest.raises(ValueError, match="must be positive"):
+            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
 
     def test_cp1_still_validates_total(self, mock_gdn):
         mock_gdn.cp_size = 1

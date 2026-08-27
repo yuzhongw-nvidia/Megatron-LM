@@ -1051,6 +1051,9 @@ def _g_beta_backward_kernel(
     qkvzba_s_stride,
     qkvzba_b_stride,
     qkvzba_c_stride,
+    d_qkvzba_s_stride,
+    d_qkvzba_b_stride,
+    d_qkvzba_c_stride,
     d_g_b_stride,
     d_g_s_stride,
     d_g_h_stride,
@@ -1143,15 +1146,15 @@ def _g_beta_backward_kernel(
     # ----- Store per-element grads back to d_qkvzba -----
     d_alpha_ptrs = (
         d_qkvzba_ptr
-        + s_offs[:, None] * qkvzba_s_stride
-        + pid_b * qkvzba_b_stride
-        + (alpha_channel_offset + h_offs[None, :]) * qkvzba_c_stride
+        + s_offs[:, None] * d_qkvzba_s_stride
+        + pid_b * d_qkvzba_b_stride
+        + (alpha_channel_offset + h_offs[None, :]) * d_qkvzba_c_stride
     )
     d_beta_ptrs = (
         d_qkvzba_ptr
-        + s_offs[:, None] * qkvzba_s_stride
-        + pid_b * qkvzba_b_stride
-        + (beta_channel_offset + h_offs[None, :]) * qkvzba_c_stride
+        + s_offs[:, None] * d_qkvzba_s_stride
+        + pid_b * d_qkvzba_b_stride
+        + (beta_channel_offset + h_offs[None, :]) * d_qkvzba_c_stride
     )
     tl.store(d_alpha_ptrs, d_alpha.to(d_qkvzba_ptr.dtype.element_ty), mask=mask)
     tl.store(d_beta_ptrs, d_beta_raw.to(d_qkvzba_ptr.dtype.element_ty), mask=mask)
@@ -1553,6 +1556,9 @@ def _triton_g_beta_backward(
             qkvzba.stride(0),
             qkvzba.stride(1),
             qkvzba.stride(2),
+            d_qkvzba_out.stride(0),
+            d_qkvzba_out.stride(1),
+            d_qkvzba_out.stride(2),
             d_g.stride(0),
             d_g.stride(1),
             d_g.stride(2),
@@ -2378,12 +2384,12 @@ def _triton_pre_gated_delta_rule_backward(
     _wait_for_streams(default_stream, qk_stream, v_stream)
 
     # Pre-allocate d_x_conv as a strided view INTO d_qkvzba's conv slice.
-    # d_qkvzba memory layout is (s, b, total_channels) contiguous, so
-    # element [s, b, c] sits at offset s*b_stride + b*c_stride + c.
-    # Re-interpreting that storage as (b, conv_dim, s) lets causal_conv1d
-    # backward write d_x directly into the right cells.
-    seq_stride = qkvzba.stride(0)
-    batch_stride = qkvzba.stride(1)
+    # Use the destination strides: empty_like() may compact a storage-gapped
+    # input view, so reusing qkvzba's strides can address past d_qkvzba.
+    # Re-interpreting the destination as (b, conv_dim, s) lets causal_conv1d
+    # backward write d_x directly into the right cells without an input copy.
+    seq_stride = d_qkvzba.stride(0)
+    batch_stride = d_qkvzba.stride(1)
     d_x_conv_view = d_qkvzba.as_strided((batch, conv_dim, seq_len), (batch_stride, 1, seq_stride))
 
     apply_boundary_correction = left_boundary is not None and seq_idx is not None
@@ -2656,7 +2662,7 @@ def fused_streamed_pre_gated_delta_rule(
 
     Args:
         qkvzba: ``[seq_len, batch, in_proj_dim]`` projection output. Must be
-            on CUDA.
+            on CUDA with a contiguous channel dimension; storage gaps are allowed.
         conv1d_weight: ``[conv_dim, 1, k_w]`` depthwise conv weight.
         conv1d_bias: Must be ``None`` (conv bias is not supported).
         A_log: ``[num_value_heads]`` raw decay parameter.
@@ -2674,6 +2680,8 @@ def fused_streamed_pre_gated_delta_rule(
             ``[1, seq_len]``. Used by causal-conv backward in packed THD mode.
         cp_group: Optional chunkwise-CP process group. When it has size > 1,
             the fused path prepends a previous-rank conv boundary internally.
+            Dense SBHD inputs support arbitrary batch size; packed THD inputs
+            retain their batch-dimension-1 contract.
 
     Returns:
         ``(query, key, value, gate, beta, g)`` matching the unfused
@@ -2689,6 +2697,11 @@ def fused_streamed_pre_gated_delta_rule(
     assert qkvzba.is_cuda, (
         "fused_pre_gated_delta_rule requires CUDA inputs; " f"got qkvzba.device={qkvzba.device}."
     )
+    if qkvzba.stride(-1) != 1:
+        raise ValueError(
+            "fused_pre_gated_delta_rule requires a contiguous channel dimension; "
+            f"got qkvzba.stride()={qkvzba.stride()}."
+        )
     assert conv1d_bias is None, (
         "Conv bias is not supported by fused_pre_gated_delta_rule "
         "(production GDN config has none)."
@@ -2702,11 +2715,6 @@ def fused_streamed_pre_gated_delta_rule(
     ), f"{num_value_heads=} must be a multiple of {num_key_heads=}."
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size > 1:
-        if qkvzba.shape[1] != 1:
-            raise ValueError(
-                "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-                f"for fused_pre_gated_delta_rule; got batch={qkvzba.shape[1]}."
-            )
         boundary = conv1d_weight.shape[-1] - 1
         if boundary > 0 and qkvzba.shape[0] < boundary:
             raise ValueError(

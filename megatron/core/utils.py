@@ -43,7 +43,7 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, bind_packed_seq_cpu_metadata
 
 try:
     from packaging.version import Version as PkgVersion
@@ -2626,6 +2626,7 @@ def get_thd_batch_on_this_cp_rank(
         max_seqlen_q=int(max_seqlen[0].item()),
         max_seqlen_kv=int(max_seqlen[0].item()),
     )
+    bind_packed_seq_cpu_metadata(packed_seq_params)
 
     cp_size = parallel_state.get_context_parallel_world_size() if cp_size is None else cp_size
     cp_rank = parallel_state.get_context_parallel_rank() if cp_rank is None else cp_rank
