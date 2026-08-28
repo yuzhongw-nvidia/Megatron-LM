@@ -698,6 +698,7 @@ def _call_fused_gdr_bwd_cute(
         chunk_offsets=chunk_offsets,
         chunk_size=_CHUNK_SIZE,
         state_v_first=False,
+        trusted_chunk_offsets=chunk_offsets is not None,
     )
     return (
         dq.reshape_as(q),

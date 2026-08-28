@@ -1222,6 +1222,7 @@ def test_fused_backward_adapter_forwards_chunk_offsets(monkeypatch):
 
     assert seen["cu_seqlens"] is cu_seqlens
     assert seen["chunk_offsets"] is chunk_offsets
+    assert seen["trusted_chunk_offsets"] is True
 
 
 def test_gdn_pre_gdr_producers_emit_fp32_beta():
@@ -1284,7 +1285,7 @@ def test_fused_backward_varlen_metadata_cache_is_stream_scoped(monkeypatch):
     assert third is first
 
 
-def test_fused_backward_varlen_metadata_reuses_supplied_chunk_offsets():
+def test_fused_backward_varlen_metadata_reuses_trusted_supplied_chunk_offsets():
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_bwd_cute import (
         fused_bwd,
     )
@@ -1294,13 +1295,48 @@ def test_fused_backward_varlen_metadata_reuses_supplied_chunk_offsets():
     chunk_offsets = torch.empty(3, dtype=torch.int32, device="meta")
 
     metadata = fused_bwd._prepare_varlen_metadata(
-        cu_seqlens, total_tokens=128, chunk_size=64, chunk_offsets=chunk_offsets
+        cu_seqlens,
+        total_tokens=128,
+        chunk_size=64,
+        chunk_offsets=chunk_offsets,
+        trusted_chunk_offsets=True,
     )
 
     assert metadata.chunk_offsets is chunk_offsets
     assert metadata.num_sequences == 2
     assert metadata.num_chunks == 2
     assert metadata.uniform_sequence_length == 0
+
+
+def test_fused_backward_varlen_metadata_rejects_untrusted_device_chunk_offsets():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_bwd_cute import (
+        fused_bwd,
+    )
+
+    fused_bwd._clear_metadata_cache_for_test()
+    cu_seqlens = torch.empty(3, dtype=torch.int32, device="meta")
+    chunk_offsets = torch.empty(3, dtype=torch.int32, device="meta")
+
+    with pytest.raises(ValueError, match="trusted_chunk_offsets=True"):
+        fused_bwd._prepare_varlen_metadata(
+            cu_seqlens, total_tokens=128, chunk_size=64, chunk_offsets=chunk_offsets
+        )
+
+
+def test_fused_backward_varlen_metadata_validates_cpu_supplied_chunk_offsets():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_bwd_cute import (
+        fused_bwd,
+    )
+
+    fused_bwd._clear_metadata_cache_for_test()
+    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32)
+    chunk_offsets = torch.tensor([0, 1, 2], dtype=torch.int32)
+
+    metadata = fused_bwd._prepare_varlen_metadata(
+        cu_seqlens, total_tokens=128, chunk_size=64, chunk_offsets=chunk_offsets
+    )
+
+    assert metadata.chunk_offsets is chunk_offsets
 
 
 def test_fused_backward_support_reason_trusts_device_offsets_only_when_requested():

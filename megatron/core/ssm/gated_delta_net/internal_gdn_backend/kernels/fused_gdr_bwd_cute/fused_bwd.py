@@ -100,18 +100,24 @@ def _prepare_varlen_metadata(
     chunk_size: int,
     chunk_offsets: torch.Tensor | None = None,
     num_chunks: int | None = None,
+    trusted_chunk_offsets: bool = False,
 ) -> _VarlenMetadata:
     if not isinstance(cu_seqlens, torch.Tensor):
         raise TypeError("cu_seqlens must be a torch.Tensor")
     if cu_seqlens.dtype != torch.int32 or not cu_seqlens.is_contiguous():
         raise TypeError("cu_seqlens must be contiguous torch.int32")
-    if chunk_offsets is not None:
+    uses_supplied_chunk_offsets = chunk_offsets is not None
+    if uses_supplied_chunk_offsets:
         chunk_offsets = _validate_chunk_offsets(chunk_offsets, cu_seqlens)
+        if cu_seqlens.device.type != "cpu" and not trusted_chunk_offsets:
+            raise ValueError(
+                "non-CPU chunk_offsets require trusted_chunk_offsets=True after "
+                "host-side metadata validation"
+            )
 
     stream_key = _current_stream_cache_key(cu_seqlens)
     key = (id(cu_seqlens), stream_key)
     version = cu_seqlens._version
-    uses_supplied_chunk_offsets = chunk_offsets is not None
     cached = _METADATA_CACHE.get(key)
     if (
         cached is not None
@@ -326,6 +332,7 @@ def fused_gdr_bwd(
     chunk_offsets=None,
     chunk_size=64,
     state_v_first=False,
+    trusted_chunk_offsets=False,
 ):
     if cu_seqlens is None:
         raise NotImplementedError("packed cu_seqlens are required")
@@ -346,6 +353,7 @@ def fused_gdr_bwd(
         chunk_size=chunk_size,
         chunk_offsets=chunk_offsets,
         num_chunks=h.shape[1],
+        trusted_chunk_offsets=trusted_chunk_offsets,
     )
     _validate_inputs(
         q=q,
