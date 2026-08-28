@@ -342,6 +342,7 @@ def test_cp_backward_preprocessing_produces_fused_dht_and_state(monkeypatch, use
         do=do,
         dht=None,
         cu_seqlens=None,
+        cu_seqlens_cpu=None,
         chunk_indices=None,
         initial_state=compressed_initial_state,
         cp_context=cp_context,
@@ -396,6 +397,7 @@ def test_cutedsl_cp_backward_feeds_preprocessed_dht_to_fused_kernel(monkeypatch)
         scale=128**-0.5,
         dht=None,
         cu_seqlens=None,
+        cu_seqlens_cpu=None,
         chunk_indices=None,
         initial_state=initial_state,
         cp_context=cp_context,
@@ -579,6 +581,159 @@ def test_dense_batch_cp_forward_batches_local_compute_and_slices_boundaries(monk
     }
 
 
+def test_single_sequence_cp_forward_uses_dense_local_compute(monkeypatch):
+    implementation = _implementation()
+    shape = (1, 128, 2, 4)
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    g = torch.empty(shape[:-1], dtype=torch.float32)
+    beta = torch.empty(shape[:-1], dtype=torch.bfloat16)
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
+    A = torch.empty((*shape[:-1], 64), dtype=torch.bfloat16)
+    h = torch.empty((1, 2, 2, 4, 4), dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+    boundary_state = torch.empty((1, 2, 4, 4), dtype=torch.float32)
+    cp_cu_seqlens = torch.tensor([0, 128], dtype=torch.int32)
+    cp_context = SimpleNamespace(
+        group=object(), cu_seqlens=cp_cu_seqlens, cu_seqlens_cpu=cp_cu_seqlens
+    )
+    supplied_chunk_indices = torch.tensor([[0, 0], [0, 1]], dtype=torch.int32)
+    seen = {}
+
+    def cumsum(value, **kwargs):
+        seen["cumsum"] = kwargs
+        return value
+
+    def intra(**kwargs):
+        seen["intra"] = kwargs
+        return w, u, A
+
+    def cp_boundary(**kwargs):
+        seen["cp_boundary"] = kwargs
+        return boundary_state
+
+    def fwd_h(**kwargs):
+        seen["fwd_h"] = kwargs
+        return h, u, None
+
+    def fwd_o(**kwargs):
+        seen["output"] = kwargs
+        return output
+
+    monkeypatch.setattr(implementation, "chunk_local_cumsum", cumsum)
+    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_fwd_intra", intra)
+    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_fwd_h_pre_process", cp_boundary)
+    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_fwd_h", fwd_h)
+    monkeypatch.setattr(implementation, "chunk_fwd_o", fwd_o)
+    monkeypatch.setattr(implementation, "compress_h0", lambda state, *, context: state)
+
+    actual_g, actual_output, actual_A, saved_h, chunk_indices, initial_state = (
+        implementation._fla_forward_for_fused_bwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=0.5,
+            cu_seqlens=cp_cu_seqlens,
+            cu_seqlens_cpu=cp_cu_seqlens,
+            chunk_indices=supplied_chunk_indices,
+            cp_context=cp_context,
+            save_fused_bwd_state=False,
+            dense_local_cp=True,
+        )
+    )
+
+    assert actual_g is g
+    assert actual_output is output
+    assert actual_A is A
+    assert saved_h is None
+    assert chunk_indices is None
+    assert initial_state is boundary_state
+    assert seen["cumsum"]["cu_seqlens"] is None
+    assert seen["cumsum"]["chunk_indices"] is None
+    assert seen["intra"]["cu_seqlens"] is None
+    assert seen["intra"]["chunk_indices"] is None
+    assert seen["cp_boundary"]["cu_seqlens"] is cp_cu_seqlens
+    assert seen["fwd_h"]["cu_seqlens"] is None
+    assert seen["fwd_h"]["chunk_indices"] is None
+    assert seen["output"]["cu_seqlens"] is None
+    assert seen["output"]["chunk_indices"] is None
+
+
+def test_single_sequence_cp_backward_preprocess_uses_dense_local_compute(monkeypatch):
+    implementation = _implementation()
+    shape = (1, 128, 2, 4)
+    q = torch.empty(shape, dtype=torch.bfloat16)
+    k = torch.empty_like(q)
+    v = torch.empty_like(q)
+    g = torch.empty(shape[:-1], dtype=torch.float32)
+    beta = torch.empty(shape[:-1], dtype=torch.bfloat16)
+    A = torch.empty((*shape[:-1], 64), dtype=torch.bfloat16)
+    do = torch.empty_like(q)
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
+    dv = torch.empty_like(v)
+    compressed_initial_state = torch.empty((1, 2, 4, 4), dtype=torch.float32)
+    expanded_initial_state = torch.empty_like(compressed_initial_state)
+    h = torch.empty((1, 2, 2, 4, 4), dtype=torch.bfloat16)
+    expected_dht = torch.empty_like(compressed_initial_state)
+    cp_cu_seqlens = torch.tensor([0, 128], dtype=torch.int32)
+    cp_context = SimpleNamespace(
+        group=object(), cu_seqlens=cp_cu_seqlens, cu_seqlens_cpu=cp_cu_seqlens
+    )
+    supplied_chunk_indices = torch.tensor([[0, 0], [0, 1]], dtype=torch.int32)
+    seen = {}
+
+    def recompute(**kwargs):
+        seen["recompute"] = kwargs
+        return w, u
+
+    def dv_local(**kwargs):
+        seen["dv"] = kwargs
+        return dv
+
+    def cp_boundary(**kwargs):
+        seen["cp_boundary"] = kwargs
+        return expected_dht, None
+
+    monkeypatch.setattr(implementation, "recompute_w_u_fwd", recompute)
+    monkeypatch.setattr(
+        implementation, "expand_h0", lambda initial_state, *, context: expanded_initial_state
+    )
+    monkeypatch.setattr(implementation, "chunk_bwd_dv_local", dv_local)
+    monkeypatch.setattr(implementation, "chunk_gated_delta_rule_bwd_dhu_pre_process", cp_boundary)
+
+    actual_dht, actual_h = implementation._fla_cp_backward_preprocess(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A=A,
+        scale=0.5,
+        do=do,
+        dht=None,
+        cu_seqlens=cp_cu_seqlens,
+        cu_seqlens_cpu=cp_cu_seqlens,
+        chunk_indices=supplied_chunk_indices,
+        initial_state=compressed_initial_state,
+        cp_context=cp_context,
+        h=h,
+    )
+
+    assert actual_dht is expected_dht
+    assert actual_h is h
+    assert seen["recompute"]["cu_seqlens"] is None
+    assert seen["recompute"]["chunk_indices"] is None
+    assert seen["dv"]["cu_seqlens"] is None
+    assert seen["dv"]["chunk_indices"] is None
+    assert seen["cp_boundary"]["cu_seqlens"] is cp_cu_seqlens
+    assert seen["cp_boundary"]["initial_state"] is expanded_initial_state
+
+
 def test_dense_batch_cp_backward_batches_local_compute_and_slices_boundaries(monkeypatch):
     implementation = _implementation()
     shape = (2, 64, 2, 4)
@@ -690,6 +845,7 @@ def test_forward_save_h_policy_is_shared_by_fla_and_cute(monkeypatch, mode, reco
         inputs["g"],
         inputs["beta"],
         0.5,
+        None,
         None,
         None,
         None,
@@ -954,6 +1110,25 @@ def test_cutedsl_forward_reuses_packed_chunk_metadata(monkeypatch):
     assert seen["checkpoint_cu_starts"] is chunk_offsets
     assert seen["output_g"].shape == (128, 3)
     assert seen["gate_is_log_decay"] is True
+
+
+def test_prepare_validated_chunk_metadata_can_skip_chunk_indices(monkeypatch):
+    implementation = _implementation()
+
+    implementation._clear_packed_chunk_metadata_cache_for_test()
+    cu_seqlens = torch.tensor([0, 128], dtype=torch.int32)
+
+    def fail_prepare(*_args, **_kwargs):
+        pytest.fail("offset-only metadata must not prepare chunk_indices")
+
+    monkeypatch.setattr(implementation, "prepare_chunk_indices", fail_prepare)
+
+    chunk_indices, chunk_offsets = implementation.prepare_validated_chunk_metadata(
+        cu_seqlens, cu_seqlens, include_chunk_indices=False
+    )
+
+    assert chunk_indices is None
+    assert torch.equal(chunk_offsets, torch.tensor([0, 2], dtype=torch.int32))
 
 
 def test_packed_chunk_metadata_cache_is_stream_scoped(monkeypatch):

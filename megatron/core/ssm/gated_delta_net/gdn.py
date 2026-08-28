@@ -34,8 +34,26 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.ssm.gated_delta_net.internal_gdn_backend import (
     chunk_gated_delta_rule as internal_chunk_gated_delta_rule,
+    prepare_validated_chunk_metadata as prepare_internal_gdr_chunk_metadata,
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+
+
+_INTERNAL_GDR_CHUNK_SIZE = 64
+
+
+def _is_internal_gdr_single_local_sequence(
+    cu_seqlens: torch.Tensor | None, cu_seqlens_cpu: torch.Tensor | None, local_tokens: int
+) -> bool:
+    if cu_seqlens_cpu is not None:
+        offsets = cu_seqlens_cpu
+    elif cu_seqlens is not None and cu_seqlens.device.type == "cpu":
+        offsets = cu_seqlens
+    else:
+        return False
+    if local_tokens % _INTERNAL_GDR_CHUNK_SIZE or offsets.numel() != 2:
+        return False
+    return bool(offsets[0].item() == 0 and offsets[-1].item() == local_tokens)
 
 
 class GatedDeltaNet(_GDNBase):
@@ -279,6 +297,7 @@ class GatedDeltaNet(_GDNBase):
                     cu_seqlens=cu_seqlens_q,
                     group=cp_group_chunkwise,
                     conv1d_kernel_size=self.conv_kernel_dim,
+                    cu_seqlens_cpu=cu_seqlens_q_cpu,
                 )
         else:
             chunkwise_cp_context = None
@@ -420,9 +439,34 @@ class GatedDeltaNet(_GDNBase):
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
+        if self.config.gdn_gdr_backend == "internal":
+            if cu_seqlens_q_cpu is not None:
+                kernel_inputs["cu_seqlens_cpu"] = cu_seqlens_q_cpu
+            metadata_cu_seqlens = cu_seqlens_q
+            metadata_cu_seqlens_cpu = cu_seqlens_q_cpu
+            include_chunk_indices = True
+            if chunkwise_cp_context is not None and not dense_batched_cp:
+                metadata_cu_seqlens = getattr(chunkwise_cp_context, "cu_seqlens", None)
+                metadata_cu_seqlens_cpu = getattr(chunkwise_cp_context, "cu_seqlens_cpu", None)
+                include_chunk_indices = not _is_internal_gdr_single_local_sequence(
+                    metadata_cu_seqlens,
+                    metadata_cu_seqlens_cpu,
+                    kernel_inputs["q"].shape[1],
+                )
+            if metadata_cu_seqlens is not None:
+                validated_chunk_indices, validated_chunk_offsets = (
+                    prepare_internal_gdr_chunk_metadata(
+                        metadata_cu_seqlens,
+                        metadata_cu_seqlens_cpu,
+                        include_chunk_indices=include_chunk_indices,
+                    )
+                )
+                if validated_chunk_indices is not None:
+                    kernel_inputs["validated_chunk_indices"] = validated_chunk_indices
+                if validated_chunk_offsets is not None:
+                    kernel_inputs["validated_chunk_offsets"] = validated_chunk_offsets
+
         nvtx_range_push(suffix="gated_delta_rule")
-        if cu_seqlens_q_cpu is not None and self.config.gdn_gdr_backend == "internal":
-            kernel_inputs["cu_seqlens_cpu"] = cu_seqlens_q_cpu
         core_attn_out, _ = self.gated_delta_rule(
             **kernel_inputs,
             initial_state=None,

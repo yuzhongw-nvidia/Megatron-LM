@@ -79,6 +79,29 @@ class _PackedChunkMetadataEntry:
 
 
 @dataclass(frozen=True)
+class _PackedChunkOffsetsMetadata:
+    _cu_seqlens_ref: weakref.ReferenceType
+    chunk_offsets: torch.Tensor
+
+    @property
+    def cu_seqlens(self) -> torch.Tensor:
+        tensor = self._cu_seqlens_ref()
+        if tensor is None:
+            raise RuntimeError("cu_seqlens owner is no longer alive")
+        return tensor
+
+
+@dataclass
+class _PackedChunkOffsetsEntry:
+    owner: weakref.ReferenceType
+    version: int
+    cu_seqlens_cpu_owner: weakref.ReferenceType | None
+    cu_seqlens_cpu_version: int | None
+    chunk_size: int
+    metadata: _PackedChunkOffsetsMetadata
+
+
+@dataclass(frozen=True)
 class _DenseChunkMetadata:
     cu_seqlens: torch.Tensor
     chunk_offsets: torch.Tensor
@@ -87,6 +110,9 @@ class _DenseChunkMetadata:
 _packed_chunk_metadata_cache: dict[
     tuple[int, tuple[int, int] | None], _PackedChunkMetadataEntry
 ] = {}
+_packed_chunk_offsets_cache: dict[
+    tuple[int, tuple[int, int] | None], _PackedChunkOffsetsEntry
+] = {}
 _dense_chunk_metadata_cache: OrderedDict[
     tuple[str, int | None, int, int, int, tuple[int, int] | None], _DenseChunkMetadata
 ] = OrderedDict()
@@ -94,6 +120,7 @@ _dense_chunk_metadata_cache: OrderedDict[
 
 def _clear_packed_chunk_metadata_cache_for_test() -> None:
     _packed_chunk_metadata_cache.clear()
+    _packed_chunk_offsets_cache.clear()
 
 
 def _clear_dense_chunk_metadata_cache_for_test() -> None:
@@ -172,6 +199,114 @@ def _packed_chunk_metadata(
         metadata=metadata,
     )
     return metadata
+
+
+def _packed_chunk_offsets(
+    cu_seqlens: torch.Tensor | None, cu_seqlens_cpu: torch.Tensor | None
+) -> _PackedChunkOffsetsMetadata | None:
+    if cu_seqlens is None:
+        return None
+    stream_key = _current_stream_cache_key(cu_seqlens)
+    key = (id(cu_seqlens), stream_key)
+    version = cu_seqlens._version
+    cu_seqlens_cpu_version = None if cu_seqlens_cpu is None else cu_seqlens_cpu._version
+    cached = _packed_chunk_offsets_cache.get(key)
+    if (
+        cached is not None
+        and cached.owner() is cu_seqlens
+        and cached.version == version
+        and _same_optional_tensor_owner(cached.cu_seqlens_cpu_owner, cu_seqlens_cpu)
+        and cached.cu_seqlens_cpu_version == cu_seqlens_cpu_version
+        and cached.chunk_size == _CHUNK_SIZE
+    ):
+        return cached.metadata
+
+    offsets = _host_cu_seqlens(cu_seqlens, cu_seqlens_cpu)
+    if offsets is None:
+        sequence_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        chunks_per_sequence = (sequence_lengths + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+        chunk_offsets = torch.empty_like(cu_seqlens)
+        chunk_offsets[0] = 0
+        torch.cumsum(chunks_per_sequence, dim=0, out=chunk_offsets[1:])
+    else:
+        sequence_lengths = offsets[1:] - offsets[:-1]
+        chunks_per_sequence = (sequence_lengths + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+        cpu_chunk_offsets = torch.empty_like(offsets, dtype=cu_seqlens.dtype)
+        cpu_chunk_offsets[0] = 0
+        torch.cumsum(
+            chunks_per_sequence.to(dtype=cu_seqlens.dtype), dim=0, out=cpu_chunk_offsets[1:]
+        )
+        chunk_offsets = cpu_chunk_offsets.to(
+            device=cu_seqlens.device, dtype=cu_seqlens.dtype, non_blocking=True
+        )
+
+    def remove_cached_owner(owner_ref):
+        current = _packed_chunk_offsets_cache.get(key)
+        if current is not None and current.owner is owner_ref:
+            _packed_chunk_offsets_cache.pop(key, None)
+
+    owner_ref = weakref.ref(cu_seqlens, remove_cached_owner)
+    cpu_owner_ref = None if cu_seqlens_cpu is None else weakref.ref(cu_seqlens_cpu)
+    metadata = _PackedChunkOffsetsMetadata(
+        _cu_seqlens_ref=owner_ref, chunk_offsets=chunk_offsets
+    )
+    _packed_chunk_offsets_cache[key] = _PackedChunkOffsetsEntry(
+        owner=owner_ref,
+        version=version,
+        cu_seqlens_cpu_owner=cpu_owner_ref,
+        cu_seqlens_cpu_version=cu_seqlens_cpu_version,
+        chunk_size=_CHUNK_SIZE,
+        metadata=metadata,
+    )
+    return metadata
+
+
+def prepare_validated_chunk_metadata(
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+    *,
+    include_chunk_indices: bool = True,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Prepare trusted packed metadata before entering the profiled GDR region."""
+    if cu_seqlens is None:
+        return None, None
+    if include_chunk_indices:
+        metadata = _packed_chunk_metadata(cu_seqlens, cu_seqlens_cpu)
+        if metadata is None:
+            return None, None
+        return metadata.chunk_indices, metadata.chunk_offsets
+    metadata = _packed_chunk_offsets(cu_seqlens, cu_seqlens_cpu)
+    return None, None if metadata is None else metadata.chunk_offsets
+
+
+def _single_sequence_covers_tokens(
+    cu_seqlens: torch.Tensor | None, cu_seqlens_cpu: torch.Tensor | None, *, total_tokens: int
+) -> bool:
+    if cu_seqlens is None or total_tokens % _CHUNK_SIZE:
+        return False
+    offsets = _host_cu_seqlens(cu_seqlens, cu_seqlens_cpu)
+    if offsets is None or offsets.numel() != 2:
+        return False
+    return bool(offsets[0].item() == 0 and offsets[-1].item() == total_tokens)
+
+
+def _validate_validated_chunk_indices(
+    validated_chunk_indices: torch.Tensor | None, cu_seqlens: torch.Tensor | None
+) -> None:
+    if validated_chunk_indices is None:
+        return
+    if (
+        cu_seqlens is None
+        or validated_chunk_indices.ndim != 2
+        or validated_chunk_indices.shape[1] != 2
+        or validated_chunk_indices.dtype != cu_seqlens.dtype
+        or validated_chunk_indices.device != cu_seqlens.device
+        or not validated_chunk_indices.is_contiguous()
+    ):
+        raise ValueError(
+            "validated_chunk_indices must be contiguous with shape (num_chunks, 2) "
+            "and match cu_seqlens dtype and device"
+        )
 
 
 def _call_fla_compat(function, **kwargs):
@@ -417,12 +552,18 @@ def _fla_cp_backward_preprocess(
     do: torch.Tensor,
     dht: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
+    cu_seqlens_cpu: torch.Tensor | None,
     chunk_indices: torch.Tensor | None,
     initial_state: torch.Tensor | None,
     cp_context: object,
     h: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Use FLA's CP prefix to produce the fused kernel's boundary state."""
+    dense_local_cp = q.shape[0] == 1 and _single_sequence_covers_tokens(
+        cu_seqlens, cu_seqlens_cpu, total_tokens=q.shape[1]
+    )
+    compute_cu_seqlens = None if dense_local_cp else cu_seqlens
+    compute_chunk_indices = None if dense_local_cp else chunk_indices
     w, u = _call_fla_compat(
         recompute_w_u_fwd,
         k=k,
@@ -430,8 +571,8 @@ def _fla_cp_backward_preprocess(
         beta=beta,
         A=A,
         g=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
+        cu_seqlens=compute_cu_seqlens,
+        chunk_indices=compute_chunk_indices,
         use_exp2=True,
     )
     expanded_initial_state = expand_h0(initial_state, context=cp_context)
@@ -445,8 +586,8 @@ def _fla_cp_backward_preprocess(
             initial_state=expanded_initial_state,
             output_final_state=False,
             save_new_value=True,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
+            cu_seqlens=compute_cu_seqlens,
+            chunk_indices=compute_chunk_indices,
             use_exp2=True,
             transpose_state_layout=False,
         )
@@ -457,8 +598,8 @@ def _fla_cp_backward_preprocess(
         g=g,
         do=do,
         scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
+        cu_seqlens=compute_cu_seqlens,
+        chunk_indices=compute_chunk_indices,
         use_exp2=True,
     )
     if q.shape[0] > 1 and cu_seqlens is None:
@@ -942,9 +1083,11 @@ def _fla_forward_for_fused_bwd(
     scale: float,
     cu_seqlens: torch.Tensor | None,
     cu_seqlens_cpu: torch.Tensor | None,
+    chunk_indices: torch.Tensor | None = None,
     packed_metadata: _PackedChunkMetadata | None = None,
     cp_context: object | None = None,
     save_fused_bwd_state: bool = False,
+    dense_local_cp: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -954,24 +1097,32 @@ def _fla_forward_for_fused_bwd(
     torch.Tensor | None,
 ]:
     """Prepare the exact FLA state consumed by latest-main's fused backward."""
-    chunk_indices = None
-    if cu_seqlens is not None:
+    if dense_local_cp and (cp_context is None or q.shape[0] != 1):
+        raise ValueError("dense_local_cp is only valid for single-batch CP inputs")
+    compute_cu_seqlens = None if dense_local_cp else cu_seqlens
+    compute_chunk_indices = None if dense_local_cp else chunk_indices
+    if compute_cu_seqlens is not None and compute_chunk_indices is None:
         if packed_metadata is not None:
-            chunk_indices = packed_metadata.chunk_indices
+            compute_chunk_indices = packed_metadata.chunk_indices
         else:
-            chunk_indices = prepare_chunk_indices(
-                cu_seqlens, _CHUNK_SIZE, cu_seqlens_cpu=cu_seqlens_cpu
+            compute_chunk_indices = prepare_chunk_indices(
+                compute_cu_seqlens, _CHUNK_SIZE, cu_seqlens_cpu=cu_seqlens_cpu
             )
+    saved_chunk_indices = None if dense_local_cp else compute_chunk_indices
     g = chunk_local_cumsum(
-        g, chunk_size=_CHUNK_SIZE, scale=RCP_LN2, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
+        g,
+        chunk_size=_CHUNK_SIZE,
+        scale=RCP_LN2,
+        cu_seqlens=compute_cu_seqlens,
+        chunk_indices=compute_chunk_indices,
     )
     intra_kwargs = {
         "k": k,
         "v": v,
         "g": g,
         "beta": beta,
-        "cu_seqlens": cu_seqlens,
-        "chunk_indices": chunk_indices,
+        "cu_seqlens": compute_cu_seqlens,
+        "chunk_indices": compute_chunk_indices,
         "chunk_size": _CHUNK_SIZE,
         "use_exp2": True,
     }
@@ -983,8 +1134,8 @@ def _fla_forward_for_fused_bwd(
             k=k,
             g=g,
             beta=beta,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
+            cu_seqlens=compute_cu_seqlens,
+            chunk_indices=compute_chunk_indices,
             chunk_size=_CHUNK_SIZE,
             output_dtype=torch.float32,
             use_exp2=True,
@@ -992,8 +1143,8 @@ def _fla_forward_for_fused_bwd(
         A = _call_fla_compat(
             solve_tril,
             A=A,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
+            cu_seqlens=compute_cu_seqlens,
+            chunk_indices=compute_chunk_indices,
             output_dtype=k.dtype,
         )
         w, u = _call_fla_compat(recompute_w_u_fwd, A=A, **intra_kwargs)
@@ -1025,8 +1176,8 @@ def _fla_forward_for_fused_bwd(
         initial_state=initial_state,
         output_final_state=False,
         save_new_value=True,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
+        cu_seqlens=compute_cu_seqlens,
+        chunk_indices=compute_chunk_indices,
         use_exp2=True,
         transpose_state_layout=False,
     )
@@ -1038,8 +1189,8 @@ def _fla_forward_for_fused_bwd(
         h=h,
         g=g,
         scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
+        cu_seqlens=compute_cu_seqlens,
+        chunk_indices=compute_chunk_indices,
         use_exp2=True,
         transpose_state_layout=False,
     )
@@ -1053,7 +1204,7 @@ def _fla_forward_for_fused_bwd(
     saved_initial_state = (
         compress_h0(initial_state, context=cp_context) if cp_context is not None else None
     )
-    return g, output, A, saved_h, chunk_indices, saved_initial_state
+    return g, output, A, saved_h, saved_chunk_indices, saved_initial_state
 
 
 def _cutedsl_forward(
@@ -1066,6 +1217,7 @@ def _cutedsl_forward(
     scale: float,
     cu_seqlens: torch.Tensor | None,
     cu_seqlens_cpu: torch.Tensor | None,
+    chunk_indices: torch.Tensor | None = None,
     packed_metadata: _PackedChunkMetadata | None = None,
     save_fused_bwd_state: bool = False,
 ) -> tuple[
@@ -1082,8 +1234,7 @@ def _cutedsl_forward(
     dense_metadata = (
         _dense_chunk_metadata(batch_size, seqlen, q.device) if cu_seqlens is None else None
     )
-    chunk_indices = None
-    if cu_seqlens is not None:
+    if cu_seqlens is not None and chunk_indices is None:
         if packed_metadata is not None:
             chunk_indices = packed_metadata.chunk_indices
         else:
@@ -1202,6 +1353,7 @@ def _cutedsl_backward(
                 do=do,
                 dht=dht,
                 cu_seqlens=cu_seqlens,
+                cu_seqlens_cpu=cu_seqlens_cpu,
                 chunk_indices=chunk_indices,
                 initial_state=initial_state,
                 cp_context=cp_context,
@@ -1257,12 +1409,14 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
         scale: float,
         cu_seqlens: torch.LongTensor | None,
         cu_seqlens_cpu: torch.LongTensor | None,
+        validated_chunk_indices: torch.LongTensor | None,
         validated_chunk_offsets: torch.LongTensor | None,
         recompute_h: bool,
         cp_context: object | None,
     ):
         mode = _backend_mode()
         trust_device_cu_seqlens = cu_seqlens_cpu is not None
+        _validate_validated_chunk_indices(validated_chunk_indices, cu_seqlens)
         if validated_chunk_offsets is not None and (
             cu_seqlens is None
             or validated_chunk_offsets.shape != cu_seqlens.shape
@@ -1277,12 +1431,29 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q, k, v, g, beta, cu_seqlens, cu_seqlens_cpu, trust_device_cu_seqlens
         )
         save_fused_bwd_state = use_fused_bwd and not recompute_h
+        dense_local_cp = (
+            cp_context is not None
+            and q.shape[0] == 1
+            and _single_sequence_covers_tokens(
+                cu_seqlens, cu_seqlens_cpu, total_tokens=q.shape[1]
+            )
+        )
         saved_h = None
-        packed_metadata = _packed_chunk_metadata(cu_seqlens, cu_seqlens_cpu)
-        chunk_offsets = packed_metadata.chunk_offsets if packed_metadata is not None else None
-        if validated_chunk_offsets is not None:
-            chunk_offsets = validated_chunk_offsets
         saved_initial_state = None
+        packed_metadata = None
+        chunk_indices = validated_chunk_indices
+        chunk_offsets = validated_chunk_offsets
+        if cu_seqlens is not None and not dense_local_cp and chunk_indices is None:
+            packed_metadata = _packed_chunk_metadata(cu_seqlens, cu_seqlens_cpu)
+            if packed_metadata is not None:
+                chunk_indices = packed_metadata.chunk_indices
+                if chunk_offsets is None:
+                    chunk_offsets = packed_metadata.chunk_offsets
+        elif cu_seqlens is not None and chunk_offsets is None:
+            offsets_metadata = _packed_chunk_offsets(cu_seqlens, cu_seqlens_cpu)
+            if offsets_metadata is not None:
+                chunk_offsets = offsets_metadata.chunk_offsets
+
         if cp_context is not None or (mode != "cute" and use_fused_bwd):
             g, output, A, saved_h, chunk_indices, saved_initial_state = _fla_forward_for_fused_bwd(
                 q=q,
@@ -1293,9 +1464,11 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
                 scale=scale,
                 cu_seqlens=cu_seqlens,
                 cu_seqlens_cpu=cu_seqlens_cpu,
+                chunk_indices=chunk_indices,
                 packed_metadata=packed_metadata,
                 cp_context=cp_context,
                 save_fused_bwd_state=save_fused_bwd_state,
+                dense_local_cp=dense_local_cp,
             )
         else:
             g, output, A, saved_h, chunk_indices, generated_chunk_offsets = _cutedsl_forward(
@@ -1307,6 +1480,7 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
                 scale=scale,
                 cu_seqlens=cu_seqlens,
                 cu_seqlens_cpu=cu_seqlens_cpu,
+                chunk_indices=chunk_indices,
                 packed_metadata=packed_metadata,
                 save_fused_bwd_state=save_fused_bwd_state,
             )
@@ -1369,6 +1543,7 @@ class InternalChunkGatedDeltaRuleFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -1388,6 +1563,7 @@ def chunk_gated_delta_rule(
     state_v_first: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
+    validated_chunk_indices: torch.LongTensor | None = None,
     validated_chunk_offsets: torch.LongTensor | None = None,
     cp_context: object | None = None,
     recompute_h: bool = False,
@@ -1425,13 +1601,14 @@ def chunk_gated_delta_rule(
     if cp_context is not None:
         # CP context offsets replace the caller's packed offsets. Its CPU metadata,
         # when present, is independently validated by the support checks below.
-        validated_chunk_offsets = None
         cp_cu_seqlens = getattr(cp_context, "cu_seqlens", None)
         if cp_cu_seqlens is None:
             raise ValueError("cp_context.cu_seqlens is required for context parallel GDR")
         if q.shape[0] > 1:
             cu_seqlens = None
             cu_seqlens_cpu = None
+            validated_chunk_indices = None
+            validated_chunk_offsets = None
         else:
             cu_seqlens = cp_cu_seqlens
             cp_cu_seqlens_cpu = getattr(cp_context, "cu_seqlens_cpu", None)
@@ -1486,6 +1663,7 @@ def chunk_gated_delta_rule(
         scale,
         cu_seqlens,
         cu_seqlens_cpu,
+        validated_chunk_indices,
         validated_chunk_offsets,
         recompute_h,
         cp_context,

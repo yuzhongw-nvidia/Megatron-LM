@@ -23,6 +23,34 @@ def _load_internal_chunk_gated_delta_rule() -> (
     return chunk_gated_delta_rule
 
 
+@lru_cache(maxsize=1)
+def _load_internal_prepare_validated_chunk_metadata() -> (
+    Callable[..., tuple[torch.Tensor | None, torch.Tensor | None]]
+):
+    """Load the metadata helper only when the internal backend needs it."""
+    try:
+        from .implementation import prepare_validated_chunk_metadata
+    except ImportError as exc:
+        raise RuntimeError(
+            "The internal GDR backend requires the flash-linear-attention dependency "
+            "from the Megatron Core development environment."
+        ) from exc
+    return prepare_validated_chunk_metadata
+
+
+def prepare_validated_chunk_metadata(
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
+    *,
+    include_chunk_indices: bool = True,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Prepare trusted packed metadata before entering the profiled GDR region."""
+    helper = _load_internal_prepare_validated_chunk_metadata()
+    return helper(
+        cu_seqlens, cu_seqlens_cpu, include_chunk_indices=include_chunk_indices
+    )
+
+
 def chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -38,6 +66,7 @@ def chunk_gated_delta_rule(
     state_v_first: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     cu_seqlens_cpu: torch.LongTensor | None = None,
+    validated_chunk_indices: torch.LongTensor | None = None,
     validated_chunk_offsets: torch.LongTensor | None = None,
     cp_context: object | None = None,
     recompute_h: bool = False,
@@ -71,6 +100,7 @@ def chunk_gated_delta_rule(
         state_v_first=state_v_first,
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
+        validated_chunk_indices=validated_chunk_indices,
         validated_chunk_offsets=validated_chunk_offsets,
         cp_context=cp_context,
         recompute_h=recompute_h,
