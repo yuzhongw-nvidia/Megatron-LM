@@ -984,7 +984,6 @@ class MLAWithLatentCP(MLASelfAttention):
                     "recomputed phase lost its pre-expanded K/V tensors",
                 )
                 execute_off_main = phase_index % 2 == 1
-                execution_stream = attention_stream if execute_off_main else None
                 completion_event: torch.cuda.Event | None = None
                 if execute_off_main:
                     _require(
@@ -999,18 +998,29 @@ class MLAWithLatentCP(MLASelfAttention):
                 q_phase.record_stream(ready_stream)
                 phase_key.record_stream(ready_stream)
                 phase_value.record_stream(ready_stream)
-                partial_output, partial_lse = recomputed_forward(
-                    q_phase,
-                    payload_phase,
-                    phase_key,
-                    phase_value,
-                    phase,
-                    self.softmax_scale,
-                    self._expand_phase_kv,
-                    execution_stream,
-                    completion_event,
-                    *projection_parameters,
-                )
+
+                def launch_recomputed_phase() -> tuple[Tensor, Tensor]:
+                    return recomputed_forward(
+                        q_phase,
+                        payload_phase,
+                        phase_key,
+                        phase_value,
+                        phase,
+                        self.softmax_scale,
+                        self._expand_phase_kv,
+                        *projection_parameters,
+                    )
+
+                if execute_off_main:
+                    with torch.cuda.stream(ready_stream):
+                        partial_output, partial_lse = launch_recomputed_phase()
+                        _require(
+                            completion_event is not None,
+                            "alternate attention completion event is missing",
+                        )
+                        completion_event.record(ready_stream)
+                else:
+                    partial_output, partial_lse = launch_recomputed_phase()
             # The custom cuDNN boundary does not retain expanded K/V. Drop the
             # Python references before the generator stages a later phase.
             del phase_key, phase_value

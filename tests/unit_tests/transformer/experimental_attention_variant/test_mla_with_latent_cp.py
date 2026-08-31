@@ -1263,6 +1263,10 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
                 grad_output.to(v.dtype),
             )
 
+        @staticmethod
+        def _serialized_projection_gradients(calculate):
+            return calculate()
+
     torch.manual_seed(51)
     query = torch.randn(5, 1, 2, requires_grad=True)
     payload = torch.randn(5, 2, requires_grad=True)
@@ -1308,8 +1312,6 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
         1.0,
         adapter,
         expand_phase_kv,
-        None,
-        None,
         weight,
         norm_weight,
     )
@@ -1332,13 +1334,14 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_cudnn_selective_recompute_overlaps_only_forward_attention():
-    """Alternate forward execution must not move projection replay off the caller stream."""
+def test_cudnn_selective_recompute_preserves_canonical_phase_stream():
+    """Forward and backward must stay on the phase's canonical CUDA stream."""
 
     class FakeAdapter:
         def __init__(self):
             self.forward_stream = None
             self.backward_stream = None
+            self.projection_gradient_stream = None
 
         def _execute_forward(self, q, k, v, *_args):
             self.forward_stream = torch.cuda.current_stream().cuda_stream
@@ -1352,6 +1355,10 @@ def test_cudnn_selective_recompute_overlaps_only_forward_attention():
                 grad_output.to(k.dtype),
                 grad_output.to(v.dtype),
             )
+
+        def _serialized_projection_gradients(self, calculate):
+            self.projection_gradient_stream = torch.cuda.current_stream().cuda_stream
+            return calculate()
 
     caller_stream = torch.cuda.current_stream()
     attention_stream = torch.cuda.Stream()
@@ -1381,26 +1388,27 @@ def test_cudnn_selective_recompute_overlaps_only_forward_attention():
     adapter = FakeAdapter()
     with torch.no_grad():
         key, value = expand_phase_kv(payload, phase)
-    output, _ = latent_cp_cudnn_backend._CudnnRecomputedPhaseFunction.apply(
-        query,
-        payload,
-        key,
-        value,
-        phase,
-        1.0,
-        adapter,
-        expand_phase_kv,
-        attention_stream,
-        completion_event,
-        weight,
-    )
+    with torch.cuda.stream(attention_stream):
+        output, _ = latent_cp_cudnn_backend._CudnnRecomputedPhaseFunction.apply(
+            query,
+            payload,
+            key,
+            value,
+            phase,
+            1.0,
+            adapter,
+            expand_phase_kv,
+            weight,
+        )
+        completion_event.record(attention_stream)
     caller_stream.wait_event(completion_event)
     output.record_stream(caller_stream)
     output.sum().backward()
     torch.cuda.synchronize()
 
     assert adapter.forward_stream == attention_stream.cuda_stream
-    assert adapter.backward_stream == caller_stream.cuda_stream
+    assert adapter.backward_stream == attention_stream.cuda_stream
+    assert adapter.projection_gradient_stream == attention_stream.cuda_stream
 
 
 def test_merge_scatter_and_cudnn_proxy_extremes():

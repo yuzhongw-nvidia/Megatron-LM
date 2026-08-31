@@ -510,9 +510,12 @@ stream that consumes that K/V. Forward attention phases alternate between the or
 one adapter-shared attention stream, and partial merges are submitted only after every phase
 attention launch. This overlaps phase `i+1` projection and neighboring attention phases with phase
 `i` attention without retaining a differentiable projection graph. Forward expansion runs under
-`no_grad`; the custom autograd node remains owned by the ordinary caller stream, so backward replay,
-cuDNN backward, and projection-gradient accumulation stay serialized there. FA4 keeps its checkpoint
-path and does not use this stream pipeline.
+`no_grad`. Each custom autograd node is created on the stream that executes its phase, so PyTorch's
+producer/consumer stream contract returns that phase's replay and cuDNN backward to the same
+canonical stream. Neighboring phase backward work can therefore overlap. The adapter separately
+chains projection-gradient completion events across those streams because TE gradient-accumulation
+fusion updates one shared `main_grad`; only that side effect remains serialized. FA4 keeps its
+checkpoint path and does not use this stream pipeline.
 
 Full K/V exist only during the initial phase forward, the one-phase-ahead projection window, and the
 short projection replay; they are never sent or stored in ring state.
@@ -1041,8 +1044,8 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    exchange is submitted on the dedicated stream before the current lease is yielded. Every returned
    work must be waited exactly once: forward waits run on an explicitly supplied projection stream,
    while reverse-autograd waits remain on the ordinary consumer stream. Alternating cuDNN forward
-   phases must execute on the ordinary/secondary attention streams, while the custom backward stays
-   on the ordinary caller stream. Relay sends must alias the
+   phases and their custom backwards must execute on the same ordinary/secondary canonical streams,
+   while projection-gradient side effects remain explicitly event-serialized. Relay sends must alias the
    corresponding immutable lease rather than stage a D2D copy. After construction, patch
    `parallel_state.get_tensor_model_parallel_group`,
    `get_context_parallel_group`, and `get_tensor_and_context_parallel_group` to raise throughout
