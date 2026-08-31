@@ -203,29 +203,60 @@ class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
         scale: float,
         adapter: "CudnnFusedAttentionAdapter",
         expand_phase_kv: Callable[[Tensor, PhaseSpec], tuple[Tensor, Tensor]],
+        execution_stream: torch.cuda.Stream | None,
+        completion_event: torch.cuda.Event | None,
         *projection_parameters: Tensor,
     ) -> tuple[Tensor, Tensor]:
         _require(
             not key.requires_grad and not value.requires_grad,
             "pre-expanded forward K/V must not retain a projection graph",
         )
-        raw_output, stats = adapter._execute_forward(
-            query,
-            key,
-            value,
-            phase.cu_seqlens_q,
-            phase.cu_seqlens_kv,
-            phase.max_seqlen_q,
-            phase.max_seqlen_kv,
-            phase.causal,
-            scale,
+        _require(
+            (execution_stream is None) == (completion_event is None),
+            "alternate cuDNN execution requires one completion event",
         )
+        caller_stream = (
+            torch.cuda.current_stream(query.device) if query.is_cuda else None
+        )
+
+        def execute() -> tuple[Tensor, Tensor]:
+            return adapter._execute_forward(
+                query,
+                key,
+                value,
+                phase.cu_seqlens_q,
+                phase.cu_seqlens_kv,
+                phase.max_seqlen_q,
+                phase.max_seqlen_kv,
+                phase.causal,
+                scale,
+            )
+
+        if execution_stream is None:
+            raw_output, stats = execute()
+            output, lse = raw_output.float(), stats.float()
+        else:
+            _require(query.is_cuda, "alternate cuDNN execution requires CUDA tensors")
+            with torch.cuda.stream(execution_stream):
+                query.record_stream(execution_stream)
+                key.record_stream(execution_stream)
+                value.record_stream(execution_stream)
+                raw_output, stats = execute()
+                output, lse = raw_output.float(), stats.float()
+                completion_event.record(execution_stream)
+            _require(caller_stream is not None, "CUDA caller stream is missing")
+            for tensor in (raw_output, stats, output, lse):
+                tensor.record_stream(caller_stream)
         ctx.save_for_backward(query, payload, raw_output, stats, *projection_parameters)
         ctx.phase = phase
         ctx.scale = scale
         ctx.adapter = adapter
         ctx.expand_phase_kv = expand_phase_kv
-        return raw_output.float(), stats.float()
+        ctx.caller_stream_id = (
+            None if caller_stream is None else int(caller_stream.cuda_stream)
+        )
+        ctx.completion_event = completion_event
+        return output, lse
 
     @staticmethod
     def backward(
@@ -236,6 +267,14 @@ class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
             projection_parameters, "latent-KV projection has no trainable parameters"
         )
         phase = ctx.phase
+        if query.is_cuda:
+            backward_stream = torch.cuda.current_stream(query.device)
+            _require(
+                int(backward_stream.cuda_stream) == ctx.caller_stream_id,
+                "latent-KV projection backward must remain on its caller stream",
+            )
+            if ctx.completion_event is not None:
+                backward_stream.wait_event(ctx.completion_event)
         if grad_output is None:
             grad_output = torch.zeros_like(raw_output, dtype=torch.float32)
         if grad_lse is None:
@@ -271,7 +310,19 @@ class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
             )
             grad_payload, *grad_parameters = projection_gradients
         _require(grad_payload is not None, "latent-KV replay lost its payload gradient")
-        return dq, grad_payload, None, None, None, None, None, None, *grad_parameters
+        return (
+            dq,
+            grad_payload,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            *grad_parameters,
+        )
 
 
 def _resolve_cudnn_frontend_version(cudnn: Any) -> str:
@@ -317,6 +368,7 @@ class CudnnFusedAttentionAdapter:
             capability = torch.cuda.get_device_capability(self.device_index)
             self._handle = self.cudnn.create_handle()
             self._projection_stream = torch.cuda.Stream(device=self.device_index)
+            self._attention_stream = torch.cuda.Stream(device=self.device_index)
         self.identity: QualifiedBackendTuple = (
             AttnBackend.fused,
             self.frontend_version,
@@ -937,6 +989,8 @@ class CudnnFusedAttentionAdapter:
         phase: PhaseSpec,
         scale: float,
         expand_phase_kv: Callable[[Tensor, PhaseSpec], tuple[Tensor, Tensor]],
+        execution_stream: torch.cuda.Stream | None,
+        completion_event: torch.cuda.Event | None,
         *projection_parameters: Tensor,
     ) -> tuple[Tensor, Tensor]:
         """Execute SDPA while retaining only latent payload plus cuDNN O/LSE state."""
@@ -950,6 +1004,8 @@ class CudnnFusedAttentionAdapter:
             scale,
             self,
             expand_phase_kv,
+            execution_stream,
+            completion_event,
             *projection_parameters,
         )
 
@@ -961,6 +1017,15 @@ class CudnnFusedAttentionAdapter:
             "projection stream belongs to a different CUDA device",
         )
         return self._projection_stream
+
+    def attention_stream(self) -> torch.cuda.Stream:
+        """Return the second stream used by alternating forward attention phases."""
+
+        _require(
+            torch.cuda.current_device() == self.device_index,
+            "attention stream belongs to a different CUDA device",
+        )
+        return self._attention_stream
 
 
 _CUDNN_ADAPTER_CACHE_LOCK: Final[threading.Lock] = threading.Lock()

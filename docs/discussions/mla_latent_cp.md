@@ -505,11 +505,14 @@ public API exposes an equally narrow split forward/backward ownership boundary.
 
 For the cuDNN selective-recompute path, phase zero expands K/V on the ordinary stream. Before its
 attention launch, the next lease is ordered on one adapter-shared projection stream and its
-latent-KV up projection plus K/V packing are submitted there. A recorded event orders the ordinary
-stream only when that next phase is consumed. Repeating this schedule overlaps phase `i+1`
-projection with phase `i` attention without retaining a differentiable projection graph: forward
-expansion runs under `no_grad`, while backward replays the same projection through the custom
-autograd boundary. FA4 keeps its checkpoint path and does not use this stream pipeline.
+latent-KV up projection plus K/V packing are submitted there. A recorded event orders only the
+stream that consumes that K/V. Forward attention phases alternate between the ordinary stream and
+one adapter-shared attention stream, and partial merges are submitted only after every phase
+attention launch. This overlaps phase `i+1` projection and neighboring attention phases with phase
+`i` attention without retaining a differentiable projection graph. Forward expansion runs under
+`no_grad`; the custom autograd node remains owned by the ordinary caller stream, so backward replay,
+cuDNN backward, and projection-gradient accumulation stay serialized there. FA4 keeps its checkpoint
+path and does not use this stream pipeline.
 
 Full K/V exist only during the initial phase forward, the one-phase-ahead projection window, and the
 short projection replay; they are never sent or stored in ring state.
@@ -1037,7 +1040,9 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    that every recorded `P2POp` constructor receives the effective CP group, and that the next
    exchange is submitted on the dedicated stream before the current lease is yielded. Every returned
    work must be waited exactly once: forward waits run on an explicitly supplied projection stream,
-   while reverse-autograd waits remain on the ordinary consumer stream. Relay sends must alias the
+   while reverse-autograd waits remain on the ordinary consumer stream. Alternating cuDNN forward
+   phases must execute on the ordinary/secondary attention streams, while the custom backward stays
+   on the ordinary caller stream. Relay sends must alias the
    corresponding immutable lease rather than stage a D2D copy. After construction, patch
    `parallel_state.get_tensor_model_parallel_group`,
    `get_context_parallel_group`, and `get_tensor_and_context_parallel_group` to raise throughout

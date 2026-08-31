@@ -703,7 +703,15 @@ class MLAWithLatentCP(MLASelfAttention):
         transport: LatentCPTransport,
         local_payload: Tensor,
         phases: tuple[latent_cp_layout.PhaseSpec, ...],
-    ) -> Iterator[tuple[latent_cp_layout.PhaseSpec, PayloadLease, Tensor, Tensor]]:
+    ) -> Iterator[
+        tuple[
+            latent_cp_layout.PhaseSpec,
+            PayloadLease,
+            Tensor,
+            Tensor,
+            torch.cuda.Event | None,
+        ]
+    ]:
         """Pipeline each next latent-KV expansion with the current cuDNN phase."""
 
         stream_factory = getattr(backend, "projection_stream", None)
@@ -757,12 +765,13 @@ class MLAWithLatentCP(MLASelfAttention):
                     ready,
                 )
 
-            if current_ready is not None:
-                consumer_stream = torch.cuda.current_stream(current_key.device)
-                consumer_stream.wait_event(current_ready)
-                current_key.record_stream(consumer_stream)
-                current_value.record_stream(consumer_stream)
-            yield current_phase, current_lease, current_key, current_value
+            yield (
+                current_phase,
+                current_lease,
+                current_key,
+                current_value,
+                current_ready,
+            )
 
             if next_state is not None:
                 (
@@ -849,73 +858,14 @@ class MLAWithLatentCP(MLASelfAttention):
         subset_indices: Tensor | None = None
         subset_slice: tuple[int, int] | None = None
         lease_count = 0
-        recomputed_forward = getattr(backend, "forward_recomputed_phase", None)
-        projection_parameters: tuple[Tensor, ...] = ()
-        if recomputed_forward is not None:
-            projection_parameters = tuple(
-                parameter
-                for parameter in self.linear_kv_up_proj.parameters()
-                if parameter.requires_grad
-            )
-            _require(
-                projection_parameters,
-                "latent-KV up projection has no trainable parameters",
-            )
-        if recomputed_forward is None:
-            leases = transport.iter_payloads(local_payload, layout.phases)
-            phase_inputs = (
-                (phase, lease, None, None)
-                for phase, lease in zip(layout.phases, leases, strict=True)
-            )
-        else:
-            phase_inputs = self._iter_recomputed_phases(
-                backend, transport, local_payload, layout.phases
-            )
 
-        for phase, lease, phase_key, phase_value in phase_inputs:
-            lease_count += 1
-            _require(
-                lease.owner == phase.owner, "transport owner order disagrees with plan"
-            )
-            q_phase = self._phase_rows(query, phase.q_indices, phase.q_slice)
-            payload_phase = lease.tensor
-
-            def run_phase(
-                q_input: Tensor,
-                payload_input: Tensor,
-                phase_spec: latent_cp_layout.PhaseSpec = phase,
-                phase_backend: DirectAttentionAdapter = backend,
-            ) -> tuple[Tensor, Tensor]:
-                return self._phase_attention(
-                    q_input, payload_input, phase_spec, phase_backend
-                )
-
-            if recomputed_forward is None:
-                partial_output, partial_lse = checkpoint(
-                    run_phase,
-                    q_phase,
-                    payload_phase,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
-                )
-            else:
-                _require(
-                    phase_key is not None and phase_value is not None,
-                    "recomputed phase lost its pre-expanded K/V tensors",
-                )
-                partial_output, partial_lse = recomputed_forward(
-                    q_phase,
-                    payload_phase,
-                    phase_key,
-                    phase_value,
-                    phase,
-                    self.softmax_scale,
-                    self._expand_phase_kv,
-                    *projection_parameters,
-                )
-            # The custom cuDNN boundary does not retain expanded K/V. Drop the
-            # Python references before the generator stages a later phase.
-            del phase_key, phase_value
+        def merge_phase(
+            phase: latent_cp_layout.PhaseSpec,
+            partial_output: Tensor,
+            partial_lse: Tensor,
+        ) -> None:
+            nonlocal merged_output, merged_lse
+            nonlocal subset_output, subset_lse, subset_indices, subset_slice
             if merged_output is None:
                 _require(
                     phase.scatter_indices is None,
@@ -944,6 +894,139 @@ class MLAWithLatentCP(MLASelfAttention):
                 subset_output, subset_lse = latent_cp_utils.merge_attention_partials(
                     subset_output, subset_lse, partial_output, partial_lse
                 )
+
+        recomputed_forward = getattr(backend, "forward_recomputed_phase", None)
+        projection_parameters: tuple[Tensor, ...] = ()
+        consumer_stream = torch.cuda.current_stream(query.device)
+        attention_stream: torch.cuda.Stream | None = None
+        phase_queries: tuple[Tensor, ...] | None = None
+        pending_merges: list[
+            tuple[
+                latent_cp_layout.PhaseSpec,
+                Tensor,
+                Tensor,
+                torch.cuda.Event | None,
+            ]
+        ] = []
+        if recomputed_forward is not None:
+            projection_parameters = tuple(
+                parameter
+                for parameter in self.linear_kv_up_proj.parameters()
+                if parameter.requires_grad
+            )
+            _require(
+                projection_parameters,
+                "latent-KV up projection has no trainable parameters",
+            )
+            attention_stream_factory = getattr(backend, "attention_stream", None)
+            _require(
+                callable(attention_stream_factory),
+                "recomputed backend has no alternate attention stream",
+            )
+            attention_stream = attention_stream_factory()
+            phase_queries = tuple(
+                self._phase_rows(query, phase.q_indices, phase.q_slice)
+                for phase in layout.phases
+            )
+            query_ready = torch.cuda.Event()
+            query_ready.record(consumer_stream)
+            attention_stream.wait_event(query_ready)
+        if recomputed_forward is None:
+            leases = transport.iter_payloads(local_payload, layout.phases)
+            phase_inputs = (
+                (phase, lease, None, None, None)
+                for phase, lease in zip(layout.phases, leases, strict=True)
+            )
+        else:
+            phase_inputs = self._iter_recomputed_phases(
+                backend, transport, local_payload, layout.phases
+            )
+
+        for phase_index, (
+            phase,
+            lease,
+            phase_key,
+            phase_value,
+            phase_ready,
+        ) in enumerate(phase_inputs):
+            lease_count += 1
+            _require(
+                lease.owner == phase.owner, "transport owner order disagrees with plan"
+            )
+            q_phase = (
+                self._phase_rows(query, phase.q_indices, phase.q_slice)
+                if phase_queries is None
+                else phase_queries[phase_index]
+            )
+            payload_phase = lease.tensor
+
+            def run_phase(
+                q_input: Tensor,
+                payload_input: Tensor,
+                phase_spec: latent_cp_layout.PhaseSpec = phase,
+                phase_backend: DirectAttentionAdapter = backend,
+            ) -> tuple[Tensor, Tensor]:
+                return self._phase_attention(
+                    q_input, payload_input, phase_spec, phase_backend
+                )
+
+            if recomputed_forward is None:
+                partial_output, partial_lse = checkpoint(
+                    run_phase,
+                    q_phase,
+                    payload_phase,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                _require(
+                    phase_key is not None and phase_value is not None,
+                    "recomputed phase lost its pre-expanded K/V tensors",
+                )
+                execute_off_main = phase_index % 2 == 1
+                execution_stream = attention_stream if execute_off_main else None
+                completion_event: torch.cuda.Event | None = None
+                if execute_off_main:
+                    _require(
+                        attention_stream is not None,
+                        "alternate attention stream is missing",
+                    )
+                    completion_event = torch.cuda.Event()
+                ready_stream = attention_stream if execute_off_main else consumer_stream
+                _require(ready_stream is not None, "phase execution stream is missing")
+                if phase_ready is not None:
+                    ready_stream.wait_event(phase_ready)
+                q_phase.record_stream(ready_stream)
+                phase_key.record_stream(ready_stream)
+                phase_value.record_stream(ready_stream)
+                partial_output, partial_lse = recomputed_forward(
+                    q_phase,
+                    payload_phase,
+                    phase_key,
+                    phase_value,
+                    phase,
+                    self.softmax_scale,
+                    self._expand_phase_kv,
+                    execution_stream,
+                    completion_event,
+                    *projection_parameters,
+                )
+            # The custom cuDNN boundary does not retain expanded K/V. Drop the
+            # Python references before the generator stages a later phase.
+            del phase_key, phase_value
+            if recomputed_forward is None:
+                merge_phase(phase, partial_output, partial_lse)
+            else:
+                pending_merges.append(
+                    (phase, partial_output, partial_lse, completion_event)
+                )
+
+        for phase, partial_output, partial_lse, completion_event in pending_merges:
+            if completion_event is not None:
+                consumer_stream.wait_event(completion_event)
+                partial_output.record_stream(consumer_stream)
+                partial_lse.record_stream(consumer_stream)
+            merge_phase(phase, partial_output, partial_lse)
 
         _require(
             lease_count == len(layout.phases),
