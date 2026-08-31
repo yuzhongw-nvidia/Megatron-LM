@@ -1333,6 +1333,78 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
     assert adapter.backward_calls == 1
 
 
+def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
+    monkeypatch,
+):
+    """The next projection must be staged only after current attention is enqueued."""
+
+    order = []
+    projection_stream = object()
+    phases = tuple(SimpleNamespace(phase=index, owner=index) for index in range(4))
+
+    class FakePayload:
+        def __init__(self, phase_index):
+            self.phase_index = phase_index
+
+        def record_stream(self, stream):
+            assert stream is projection_stream
+
+    class FakeTransport:
+        @staticmethod
+        def iter_payloads(_local_payload, phase_plan, consumer_stream=None):
+            assert phase_plan is phases
+            assert consumer_stream is projection_stream
+            for phase in phase_plan:
+                yield SimpleNamespace(
+                    owner=phase.owner, tensor=FakePayload(phase.phase)
+                )
+
+    class FakeBackend:
+        @staticmethod
+        def projection_stream():
+            return projection_stream
+
+    class FakeEvent:
+        def record(self, stream):
+            assert stream is projection_stream
+
+    class Harness:
+        @staticmethod
+        def _expand_phase_kv(payload, phase):
+            assert payload.phase_index == phase.phase
+            order.append(("projection", phase.phase))
+            return object(), object()
+
+    @contextmanager
+    def use_stream(stream):
+        assert stream is projection_stream
+        yield
+
+    monkeypatch.setattr(latent_cp_module.torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(latent_cp_module.torch.cuda, "Event", FakeEvent)
+    phase_inputs = latent_cp_module.MLAWithLatentCP._iter_recomputed_phases(
+        Harness(), FakeBackend(), FakeTransport(), FakePayload(-1), phases
+    )
+    ready = []
+    for phase, lease, _key, _value, phase_ready in phase_inputs:
+        assert lease.owner == phase.owner
+        order.append(("attention", phase.phase))
+        ready.append(phase_ready)
+
+    assert order == [
+        ("projection", 0),
+        ("attention", 0),
+        ("projection", 1),
+        ("attention", 1),
+        ("projection", 2),
+        ("attention", 2),
+        ("projection", 3),
+        ("attention", 3),
+    ]
+    assert ready[0] is None
+    assert all(isinstance(event, FakeEvent) for event in ready[1:])
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_cudnn_selective_recompute_preserves_canonical_phase_stream():
     """Forward and backward must stay on the phase's canonical CUDA stream."""

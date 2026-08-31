@@ -735,36 +735,9 @@ class MLAWithLatentCP(MLASelfAttention):
         current_ready: torch.cuda.Event | None = None
 
         for phase_index in range(len(phases)):
-            next_state: (
-                tuple[
-                    latent_cp_layout.PhaseSpec,
-                    PayloadLease,
-                    Tensor,
-                    Tensor,
-                    torch.cuda.Event,
-                ]
-                | None
-            ) = None
-            if phase_index + 1 < len(phases):
-                next_phase = phases[phase_index + 1]
-                next_lease = next(leases)
-                next_payload = next_lease.tensor
-                with torch.cuda.stream(projection_stream):
-                    next_payload.record_stream(projection_stream)
-                    with torch.no_grad():
-                        next_key, next_value = self._expand_phase_kv(
-                            next_payload, next_phase
-                        )
-                    ready = torch.cuda.Event()
-                    ready.record(projection_stream)
-                next_state = (
-                    next_phase,
-                    next_lease,
-                    next_key,
-                    next_value,
-                    ready,
-                )
-
+            # Suspend before staging the next phase. The caller first enqueues the
+            # current attention, then resumes this generator so the next projection
+            # can overlap work that is already resident on an attention stream.
             yield (
                 current_phase,
                 current_lease,
@@ -773,14 +746,19 @@ class MLAWithLatentCP(MLASelfAttention):
                 current_ready,
             )
 
-            if next_state is not None:
-                (
-                    current_phase,
-                    current_lease,
-                    current_key,
-                    current_value,
-                    current_ready,
-                ) = next_state
+            if phase_index + 1 >= len(phases):
+                continue
+            current_phase = phases[phase_index + 1]
+            current_lease = next(leases)
+            current_payload = current_lease.tensor
+            with torch.cuda.stream(projection_stream):
+                current_payload.record_stream(projection_stream)
+                with torch.no_grad():
+                    current_key, current_value = self._expand_phase_kv(
+                        current_payload, current_phase
+                    )
+                current_ready = torch.cuda.Event()
+                current_ready.record(projection_stream)
 
         _require(
             next(leases, None) is None, "transport yielded too many payload leases"
