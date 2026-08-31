@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 import torch.distributed as dist
@@ -34,7 +34,7 @@ from . import layout as latent_cp_layout
 from . import utils as latent_cp_utils
 from .backend import DirectAttentionAdapter, _qualified_backend_adapter
 from .layout import AlreadyZigZagTHDAdapter
-from .transport import LatentCPTransport, P2PRingTransport
+from .transport import LatentCPTransport, P2PRingTransport, PayloadLease
 from .utils import LatentCPError, QualifiedBackendTuple, _require
 
 if HAVE_TE:
@@ -697,6 +697,86 @@ class MLAWithLatentCP(MLASelfAttention):
             self.config.v_head_dim,
         )
 
+    def _iter_recomputed_phases(
+        self,
+        backend: DirectAttentionAdapter,
+        transport: LatentCPTransport,
+        local_payload: Tensor,
+        phases: tuple[latent_cp_layout.PhaseSpec, ...],
+    ) -> Iterator[tuple[latent_cp_layout.PhaseSpec, PayloadLease, Tensor, Tensor]]:
+        """Pipeline each next latent-KV expansion with the current cuDNN phase."""
+
+        stream_factory = getattr(backend, "projection_stream", None)
+        _require(
+            callable(stream_factory), "recomputed backend has no projection stream"
+        )
+        projection_stream = stream_factory()
+        _require(phases, "phase plan must not be empty")
+        leases = iter(
+            transport.iter_payloads(
+                local_payload, phases, consumer_stream=projection_stream
+            )
+        )
+
+        current_phase = phases[0]
+        current_lease = next(leases)
+        with torch.no_grad():
+            current_key, current_value = self._expand_phase_kv(
+                current_lease.tensor, current_phase
+            )
+        current_ready: torch.cuda.Event | None = None
+
+        for phase_index in range(len(phases)):
+            next_state: (
+                tuple[
+                    latent_cp_layout.PhaseSpec,
+                    PayloadLease,
+                    Tensor,
+                    Tensor,
+                    torch.cuda.Event,
+                ]
+                | None
+            ) = None
+            if phase_index + 1 < len(phases):
+                next_phase = phases[phase_index + 1]
+                next_lease = next(leases)
+                next_payload = next_lease.tensor
+                with torch.cuda.stream(projection_stream):
+                    next_payload.record_stream(projection_stream)
+                    with torch.no_grad():
+                        next_key, next_value = self._expand_phase_kv(
+                            next_payload, next_phase
+                        )
+                    ready = torch.cuda.Event()
+                    ready.record(projection_stream)
+                next_state = (
+                    next_phase,
+                    next_lease,
+                    next_key,
+                    next_value,
+                    ready,
+                )
+
+            if current_ready is not None:
+                consumer_stream = torch.cuda.current_stream(current_key.device)
+                consumer_stream.wait_event(current_ready)
+                current_key.record_stream(consumer_stream)
+                current_value.record_stream(consumer_stream)
+            yield current_phase, current_lease, current_key, current_value
+
+            if next_state is not None:
+                (
+                    current_phase,
+                    current_lease,
+                    current_key,
+                    current_value,
+                    current_ready,
+                ) = next_state
+
+        _require(
+            next(leases, None) is None, "transport yielded too many payload leases"
+        )
+
     def _phase_attention(
         self,
         query: Tensor,
@@ -769,7 +849,6 @@ class MLAWithLatentCP(MLASelfAttention):
         subset_indices: Tensor | None = None
         subset_slice: tuple[int, int] | None = None
         lease_count = 0
-        leases = transport.iter_payloads(local_payload, layout.phases)
         recomputed_forward = getattr(backend, "forward_recomputed_phase", None)
         projection_parameters: tuple[Tensor, ...] = ()
         if recomputed_forward is not None:
@@ -782,7 +861,18 @@ class MLAWithLatentCP(MLASelfAttention):
                 projection_parameters,
                 "latent-KV up projection has no trainable parameters",
             )
-        for phase, lease in zip(layout.phases, leases, strict=True):
+        if recomputed_forward is None:
+            leases = transport.iter_payloads(local_payload, layout.phases)
+            phase_inputs = (
+                (phase, lease, None, None)
+                for phase, lease in zip(layout.phases, leases, strict=True)
+            )
+        else:
+            phase_inputs = self._iter_recomputed_phases(
+                backend, transport, local_payload, layout.phases
+            )
+
+        for phase, lease, phase_key, phase_value in phase_inputs:
             lease_count += 1
             _require(
                 lease.owner == phase.owner, "transport owner order disagrees with plan"
@@ -809,14 +899,23 @@ class MLAWithLatentCP(MLASelfAttention):
                     preserve_rng_state=False,
                 )
             else:
+                _require(
+                    phase_key is not None and phase_value is not None,
+                    "recomputed phase lost its pre-expanded K/V tensors",
+                )
                 partial_output, partial_lse = recomputed_forward(
                     q_phase,
                     payload_phase,
+                    phase_key,
+                    phase_value,
                     phase,
                     self.softmax_scale,
                     self._expand_phase_kv,
                     *projection_parameters,
                 )
+            # The custom cuDNN boundary does not retain expanded K/V. Drop the
+            # Python references before the generator stages a later phase.
+            del phase_key, phase_value
             if merged_output is None:
                 _require(
                     phase.scatter_indices is None,

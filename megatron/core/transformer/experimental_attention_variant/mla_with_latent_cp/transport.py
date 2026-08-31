@@ -29,9 +29,12 @@ class LatentCPTransport(Protocol):
     """Extension seam for future A2A+P2P transports."""
 
     def iter_payloads(
-        self, local_payload: Tensor, phase_plan: tuple[PhaseSpec, ...]
+        self,
+        local_payload: Tensor,
+        phase_plan: tuple[PhaseSpec, ...],
+        consumer_stream: torch.cuda.Stream | None = None,
     ) -> Iterator[PayloadLease]:
-        """Yield one consumer-stream-ordered payload lease for every phase."""
+        """Yield one payload lease per phase, ordered on the requested consumer stream."""
         ...
 
 
@@ -64,12 +67,19 @@ class _PendingExchange:
     send_tensor: Tensor | None = None
     waited: bool = False
 
-    def wait_on_current_stream(self) -> None:
-        """Wait once for the prefetched receive on the current consumer stream."""
+    def wait_on_consumer_stream(
+        self, consumer_stream: torch.cuda.Stream | None = None
+    ) -> None:
+        """Order one prefetched receive on an explicit or current consumer stream."""
 
         _require(not self.waited, "a prefetched ring payload was consumed twice")
-        for work in self.works:
-            work.wait()
+        if consumer_stream is None:
+            for work in self.works:
+                work.wait()
+        else:
+            with torch.cuda.stream(consumer_stream):
+                for work in self.works:
+                    work.wait()
         self.works = ()
         self.waited = True
         self.send_tensor = None
@@ -156,7 +166,7 @@ class _LatentRingExchange(torch.autograd.Function):
             pending,
             True,
         )
-        pending.wait_on_current_stream()
+        pending.wait_on_consumer_stream()
         return grad_payload, None, None, None, None, None, None
 
 
@@ -173,9 +183,12 @@ class P2PRingTransport:
         self.next_peer = self.group_ranks[(self.rank + 1) % self.size]
 
     def iter_payloads(
-        self, local_payload: Tensor, phase_plan: tuple[PhaseSpec, ...]
+        self,
+        local_payload: Tensor,
+        phase_plan: tuple[PhaseSpec, ...],
+        consumer_stream: torch.cuda.Stream | None = None,
     ) -> Iterator[PayloadLease]:
-        """Yield each payload after ordering the consumer behind its prefetched receive."""
+        """Yield each payload after ordering the selected consumer behind its receive."""
         _require(len(phase_plan) == self.size, "phase-plan length must equal CP size")
         for phase_index, phase in enumerate(phase_plan):
             expected_owner = (self.rank - phase_index) % self.size
@@ -194,7 +207,7 @@ class P2PRingTransport:
         )
         for phase_index, phase in enumerate(phase_plan):
             if pending is not None:
-                pending.wait_on_current_stream()
+                pending.wait_on_consumer_stream(consumer_stream)
 
             next_payload: Tensor | None = None
             next_pending: _PendingExchange | None = None

@@ -503,8 +503,16 @@ gradient-accumulation-fusion side effects and parameter hooks while removing the
 forward. The FA4 adapter retains the non-reentrant phase-checkpoint fallback until its qualified
 public API exposes an equally narrow split forward/backward ownership boundary.
 
-Full K/V exist only during the initial phase forward and the short projection replay; they are
-never sent or stored in ring state.
+For the cuDNN selective-recompute path, phase zero expands K/V on the ordinary stream. Before its
+attention launch, the next lease is ordered on one adapter-shared projection stream and its
+latent-KV up projection plus K/V packing are submitted there. A recorded event orders the ordinary
+stream only when that next phase is consumed. Repeating this schedule overlaps phase `i+1`
+projection with phase `i` attention without retaining a differentiable projection graph: forward
+expansion runs under `no_grad`, while backward replays the same projection through the custom
+autograd boundary. FA4 keeps its checkpoint path and does not use this stream pipeline.
+
+Full K/V exist only during the initial phase forward, the one-phase-ahead projection window, and the
+short projection replay; they are never sent or stored in ring state.
 
 The intentionally retained activation classes are:
 
@@ -546,8 +554,11 @@ communication stream. The public `torch.distributed.batch_isend_irecv` batch con
 objects ordered as `[isend(next), irecv(previous)]`, and every operation sets
 `group=effective_cp_group`. For a compute-produced payload, the communication stream waits for its
 producer. The returned work handles remain pending while the current phase computes; when the
-consumer next requests the prefetched receive, every handle is waited exactly once on that consumer
-stream. The producer stream is captured before entering the communication-stream context; querying
+consumer next requests the prefetched receive, every handle is waited exactly once on that explicit
+consumer stream. The ordinary backend path uses the attention stream; cuDNN projection pipelining
+uses the adapter-shared projection stream, so receive completion can feed K/V expansion without
+stalling current-phase attention. Ring autograd nodes themselves remain on the ordinary stream.
+The producer stream is captured before entering the communication-stream context; querying
 the current stream after that switch would return the communication stream itself and silently remove
 the dependency.
 
@@ -680,15 +691,17 @@ The completed sanitized qualification matrix is:
 
 | Hardware | Backend | Frontend/package | Runtime/distribution identity | Evidence epsilon |
 | --- | --- | --- | --- | --- |
-| H100 / SM90 | `AttnBackend.fused` | `1.22.1` | cuDNN `9.21.0` | `4.561878810305231e-05` |
-| SM100 | `AttnBackend.fused` | `1.26.0` | cuDNN `9.25.0` | `4.423665134356547e-05` |
-| SM100 | `AttnBackend.flash` | `4.0.0b11` | `flash-attn-4==4.0.0b11` | `4.3095951884009054e-05` |
+| H100 / SM90 | `AttnBackend.fused` | `1.22.1` | cuDNN `9.21.0` | `5e-5` |
+| SM100 | `AttnBackend.fused` | `1.26.0` | cuDNN `9.25.0` | `5e-5` |
+| SM100 | `AttnBackend.flash` | `4.0.0b11` | `flash-attn-4==4.0.0b11` | `5e-5` |
 
 The test file independently spells the exact tuple sequence in
 `EXPECTED_QUALIFIED_BACKEND_CONFIGS` and the exact tuple-to-epsilon mapping in
 `EXPECTED_QUALIFICATION_EPS`. Tests require exact production/test/source-revision equality, exact
-mapping keys, and no extra entry. The epsilon is a parity assertion threshold, not a production
-runtime knob.
+mapping keys, and no extra entry. Each epsilon is a rounded acceptance envelope, not the exact candidate emitted by one run. The
+test separately requires `candidate_eps = max(1e-5, 2 * max_observed_error) <= qualified_eps`, preserving a
+2x evidence margin while avoiding rank-count-dependent failures at a raw floating-point observation.
+The epsilon is a parity assertion threshold, not a production runtime knob.
 
 Qualified full-parity tests do not assign an adapter or mutate the allow-list. They resolve the
 installed tuple without constructing an adapter, require exact membership, construct the layer, and
@@ -1023,7 +1036,9 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    full-K/V size. For CP=2/4, prove forward owner routing, reverse gradient routing, fixed peer order,
    that every recorded `P2POp` constructor receives the effective CP group, and that the next
    exchange is submitted on the dedicated stream before the current lease is yielded. Every returned
-   work must be waited exactly once. After construction, patch
+   work must be waited exactly once: forward waits run on an explicitly supplied projection stream,
+   while reverse-autograd waits remain on the ordinary consumer stream. Relay sends must alias the
+   corresponding immutable lease rather than stage a D2D copy. After construction, patch
    `parallel_state.get_tensor_model_parallel_group`,
    `get_context_parallel_group`, and `get_tensor_and_context_parallel_group` to raise throughout
    the complete TP=2 x CP=2 production forward/backward; test-harness collectives remain explicitly

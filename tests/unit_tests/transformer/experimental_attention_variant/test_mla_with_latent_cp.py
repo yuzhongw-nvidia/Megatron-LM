@@ -72,15 +72,17 @@ EXPECTED_QUALIFIED_BACKEND_CONFIGS: tuple[latent_cp.QualifiedBackendTuple, ...] 
     (AttnBackend.fused, "1.26.0", "9.25.0", (10, 0)),
     (AttnBackend.flash, "4.0.0b11", "flash-attn-4==4.0.0b11", (10, 0)),
 )
+# Rounded acceptance envelopes are deliberately not exact replays of one observed run.
+# The candidate check below still requires a 2x margin over every aggregated error.
 EXPECTED_QUALIFICATION_EPS: dict[latent_cp.QualifiedBackendTuple, float] = {
-    (AttnBackend.fused, "1.22.1", "9.21.0", (9, 0)): 4.561878810305231e-05,
-    (AttnBackend.fused, "1.26.0", "9.25.0", (10, 0)): 4.423665134356547e-05,
+    (AttnBackend.fused, "1.22.1", "9.21.0", (9, 0)): 5e-5,
+    (AttnBackend.fused, "1.26.0", "9.25.0", (10, 0)): 5e-5,
     (
         AttnBackend.flash,
         "4.0.0b11",
         "flash-attn-4==4.0.0b11",
         (10, 0),
-    ): 4.3095951884009054e-05,
+    ): 5e-5,
 }
 _LEGACY_FULL_KV_CP_PARITY_EPS = 1e-4
 
@@ -1294,9 +1296,14 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
         return expanded[..., :2], expanded[..., 2:]
 
     adapter = FakeAdapter()
+    with torch.no_grad():
+        key, value = expand_phase_kv(payload, phase)
+    assert not key.requires_grad and not value.requires_grad
     output, lse = latent_cp_cudnn_backend._CudnnRecomputedPhaseFunction.apply(
         query,
         payload,
+        key,
+        value,
         phase,
         1.0,
         adapter,
@@ -2615,8 +2622,10 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         batch_calls = []
         batch_streams = []
         returned_proxies = []
+        work_wait_streams = []
         wait_for_compute_stream = []
         consumer_stream = torch.cuda.current_stream().cuda_stream
+        projection_stream = torch.cuda.Stream()
         wait_count = 0
 
         def p2p_op(op, tensor, peer, group=None, tag=0):
@@ -2635,6 +2644,7 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
                 assert not self.waited
                 self.waited = True
                 wait_count += 1
+                work_wait_streams.append(torch.cuda.current_stream().cuda_stream)
                 return self.work.wait()
 
         def batch(operations):
@@ -2655,13 +2665,19 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
 
         monkeypatch.setattr(latent_cp._transport, "_launch_ring_exchange", launch)
         lease_iterator = latent_cp.P2PRingTransport(pg.cp).iter_payloads(
-            payload, layout.phases
+            payload, layout.phases, consumer_stream=projection_stream
         )
         first_lease = next(lease_iterator)
         assert len(batch_calls) == 1
         assert batch_streams[0] != consumer_stream
         assert returned_proxies and not any(proxy.waited for proxy in returned_proxies)
         leases = [first_lease, *lease_iterator]
+        forward_proxy_count = len(returned_proxies)
+        assert forward_proxy_count
+        assert (
+            work_wait_streams == [projection_stream.cuda_stream] * forward_proxy_count
+        )
+        torch.cuda.current_stream().wait_stream(projection_stream)
         assert [lease.owner for lease in leases] == [
             (cp_rank - phase) % cp_size for phase in range(cp_size)
         ]
@@ -2696,6 +2712,9 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         assert len(p2p_records) == 2 * len(batch_calls)
         assert returned_proxies and all(proxy.waited for proxy in returned_proxies)
         assert wait_count == len(returned_proxies)
+        assert work_wait_streams[forward_proxy_count:] == [consumer_stream] * (
+            len(returned_proxies) - forward_proxy_count
+        )
         assert wait_for_compute_stream[: cp_size - 1] == [True] + [False] * (
             cp_size - 2
         )

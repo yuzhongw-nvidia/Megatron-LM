@@ -197,13 +197,18 @@ class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
         ctx: Any,
         query: Tensor,
         payload: Tensor,
+        key: Tensor,
+        value: Tensor,
         phase: PhaseSpec,
         scale: float,
         adapter: "CudnnFusedAttentionAdapter",
         expand_phase_kv: Callable[[Tensor, PhaseSpec], tuple[Tensor, Tensor]],
         *projection_parameters: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        key, value = expand_phase_kv(payload, phase)
+        _require(
+            not key.requires_grad and not value.requires_grad,
+            "pre-expanded forward K/V must not retain a projection graph",
+        )
         raw_output, stats = adapter._execute_forward(
             query,
             key,
@@ -266,7 +271,7 @@ class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
             )
             grad_payload, *grad_parameters = projection_gradients
         _require(grad_payload is not None, "latent-KV replay lost its payload gradient")
-        return dq, grad_payload, None, None, None, None, *grad_parameters
+        return dq, grad_payload, None, None, None, None, None, None, *grad_parameters
 
 
 def _resolve_cudnn_frontend_version(cudnn: Any) -> str:
@@ -311,6 +316,7 @@ class CudnnFusedAttentionAdapter:
         with torch.cuda.device(self.device_index):
             capability = torch.cuda.get_device_capability(self.device_index)
             self._handle = self.cudnn.create_handle()
+            self._projection_stream = torch.cuda.Stream(device=self.device_index)
         self.identity: QualifiedBackendTuple = (
             AttnBackend.fused,
             self.frontend_version,
@@ -926,6 +932,8 @@ class CudnnFusedAttentionAdapter:
         self,
         query: Tensor,
         payload: Tensor,
+        key: Tensor,
+        value: Tensor,
         phase: PhaseSpec,
         scale: float,
         expand_phase_kv: Callable[[Tensor, PhaseSpec], tuple[Tensor, Tensor]],
@@ -936,12 +944,23 @@ class CudnnFusedAttentionAdapter:
         return _CudnnRecomputedPhaseFunction.apply(
             query,
             payload,
+            key,
+            value,
             phase,
             scale,
             self,
             expand_phase_kv,
             *projection_parameters,
         )
+
+    def projection_stream(self) -> torch.cuda.Stream:
+        """Return the adapter-shared stream used to prepare the next phase's K/V."""
+
+        _require(
+            torch.cuda.current_device() == self.device_index,
+            "projection stream belongs to a different CUDA device",
+        )
+        return self._projection_stream
 
 
 _CUDNN_ADAPTER_CACHE_LOCK: Final[threading.Lock] = threading.Lock()
