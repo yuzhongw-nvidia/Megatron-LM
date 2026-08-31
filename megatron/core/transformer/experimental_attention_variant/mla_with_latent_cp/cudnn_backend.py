@@ -276,24 +276,11 @@ class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
                 phase.causal,
                 ctx.scale,
             )
-            serialize_projection_gradients = getattr(
-                ctx.adapter, "_serialized_projection_gradients", None
-            )
-            _require(
-                callable(serialize_projection_gradients),
-                "cuDNN adapter cannot serialize projection gradients",
-            )
-
-            def calculate_projection_gradients() -> tuple[Tensor | None, ...]:
-                return torch.autograd.grad(
-                    (key, value),
-                    (replay_payload, *projection_parameters),
-                    grad_outputs=(dk, dv),
-                    allow_unused=True,
-                )
-
-            projection_gradients = serialize_projection_gradients(
-                calculate_projection_gradients
+            projection_gradients = torch.autograd.grad(
+                (key, value),
+                (replay_payload, *projection_parameters),
+                grad_outputs=(dk, dv),
+                allow_unused=True,
             )
             grad_payload, *grad_parameters = projection_gradients
         _require(grad_payload is not None, "latent-KV replay lost its payload gradient")
@@ -370,23 +357,6 @@ class CudnnFusedAttentionAdapter:
         self._bindings: OrderedDict[_CudnnBindingKey, _CudnnBinding] = OrderedDict()
         self._workspaces: dict[tuple[_CudnnPlanKey, int, bool], Tensor] = {}
         self._execution_lock = threading.RLock()
-        self._projection_gradient_lock = threading.Lock()
-        self._projection_gradient_event: torch.cuda.Event | None = None
-
-    def _serialized_projection_gradients(
-        self, calculate: Callable[[], tuple[Tensor | None, ...]]
-    ) -> tuple[Tensor | None, ...]:
-        """Serialize fused projection-gradient side effects across phase streams."""
-
-        stream = torch.cuda.current_stream(self.device_index)
-        with self._projection_gradient_lock:
-            if self._projection_gradient_event is not None:
-                stream.wait_event(self._projection_gradient_event)
-            gradients = calculate()
-            completion = torch.cuda.Event()
-            completion.record(stream)
-            self._projection_gradient_event = completion
-        return gradients
 
     def __del__(self) -> None:
         handle = getattr(self, "_handle", None)
