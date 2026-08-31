@@ -92,7 +92,7 @@ def _launch_ring_exchange(
     receive_peer: int,
     communication_stream: torch.cuda.Stream | None,
     pending: _PendingExchange,
-    producer_stream: torch.cuda.Stream | None,
+    wait_for_compute_stream: bool,
 ) -> Tensor:
     """Launch one explicit-group exchange, isolated from the attention stream."""
 
@@ -107,8 +107,10 @@ def _launch_ring_exchange(
         pending.send_tensor = payload
         return receive
 
+    producer_stream = torch.cuda.current_stream(payload.device)
     with torch.cuda.stream(communication_stream):
-        if producer_stream is not None:
+        if wait_for_compute_stream:
+            # current_stream() is the communication stream inside this context.
             communication_stream.wait_stream(producer_stream)
         works = tuple(dist.batch_isend_irecv(operations))
         _require(works, "a CUDA P2P exchange returned no work handle")
@@ -131,7 +133,7 @@ class _LatentRingExchange(torch.autograd.Function):
         next_peer: int,
         communication_stream: torch.cuda.Stream | None,
         pending: _PendingExchange,
-        producer_stream: torch.cuda.Stream | None,
+        wait_for_compute_stream: bool,
     ) -> Tensor:
         """Prefetch the preceding owner's payload on the communication stream."""
         ctx.cp_group = cp_group
@@ -145,7 +147,7 @@ class _LatentRingExchange(torch.autograd.Function):
             previous_peer,
             communication_stream,
             pending,
-            producer_stream,
+            wait_for_compute_stream,
         )
 
     @staticmethod
@@ -154,12 +156,6 @@ class _LatentRingExchange(torch.autograd.Function):
     ) -> tuple[Tensor, None, None, None, None, None, None]:
         """Route the received-payload gradient through the reverse ring hop."""
         grad_receive = grad_receive.contiguous()
-        if ctx.communication_stream is not None:
-            _require(
-                torch.cuda.current_stream(grad_receive.device)
-                == ctx.communication_stream,
-                "ring backward must execute on the communication stream",
-            )
         pending = _PendingExchange()
         grad_payload = _launch_ring_exchange(
             grad_receive,
@@ -168,9 +164,9 @@ class _LatentRingExchange(torch.autograd.Function):
             ctx.next_peer,
             ctx.communication_stream,
             pending,
-            None,
+            True,
         )
-        pending.wait_on_consumer_stream(ctx.communication_stream)
+        pending.wait_on_consumer_stream()
         return grad_payload, None, None, None, None, None, None
 
 
@@ -217,32 +213,15 @@ class P2PRingTransport:
             next_pending: _PendingExchange | None = None
             if phase_index + 1 < self.size:
                 next_pending = _PendingExchange()
-                if communication_stream is None:
-                    next_payload = _LatentRingExchange.apply(
-                        payload,
-                        self.cp_group,
-                        self.previous_peer,
-                        self.next_peer,
-                        None,
-                        next_pending,
-                        None,
-                    )
-                else:
-                    producer_stream = (
-                        torch.cuda.current_stream(payload.device)
-                        if phase_index == 0
-                        else None
-                    )
-                    with torch.cuda.stream(communication_stream):
-                        next_payload = _LatentRingExchange.apply(
-                            payload,
-                            self.cp_group,
-                            self.previous_peer,
-                            self.next_peer,
-                            communication_stream,
-                            next_pending,
-                            producer_stream,
-                        )
+                next_payload = _LatentRingExchange.apply(
+                    payload,
+                    self.cp_group,
+                    self.previous_peer,
+                    self.next_peer,
+                    communication_stream,
+                    next_pending,
+                    phase_index == 0,
+                )
 
             yield PayloadLease(owner=phase.owner, tensor=payload)
             if next_payload is not None and next_pending is not None:

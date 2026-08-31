@@ -563,7 +563,7 @@ producer. The returned work handles remain pending while the current phase compu
 consumer next requests the prefetched receive, every handle is waited exactly once on that explicit
 consumer stream. The ordinary backend path uses the attention stream; cuDNN projection pipelining
 uses the adapter-shared projection stream, so receive completion can feed K/V expansion without
-stalling current-phase attention. CUDA ring autograd nodes are created on the communication stream.
+stalling current-phase attention. Ring autograd nodes themselves remain on the ordinary stream.
 The producer stream is captured before entering the communication-stream context; querying
 the current stream after that switch would return the communication stream itself and silently remove
 the dependency.
@@ -575,13 +575,11 @@ lease retains send storage until its work handles complete. Every backward hop s
 compute-produced gradient. The generator yields phase `i` on the ordinary attention stream while the
 one-hop receive remains in flight, then waits only when phase `i+1` requests that receive.
 
-Backward therefore returns to that communication stream under PyTorch's custom-autograd stream
-contract, submits `[isend(previous), irecv(next)]`, and waits there for the reverse receive before
-returning `dX_r`. This keeps the reverse ring off the phase-attention streams while autograd inserts
-the required producer/consumer dependencies. Send and receive tensors are recorded on the
-communication stream, and the pending lease retains send storage until every work handle completes.
-CP=1 creates no stream and submits no P2P. Fixed payload shapes, peer order, operation lists, and
-phase counts remain identical across ranks, preventing mismatched-message and parity-order deadlocks.
+Backward submits `[isend(previous), irecv(next)]` on the same communication stream and waits for the
+reverse receive before returning `dX_r`. Send and receive tensors are recorded on the communication
+stream, and the pending lease retains send storage until every work handle completes. CP=1 creates no
+stream and submits no P2P. Fixed payload shapes, peer order, operation lists, and phase counts remain
+identical across ranks, preventing mismatched-message and parity-order deadlocks.
 
 Feature-static config, package, runtime, and capability checks run in the layer constructor, using
 the configured maximum CP/TP groups where group properties are needed. Cheap activation checks run
@@ -1045,7 +1043,7 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    that every recorded `P2POp` constructor receives the effective CP group, and that the next
    exchange is submitted on the dedicated stream before the current lease is yielded. Every returned
    work must be waited exactly once: forward waits run on an explicitly supplied projection stream,
-   while reverse-autograd waits remain on the dedicated communication stream. Alternating cuDNN forward
+   while reverse-autograd waits remain on the ordinary consumer stream. Alternating cuDNN forward
    phases and their custom backwards must execute on the same ordinary/secondary canonical streams,
    while projection-gradient side effects remain explicitly event-serialized. Relay sends must alias the
    corresponding immutable lease rather than stage a D2D copy. After construction, patch
