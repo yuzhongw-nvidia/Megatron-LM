@@ -690,19 +690,12 @@ class MLAWithLatentCP(MLASelfAttention):
             # reconstruct the complete local token axis, then apply the phase view.
             expanded = self._phase_rows(expanded, phase.kv_indices, phase.kv_slice)
             k_rope = self._phase_rows(k_rope, phase.kv_indices, phase.kv_slice)
-        k_content, value = torch.split(
-            expanded, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
+        return latent_cp_utils.fused_pack_phase_key_value(
+            expanded,
+            k_rope,
+            self.config.qk_head_dim,
+            self.config.v_head_dim,
         )
-        key = torch.cat(
-            (
-                k_content,
-                k_rope.unsqueeze(1).expand(
-                    -1, self.num_attention_heads_per_partition, -1
-                ),
-            ),
-            dim=-1,
-        ).contiguous()
-        return key, value.contiguous()
 
     def _phase_attention(
         self,

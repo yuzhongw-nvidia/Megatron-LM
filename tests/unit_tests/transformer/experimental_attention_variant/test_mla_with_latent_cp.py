@@ -50,6 +50,9 @@ from megatron.core.transformer.experimental_attention_variant.mla_with_latent_cp
 from megatron.core.transformer.experimental_attention_variant.mla_with_latent_cp import (
     mla_with_latent_cp as latent_cp_module,
 )
+from megatron.core.transformer.experimental_attention_variant.mla_with_latent_cp import (
+    utils as latent_cp_utils,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -1134,6 +1137,36 @@ def test_independent_packed_zigzag_global_positions(rope_type: str, cp_size: int
             )
             local_offset += local_length
         torch.testing.assert_close(torch.cat(actual_parts), expected)
+
+
+def test_phase_key_value_pack_matches_native_and_gradients():
+    torch.manual_seed(_SEED)
+    expanded = torch.randn(7, 3, _QK_CONTENT + _VALUE_DIM, requires_grad=True)
+    k_rope = torch.randn(7, _ROPE_DIM, requires_grad=True)
+    expanded_ref = expanded.detach().clone().requires_grad_(True)
+    k_rope_ref = k_rope.detach().clone().requires_grad_(True)
+
+    key, value = latent_cp_utils.fused_pack_phase_key_value(
+        expanded, k_rope, _QK_CONTENT, _VALUE_DIM
+    )
+    key_ref = torch.cat(
+        (
+            expanded_ref[..., :_QK_CONTENT],
+            k_rope_ref.unsqueeze(1).expand(-1, expanded_ref.size(1), -1),
+        ),
+        dim=-1,
+    )
+    value_ref = expanded_ref[..., _QK_CONTENT:].contiguous()
+    torch.testing.assert_close(key, key_ref)
+    torch.testing.assert_close(value, value_ref)
+    assert key.is_contiguous() and value.is_contiguous()
+
+    grad_key = torch.randn_like(key)
+    grad_value = torch.randn_like(value)
+    torch.autograd.backward((key, value), (grad_key, grad_value))
+    torch.autograd.backward((key_ref, value_ref), (grad_key, grad_value))
+    torch.testing.assert_close(expanded.grad, expanded_ref.grad)
+    torch.testing.assert_close(k_rope.grad, k_rope_ref.grad)
 
 
 def test_merge_matches_direct_softmax_and_gradients():
@@ -2627,6 +2660,7 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         first_lease = next(lease_iterator)
         assert len(batch_calls) == 1
         assert batch_streams[0] != consumer_stream
+        assert returned_proxies and not any(proxy.waited for proxy in returned_proxies)
         leases = [first_lease, *lease_iterator]
         assert [lease.owner for lease in leases] == [
             (cp_rank - phase) % cp_size for phase in range(cp_size)
@@ -2636,9 +2670,8 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
                 lease.tensor, torch.full_like(lease.tensor, float(lease.owner))
             )
         forward_sends = [p2p_records[2 * phase][5] for phase in range(cp_size - 1)]
-        assert forward_sends[0].data_ptr() == leases[0].tensor.data_ptr()
-        for send, lease in zip(forward_sends[1:], leases[1:-1], strict=True):
-            assert send.data_ptr() != lease.tensor.data_ptr()
+        for send, lease in zip(forward_sends, leases[:-1], strict=True):
+            assert send.data_ptr() == lease.tensor.data_ptr()
             assert torch.equal(send, lease.tensor)
         weights = [float(cp_rank * cp_size + phase + 1) for phase in range(cp_size)]
         loss = sum(

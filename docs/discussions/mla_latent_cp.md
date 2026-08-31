@@ -256,6 +256,11 @@ K = concat(K_content, expand_heads(K_pos), dim=-1)
 V -> [T_r, H_tp, D_v]
 ```
 
+On CUDA, one feature-local full-graph `torch.compile` region packs contiguous K and V outputs from
+the interleaved projection result and shared positional key. Its compiled backward restores the
+interleaved projection gradient and sums the shared positional gradient over heads. The CPU path
+uses the same eager tensor formula.
+
 For TP1, `sequence_shard` above is first narrowed to the phase's KV rows. For TP>1/SP, the
 sequence-parallel projection and positional gather must reconstruct the complete local token axis
 before the same phase view is applied.
@@ -400,9 +405,12 @@ dE_a = w_a * (dE + sum(dO * (O_a - O), dim=-1))
 ```
 
 with the symmetric equations for side `b`. This removes the generic elementwise autograd graph
-without changing the FP32 online-softmax math or its LSE-gradient contract. Partial outputs and LSE
-remain deliberately retained even though expanded K/V are not. After the last phase there is exactly
-one `O.to(torch.bfloat16)` before reshape and `linear_proj`; there are no intermediate BF16 merges.
+without changing the FP32 online-softmax math or its LSE-gradient contract. On CUDA, the same pure
+PyTorch forward and analytical backward formulas execute inside feature-local full-graph
+`torch.compile` regions, collapsing their pointwise/reduction launch fanout; CPU/reference execution
+uses the identical eager formulas. Partial outputs and LSE remain deliberately retained even though
+expanded K/V are not. After the last phase there is exactly one `O.to(torch.bfloat16)` before reshape
+and `linear_proj`; there are no intermediate BF16 merges.
 
 FA4 documents that LSE returned by `return_lse=True` supports `dLSE`. The FP32 merger returns FP32
 `G_i` and `gE_i`; autograd casts `G_i` to the raw BF16 FA4 output dtype at the adapter boundary and
@@ -433,7 +441,9 @@ For safe rows, `dot(G_i,O_corr)=dot(G_i,O_global)` exactly in real arithmetic. Z
 zero correction to avoid invalid or unstable division; their rounded behavior is part of numerical
 qualification. Immediately before public `graph.sdpa_backward`, only `G_i` and `O_corr` are cast to
 BF16. Q/K/V and returned dQ/dK/dV use BF16 graph I/O; stats and graph compute/intermediate types are
-FP32. The two BF16 casts mean the identity is not claimed to be bitwise exact in floating-point.
+FP32. The correction's pure PyTorch CUDA formula also executes in one feature-local full-graph
+`torch.compile` region; CPU diagnostics retain the eager formula. The two BF16 casts mean the
+identity is not claimed to be bitwise exact in floating-point.
 
 Qualification tests cover exactly zero gradients, tiny norms on both sides of the mask threshold,
 extreme phase weights, and very negative LSE. An uncorrected cuDNN backward is never accepted.
@@ -534,26 +544,25 @@ any of them later requires explicit nested-checkpoint and saved-tensor/offload t
 Before yielding phase `i`, every rank submits the exchange for phase `i+1` on one process/device
 communication stream. The public `torch.distributed.batch_isend_irecv` batch contains `P2POp`
 objects ordered as `[isend(next), irecv(previous)]`, and every operation sets
-`group=effective_cp_group`. For a compute-produced payload, the communication stream waits for its producer;
-each returned `Work.wait` is issued while that stream is current, followed by a CUDA readiness event.
-The producer stream is captured before entering the communication-stream context; querying the current
-stream after that switch would return the communication stream itself and silently remove the dependency.
-Only the first hop waits for the ordinary compute stream. Before a later hop is exposed to attention,
-the communication stream copies the received latent payload into a dedicated relay buffer and records
-a new readiness event. The consumer waits only for that small D2D staging copy; attention reads the
-original receive while NCCL relays the disjoint staging buffer. This removes the false dependency on
-the preceding phase's attention kernels without giving attention and transport concurrent access to
-the same storage. Every backward hop still waits for its compute-produced gradient. The generator then
-yields phase `i` on the ordinary attention stream. When it resumes for phase
-`i+1`, that consumer stream waits on the event, so the intervening attention kernels can overlap the
-one-hop receive without exposing an unready tensor.
+`group=effective_cp_group`. For a compute-produced payload, the communication stream waits for its
+producer. The returned work handles remain pending while the current phase computes; when the
+consumer next requests the prefetched receive, every handle is waited exactly once on that consumer
+stream. The producer stream is captured before entering the communication-stream context; querying
+the current stream after that switch would return the communication stream itself and silently remove
+the dependency.
 
-Backward submits `[isend(previous), irecv(next)]` on the same communication stream and inserts the
-corresponding event dependency before returning `dX_r`. Send and receive tensors are recorded on the
-communication stream, and the pending lease retains send storage until the consumer dependency is
-installed. CP=1 creates no stream and submits no P2P. Fixed payload shapes, peer order, operation
-lists, and phase counts remain identical across ranks, preventing mismatched-message and
-parity-order deadlocks.
+Only the first hop waits for the ordinary compute stream. A later hop relays the received tensor
+directly: NCCL send and phase attention are both read-only consumers of the same immutable payload,
+so no D2D staging copy or false dependency on the preceding phase's attention is needed. The pending
+lease retains send storage until its work handles complete. Every backward hop still waits for its
+compute-produced gradient. The generator yields phase `i` on the ordinary attention stream while the
+one-hop receive remains in flight, then waits only when phase `i+1` requests that receive.
+
+Backward submits `[isend(previous), irecv(next)]` on the same communication stream and waits for the
+reverse receive before returning `dX_r`. Send and receive tensors are recorded on the communication
+stream, and the pending lease retains send storage until every work handle completes. CP=1 creates no
+stream and submits no P2P. Fixed payload shapes, peer order, operation lists, and phase counts remain
+identical across ranks, preventing mismatched-message and parity-order deadlocks.
 
 Feature-static config, package, runtime, and capability checks run in the layer constructor, using
 the configured maximum CP/TP groups where group properties are needed. Cheap activation checks run
@@ -567,7 +576,7 @@ before the first ring hop. Once P2P starts, the module makes no claim to recover
 Python, CUDA, or NCCL exception; failures propagate through normal PyTorch/NCCL error handling.
 
 `LatentCPTransport` remains an extension seam. `PayloadLease.tensor` is ordered for use on the
-consumer stream before it is yielded; the readiness event is transport-private. A future explicitly
+consumer stream before it is yielded; pending work handles are transport-private. A future explicitly
 configured transport may preserve the same lease contract while changing the collective topology.
 
 ## Direct backend adapters
