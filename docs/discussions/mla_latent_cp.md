@@ -498,12 +498,10 @@ The cuDNN adapter uses a feature-owned custom autograd boundary. Forward saves Q
 every trainable parameter of the preserved up-projection module, raw BF16 local output, and FP32
 LSE, but not expanded K/V. Backward re-executes only KV expansion, applies the public cuDNN backward
 graph to retained O/LSE state, then differentiates reconstructed K/V through the preserved local or
-TE fused norm+up module. For cuDNN with configured CP greater than one, only this KV-up module has
-fused weight-gradient accumulation disabled. Each phase therefore returns ordinary parameter
-gradients; PyTorch sums the shared-parameter contributions before the normal MCore DDP hook moves
-the result into `main_grad`. All other projections retain their configured fusion behavior. Delayed
-weight-gradient compute is rejected. The FA4 adapter retains the non-reentrant phase-checkpoint
-fallback until its qualified public API exposes an equally narrow split forward/backward boundary.
+TE fused norm+up module. This preserves
+gradient-accumulation-fusion side effects and parameter hooks while removing the second SDPA
+forward. The FA4 adapter retains the non-reentrant phase-checkpoint fallback until its qualified
+public API exposes an equally narrow split forward/backward ownership boundary.
 
 For the cuDNN selective-recompute path, phase zero expands K/V on the ordinary stream. Before its
 attention launch, the next lease is ordered on one adapter-shared projection stream and its
@@ -514,9 +512,10 @@ attention launch. This overlaps phase `i+1` projection and neighboring attention
 `i` attention without retaining a differentiable projection graph. Forward expansion runs under
 `no_grad`. Each custom autograd node is created on the stream that executes its phase, so PyTorch's
 producer/consumer stream contract returns that phase's replay and cuDNN backward to the same
-canonical stream. Neighboring phase replay, cuDNN backward, and returned KV-up gradients can
-therefore overlap without an adapter-wide completion-event chain. FA4 keeps its checkpoint path and
-does not use this stream pipeline.
+canonical stream. Neighboring phase backward work can therefore overlap. The adapter separately
+chains projection-gradient completion events across those streams because TE gradient-accumulation
+fusion updates one shared `main_grad`; only that side effect remains serialized. FA4 keeps its
+checkpoint path and does not use this stream pipeline.
 
 Full K/V exist only during the initial phase forward, the one-phase-ahead projection window, and the
 short projection replay; they are never sent or stored in ring state.
@@ -1046,7 +1045,7 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    work must be waited exactly once: forward waits run on an explicitly supplied projection stream,
    while reverse-autograd waits remain on the ordinary consumer stream. Alternating cuDNN forward
    phases and their custom backwards must execute on the same ordinary/secondary canonical streams,
-   while shared KV-up parameter gradients are returned and summed by outer autograd. Relay sends must alias the
+   while projection-gradient side effects remain explicitly event-serialized. Relay sends must alias the
    corresponding immutable lease rather than stage a D2D copy. After construction, patch
    `parallel_state.get_tensor_model_parallel_group`,
    `get_context_parallel_group`, and `get_tensor_and_context_parallel_group` to raise throughout

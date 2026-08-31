@@ -1263,6 +1263,10 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
                 grad_output.to(v.dtype),
             )
 
+        @staticmethod
+        def _serialized_projection_gradients(calculate):
+            return calculate()
+
     torch.manual_seed(51)
     query = torch.randn(5, 1, 2, requires_grad=True)
     payload = torch.randn(5, 2, requires_grad=True)
@@ -1296,47 +1300,37 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
         return expanded[..., :2], expanded[..., 2:]
 
     adapter = FakeAdapter()
-    outputs = []
-    lses = []
-    for _ in range(2):
-        with torch.no_grad():
-            key, value = expand_phase_kv(payload, phase)
-        assert not key.requires_grad and not value.requires_grad
-        output, lse = latent_cp_cudnn_backend._CudnnRecomputedPhaseFunction.apply(
-            query,
-            payload,
-            key,
-            value,
-            phase,
-            1.0,
-            adapter,
-            expand_phase_kv,
-            weight,
-            norm_weight,
-        )
-        outputs.append(output)
-        lses.append(lse)
-    upstreams = [
-        torch.randn_like(output).to(torch.bfloat16).float() for output in outputs
-    ]
-    sum(
-        (output * upstream).sum() for output, upstream in zip(outputs, upstreams)
-    ).backward()
+    with torch.no_grad():
+        key, value = expand_phase_kv(payload, phase)
+    assert not key.requires_grad and not value.requires_grad
+    output, lse = latent_cp_cudnn_backend._CudnnRecomputedPhaseFunction.apply(
+        query,
+        payload,
+        key,
+        value,
+        phase,
+        1.0,
+        adapter,
+        expand_phase_kv,
+        weight,
+        norm_weight,
+    )
+    upstream = torch.randn_like(output).to(torch.bfloat16).float()
+    (output * upstream).sum().backward()
 
     normalized_ref = F.rms_norm(payload_ref, (2,), norm_weight_ref, eps=1e-6)
     expanded_ref = F.linear(normalized_ref, weight_ref).view(5, 1, 4)
     reference = query_ref + expanded_ref[..., :2] + expanded_ref[..., 2:]
-    sum((reference * upstream).sum() for upstream in upstreams).backward()
-    for output, lse in zip(outputs, lses):
-        torch.testing.assert_close(output, reference)
-        torch.testing.assert_close(lse, torch.zeros_like(lse))
+    (reference * upstream).sum().backward()
+    torch.testing.assert_close(output, reference)
+    torch.testing.assert_close(lse, torch.zeros_like(lse))
     torch.testing.assert_close(query.grad, query_ref.grad)
     torch.testing.assert_close(payload.grad, payload_ref.grad)
     torch.testing.assert_close(weight.grad, weight_ref.grad)
     torch.testing.assert_close(norm_weight.grad, norm_weight_ref.grad)
-    assert replay_calls == 4
-    assert adapter.forward_calls == 2
-    assert adapter.backward_calls == 2
+    assert replay_calls == 2
+    assert adapter.forward_calls == 1
+    assert adapter.backward_calls == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1347,6 +1341,7 @@ def test_cudnn_selective_recompute_preserves_canonical_phase_stream():
         def __init__(self):
             self.forward_stream = None
             self.backward_stream = None
+            self.projection_gradient_stream = None
 
         def _execute_forward(self, q, k, v, *_args):
             self.forward_stream = torch.cuda.current_stream().cuda_stream
@@ -1360,6 +1355,10 @@ def test_cudnn_selective_recompute_preserves_canonical_phase_stream():
                 grad_output.to(k.dtype),
                 grad_output.to(v.dtype),
             )
+
+        def _serialized_projection_gradients(self, calculate):
+            self.projection_gradient_stream = torch.cuda.current_stream().cuda_stream
+            return calculate()
 
     caller_stream = torch.cuda.current_stream()
     attention_stream = torch.cuda.Stream()
@@ -1382,11 +1381,7 @@ def test_cudnn_selective_recompute_preserves_canonical_phase_stream():
         causal=True,
     )
 
-    projection_gradient_streams = []
-
     def expand_phase_kv(latent, _phase):
-        if torch.is_grad_enabled():
-            projection_gradient_streams.append(torch.cuda.current_stream().cuda_stream)
         expanded = F.linear(latent, weight).view(5, 1, 4)
         return expanded[..., :2], expanded[..., 2:]
 
@@ -1413,7 +1408,7 @@ def test_cudnn_selective_recompute_preserves_canonical_phase_stream():
 
     assert adapter.forward_stream == attention_stream.cuda_stream
     assert adapter.backward_stream == attention_stream.cuda_stream
-    assert projection_gradient_streams == [attention_stream.cuda_stream]
+    assert adapter.projection_gradient_stream == attention_stream.cuda_stream
 
 
 def test_merge_scatter_and_cudnn_proxy_extremes():
@@ -2392,7 +2387,6 @@ def test_explicit_output_projection_uses_only_injected_group_and_matches_referen
         ("rope_type", "none", "rope and yarn"),
         ("apply_rope_fusion", True, "fused RoPE"),
         ("attention_dropout", 0.1, "dropout"),
-        ("delay_wgrad_compute", True, "delayed weight-gradient"),
         ("cache_mla_latents", True, "caching"),
         ("fine_grained_activation_offloading", True, "offload"),
         ("cpu_offloading", True, "CPU offloading"),
@@ -2412,31 +2406,6 @@ def test_initial_config_negative_validation(monkeypatch, attribute, value, messa
     monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda _group: 1)
     with pytest.raises(ValueError, match=message):
         latent_cp.MLAWithLatentCP._validate_initial_config(dummy)
-
-
-@pytest.mark.parametrize(
-    ("projection_stack", "attribute"),
-    [
-        ("local", "gradient_accumulation_fusion"),
-        ("transformer_engine", "fuse_wgrad_accumulation"),
-    ],
-)
-def test_cudnn_cp_disables_only_kv_up_fused_wgrad(projection_stack, attribute):
-    kv_up = SimpleNamespace(**{attribute: True})
-    q_up = SimpleNamespace(**{attribute: True})
-    harness = SimpleNamespace(
-        config=SimpleNamespace(
-            attention_backend=AttnBackend.fused, context_parallel_size=2
-        ),
-        _projection_stack=projection_stack,
-        linear_kv_up_proj=kv_up,
-        linear_q_up_proj=q_up,
-    )
-
-    latent_cp.MLAWithLatentCP._configure_kv_up_projection_gradient_accumulation(harness)
-
-    assert getattr(kv_up, attribute) is False
-    assert getattr(q_up, attribute) is True
 
 
 def test_inactive_default_recompute_modules_are_accepted(monkeypatch):

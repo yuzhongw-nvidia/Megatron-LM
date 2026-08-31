@@ -177,7 +177,6 @@ class MLAWithLatentCP(MLASelfAttention):
         self._parameter_dtypes_validated = False
         self._validate_initial_config()
         self._validate_projection_groups()
-        self._configure_kv_up_projection_gradient_accumulation()
         self._backend_adapter: DirectAttentionAdapter
         self._backend_runtime_tuple: QualifiedBackendTuple
         self._backend_adapter, self._backend_runtime_tuple = _qualified_backend_adapter(
@@ -255,10 +254,6 @@ class MLAWithLatentCP(MLASelfAttention):
             "fused RoPE is unsupported when this layer applies RoPE",
         )
         _require(config.attention_dropout == 0.0, "attention dropout must be zero")
-        _require(
-            not config.delay_wgrad_compute,
-            "delayed weight-gradient compute is unsupported",
-        )
         _require(config.bf16 and not config.fp16, "v1 requires BF16 and rejects FP16")
         # TODO(mla-latent-cp): Qualify FP8/FP4, including MXFP8, before merge.
         _require(
@@ -348,26 +343,6 @@ class MLAWithLatentCP(MLASelfAttention):
                 and not output_projection.use_bias,
                 "TE linear_proj must be a bias-free row-parallel projection",
             )
-
-    def _configure_kv_up_projection_gradient_accumulation(self) -> None:
-        """Return per-phase KV-up grads so canonical backward streams may overlap."""
-
-        if (
-            self.config.attention_backend is not AttnBackend.fused
-            or self.config.context_parallel_size == 1
-        ):
-            return
-        projection = self.linear_kv_up_proj
-        attribute = (
-            "gradient_accumulation_fusion"
-            if self._projection_stack == "local"
-            else "fuse_wgrad_accumulation"
-        )
-        _require(
-            hasattr(projection, attribute),
-            f"linear_kv_up_proj has no {attribute} control",
-        )
-        setattr(projection, attribute, False)
 
     def _validate_forward(
         self,
