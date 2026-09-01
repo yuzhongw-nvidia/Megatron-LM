@@ -1333,10 +1333,10 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
     assert adapter.backward_calls == 1
 
 
-def test_recomputed_phase_generator_projects_before_relaying_received_payload(
+def test_recomputed_phase_generator_prefetches_lease_but_defers_projection(
     monkeypatch,
 ):
-    """Stage received K/V after current attention but before its next relay."""
+    """Keep communication ahead while staging projection after current attention."""
 
     order = []
     projection_stream = object()
@@ -1351,24 +1351,14 @@ def test_recomputed_phase_generator_projects_before_relaying_received_payload(
 
     class FakeTransport:
         @staticmethod
-        def iter_payloads(
-            _local_payload,
-            phase_plan,
-            consumer_stream=None,
-            on_receive_ready=None,
-        ):
+        def iter_payloads(_local_payload, phase_plan, consumer_stream=None):
             assert phase_plan is phases
             assert consumer_stream is projection_stream
-            for phase_index, phase in enumerate(phase_plan):
-                lease = SimpleNamespace(
+            for phase in phase_plan:
+                order.append(("lease", phase.phase))
+                yield SimpleNamespace(
                     owner=phase.owner, tensor=FakePayload(phase.phase)
                 )
-                order.append(("lease", phase.phase))
-                if phase_index > 0 and on_receive_ready is not None:
-                    on_receive_ready(phase, lease)
-                if phase_index + 1 < len(phase_plan):
-                    order.append(("relay", phase.phase + 1))
-                yield lease
 
     class FakeBackend:
         @staticmethod
@@ -1404,18 +1394,15 @@ def test_recomputed_phase_generator_projects_before_relaying_received_payload(
 
     assert order == [
         ("lease", 0),
-        ("relay", 1),
         ("projection", 0),
-        ("attention", 0),
         ("lease", 1),
+        ("attention", 0),
         ("projection", 1),
-        ("relay", 2),
-        ("attention", 1),
         ("lease", 2),
+        ("attention", 1),
         ("projection", 2),
-        ("relay", 3),
-        ("attention", 2),
         ("lease", 3),
+        ("attention", 2),
         ("projection", 3),
         ("attention", 3),
     ]
@@ -2796,7 +2783,6 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         returned_proxies = []
         work_wait_streams = []
         wait_for_compute_stream = []
-        receive_ready_records = []
         consumer_stream = torch.cuda.current_stream().cuda_stream
         projection_stream = torch.cuda.Stream()
         wait_count = 0
@@ -2836,22 +2822,9 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
             wait_for_compute_stream.append(args[-1])
             return real_launch(*args, **kwargs)
 
-        def on_receive_ready(phase, lease):
-            receive_ready_records.append(
-                (
-                    phase.phase,
-                    lease.owner,
-                    torch.cuda.current_stream().cuda_stream,
-                    len(batch_calls),
-                )
-            )
-
         monkeypatch.setattr(latent_cp._transport, "_launch_ring_exchange", launch)
         lease_iterator = latent_cp.P2PRingTransport(pg.cp).iter_payloads(
-            payload,
-            layout.phases,
-            consumer_stream=projection_stream,
-            on_receive_ready=on_receive_ready,
+            payload, layout.phases, consumer_stream=projection_stream
         )
         first_lease = next(lease_iterator)
         assert len(batch_calls) == 1
@@ -2866,15 +2839,6 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         torch.cuda.current_stream().wait_stream(projection_stream)
         assert [lease.owner for lease in leases] == [
             (cp_rank - phase) % cp_size for phase in range(cp_size)
-        ]
-        assert receive_ready_records == [
-            (
-                phase,
-                (cp_rank - phase) % cp_size,
-                consumer_stream,
-                phase,
-            )
-            for phase in range(1, cp_size)
         ]
         for lease in leases:
             assert torch.equal(

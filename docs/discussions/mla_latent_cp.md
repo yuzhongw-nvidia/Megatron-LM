@@ -503,18 +503,16 @@ gradient-accumulation-fusion side effects and parameter hooks while removing the
 forward. The FA4 adapter retains the non-reentrant phase-checkpoint fallback until its qualified
 public API exposes an equally narrow split forward/backward ownership boundary.
 
-For the cuDNN selective-recompute path, phase zero expands K/V on the ordinary stream after the
-transport has prefetched phase one. The caller enqueues current attention before requesting the next
-lease. Once that receive is ordered on the adapter-shared projection stream, the transport invokes a
-narrow ready callback that submits latent-KV up projection plus K/V packing before relaying the same
-immutable payload to the following rank. Projection and relay are both read-only consumers, so they
-need no dependency between them and can overlap current attention. A recorded event orders only the
-stream that consumes the projected K/V. Forward attention phases alternate between the ordinary
-stream and one adapter-shared attention stream, and partial merges are submitted only after every
-phase attention launch. The strict host order is therefore `relay(1), expand(0), attention(0),
-expand(1), relay(2), attention(1), ...`; it preserves one-hop communication prefetch while keeping
-the following relay's host launch out of the attention-to-projection enqueue gap. No differentiable
-projection graph is retained. Forward expansion runs under
+For the cuDNN selective-recompute path, phase zero expands K/V on the ordinary stream. Before each
+phase is yielded, the iterator requests the next lease so the P2P ring remains one hop ahead, but it
+does not expand that lease yet. The caller enqueues the current attention, then resumes the iterator
+and submits the prefetched lease's latent-KV up projection plus K/V packing on one adapter-shared
+projection stream. A recorded event orders only the stream that consumes that K/V. Forward
+attention phases alternate between the ordinary stream and one adapter-shared attention stream, and
+partial merges are submitted only after every phase attention launch. The strict host order is
+therefore `lease(1), attention(0), expand(1), lease(2), attention(1), expand(2), ...`; communication
+stays prefetched while phase `i+1` projection and neighboring attention phases overlap phase `i`
+attention without retaining a differentiable projection graph. Forward expansion runs under
 `no_grad`. Each custom autograd node is created on the stream that executes its phase, so PyTorch's
 producer/consumer stream contract returns that phase's replay and cuDNN backward to the same
 canonical stream. Neighboring phase backward work can therefore overlap. The adapter separately
@@ -561,17 +559,14 @@ any of them later requires explicit nested-checkpoint and saved-tensor/offload t
 ### Pipelined transport, lifetimes, and deadlock ordering
 
 Before yielding phase `i`, every rank submits the exchange for phase `i+1` on one process/device
-communication stream. For non-local phases, an optional ready callback runs after the prior receive
-is ordered on its explicit consumer stream and before the received payload is submitted as the next
-relay. The public `torch.distributed.batch_isend_irecv` batch contains `P2POp` objects ordered as
-`[isend(next), irecv(previous)]`, and every operation sets `group=effective_cp_group`. For a
-compute-produced payload, the communication stream waits for its producer. The returned work
-handles remain pending while the current phase computes; when the consumer next requests the
-prefetched receive, every handle is waited exactly once on that explicit consumer stream. The
-ordinary backend path uses the attention stream; cuDNN projection pipelining uses the adapter-shared
-projection stream and its ready callback, so receive completion can feed K/V expansion without
-stalling current-phase attention or waiting for the following relay's host launch. Ring autograd
-nodes themselves remain on the ordinary stream.
+communication stream. The public `torch.distributed.batch_isend_irecv` batch contains `P2POp`
+objects ordered as `[isend(next), irecv(previous)]`, and every operation sets
+`group=effective_cp_group`. For a compute-produced payload, the communication stream waits for its
+producer. The returned work handles remain pending while the current phase computes; when the
+consumer next requests the prefetched receive, every handle is waited exactly once on that explicit
+consumer stream. The ordinary backend path uses the attention stream; cuDNN projection pipelining
+uses the adapter-shared projection stream, so receive completion can feed K/V expansion without
+stalling current-phase attention. Ring autograd nodes themselves remain on the ordinary stream.
 The producer stream is captured before entering the communication-stream context; querying
 the current stream after that switch would return the communication stream itself and silently remove
 the dependency.
@@ -926,9 +921,7 @@ Two small protocols keep future collectives out of attention math:
 
 ```text
 LatentCPLayoutAdapter.prepare(local_hidden, packed_params, cp_group) -> LayoutView
-LatentCPTransport.iter_payloads(
-    local_payload, phase_plan, consumer_stream=None, on_receive_ready=None
-) -> Iterator[PayloadLease]
+LatentCPTransport.iter_payloads(local_payload, phase_plan) -> Iterator[PayloadLease]
 ```
 
 `LayoutView` owns front/back indices, phase cumulative lengths, owner global-position mapping, and
