@@ -34,7 +34,7 @@ from . import layout as latent_cp_layout
 from . import utils as latent_cp_utils
 from .backend import DirectAttentionAdapter, _qualified_backend_adapter
 from .layout import AlreadyZigZagTHDAdapter
-from .transport import AllGatherTransport, LatentCPTransport, PayloadLease
+from .transport import LatentCPTransport, P2PRingTransport, PayloadLease
 from .utils import LatentCPError, QualifiedBackendTuple, _require
 
 if HAVE_TE:
@@ -827,7 +827,7 @@ class MLAWithLatentCP(MLASelfAttention):
         query, local_payload = self._project_query_and_payload(
             hidden_states, packed_seq_params, layout, effective_cp_group
         )
-        transport: LatentCPTransport = AllGatherTransport(effective_cp_group)
+        transport: LatentCPTransport = P2PRingTransport(effective_cp_group)
 
         merged_output: Tensor | None = None
         merged_lse: Tensor | None = None

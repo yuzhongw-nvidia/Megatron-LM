@@ -27,20 +27,18 @@ small compatibility change: it honors the existing per-layer `no_rope_freq` flag
 constructing or applying a rotary embedding for that layer. The latent-CP module owns all CP,
 backend, merge, and transport logic.
 
-Latent context parallelism (CP) asynchronously gathers normalized MLA latent KV and the positional
-key component, rather than expanded K and V. The local phase consumes its original payload while
-remote phases select rank-major gathered owner slices. Each receiving CP rank reconstructs K/V
-immediately before its attention phase. Expanded K/V remain temporary: backward recomputes the
-latent-KV up projection, while the cuDNN path retains local O/LSE and calls its backward graph
-without replaying SDPA.
+P2P context parallelism (CP) circulates normalized MLA latent KV and the positional key component,
+rather than expanded K and V. Each receiving CP rank reconstructs K/V immediately before its
+attention phase. Expanded K/V remain temporary: backward recomputes the latent-KV up projection,
+while the cuDNN path retains local O/LSE and calls its backward graph without replaying SDPA.
 
 ## Goals and initial scope
 
 The first version will:
 
 - support training-only MLA self-attention in THD format;
-- support static and per-microbatch dynamic CP with the zigzag partition, including the exact
-  no-collective CP=1 degeneration;
+- support static and per-microbatch dynamic P2P CP with the zigzag partition, including the exact
+  no-ring CP=1 degeneration;
 - require sequence parallelism whenever tensor parallelism is greater than one;
 - support the unfused `rope` and `yarn` rotary modes and Kimi-style no-RoPE layers selected by the
   existing `no_rope_freq` flag;
@@ -450,23 +448,23 @@ identity is not claimed to be bitwise exact in floating-point.
 Qualification tests cover exactly zero gradients, tiny norms on both sides of the mask threshold,
 extreme phase weights, and very negative LSE. An uncorrected cuDNN backward is never accepted.
 
-## Differentiable all-gather transport and recomputation
+## Differentiable P2P ring and recomputation
 
 ### Autograd topology and gradient ownership
 
-`_LatentAllGatherExchange`, local to `transport.py`, is one custom autograd boundary over the
-effective CP group. Forward and backward are:
+`_LatentRingExchange`, local to `transport.py`, is a `torch.autograd.Function` over one payload hop.
+Forward and backward are:
 
 ```text
-forward:  G_r[j] = X_j                           # rank-major all-gather
-backward: dX_r = sum_q dG_q[r]                   # reduce-scatter SUM
+forward:  Y_r  = X_(r-1)    # send X_r to r+1, receive from r-1
+backward: dX_r = dY_(r+1)   # send dY_r to r-1, receive from r+1
 ```
 
-The attention loop has `P` compute phases and one gather node. Phase zero uses `X_r` directly and
-never reads `G_r[r]`; remote phases use only owner slices from `G_r`. The unused local gathered
-slice contributes zero to the reduce-scatter input. Autograd adds the direct local-phase gradient
-to the reduce-scattered remote contributions at `X_r`, so every owner receives every query-rank
-contribution exactly once.
+The attention loop has `P` compute phases and `P-1` exchange nodes. Autograd addition at each node
+accumulates the local phase contribution with the gradient arriving from downstream nodes. Every
+owner's payload gradient therefore contains all query-rank contributions when it reaches the
+owner's original `Z`; no extra hop or latent all-reduce is needed. All ranks build the same graph,
+so backward traverses ring hops in reverse phase order.
 
 Gradient ownership is:
 
@@ -559,23 +557,6 @@ offload at construction. Supporting
 any of them later requires explicit nested-checkpoint and saved-tensor/offload tests.
 
 ### Pipelined transport, lifetimes, and deadlock ordering
-
-Before yielding the local phase, every rank flattens its contiguous payload and submits exactly one
-asynchronous `all_gather_into_tensor` on the effective CP group and existing communication stream.
-The local phase consumes the original immutable payload while the gather is in flight. At the first
-remote phase, the Work is waited exactly once on the explicit consumer stream. In the cuDNN path
-that is the projection stream: every raw remote slice is first expanded there, and only projected
-K/V crosses an event to ordinary or alternate attention streams.
-
-The gathered buffer is rank-major `[P, *payload.shape]`. A private handle retains its input, output,
-and Work until the first-remote wait. Backward submits exactly one asynchronous
-`reduce_scatter_tensor(op=SUM)` on the same group after ordering the communication stream behind the
-autograd producer stream, then waits once on the canonical caller stream. Thus every rank executes
-one AG/one RS per layer and microbatch in identical order. Equal flattened payload sizes, explicit
-group use, shape gates, and CP2/4 multi-stream tests fail closed against collective mismatch or a
-same-stream dependency deadlock. CP=1 creates no communication stream or collective.
-
-The older hop-by-hop P2P design below remains historical motivation; it is not the active transport.
 
 Before yielding phase `i`, every rank submits the exchange for phase `i+1` on one process/device
 communication stream. The public `torch.distributed.batch_isend_irecv` batch contains `P2POp`
@@ -948,8 +929,8 @@ output restoration. V1's `AlreadyZigZagTHDAdapter` validates and returns views. 
 `ContiguousToZigZagAdapter` can use public `CpPartitionModeConverter`, but remains separate rather
 than hiding an eager conversion in the attention module.
 
-`AllGatherTransport` yields local data directly, then owner-ordered remote slices after one wait.
-A future hierarchical transport can consume a layout plan and combine
+`P2PRingTransport` yields an owner plus a consumer-stream-ordered payload while prefetching the next
+hop. A future `HierarchicalA2AP2PTransport` can consume a layout plan and combine
 contiguous-to-zigzag permutation with low-level A2A, then expose the same owner order and readiness
 contract. Its process groups must be injected, for
 example through `pg_collection.hcp`; no global `parallel_state` read is introduced.
@@ -1060,8 +1041,8 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    The local fallback is tested for both gradient-accumulation flag values.
    Output-gate parity exhaustively maps the optional gate weight and compares output, input
    gradient, gate gradient, and every base parameter gradient for elementwise and headwise modes.
-4. **Payload and collective tests.** Assert the gather input has `T_r*(C+D_r)` elements, never the
-   full-K/V size. For CP=2/4, prove rank-major routing, RS-SUM gradients, local bypass, and one AG/RS.
+4. **Payload and ring tests.** Assert each forward P2P tensor has `T_r*(C+D_r)` elements, never the
+   full-K/V size. For CP=2/4, prove forward owner routing, reverse gradient routing, fixed peer order,
    that every recorded `P2POp` constructor receives the effective CP group, and that the next
    exchange is submitted on the dedicated stream before the current lease is yielded. Every returned
    work must be waited exactly once: forward waits run on an explicitly supplied projection stream,

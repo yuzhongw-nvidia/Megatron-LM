@@ -1045,7 +1045,7 @@ def test_single_sequence_phase_plan_records_contiguous_spans(cp_size: int):
                 assert phase.scatter_slice == phase.q_slice
 
 
-def test_cp1_planner_and_transport_are_exact_no_collective_degenerations():
+def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
     lengths = (7, 5)
     layout = latent_cp.build_zigzag_layout(
         _cumulative(lengths), local_tokens=sum(lengths), cp_size=1, cp_rank=0
@@ -1072,9 +1072,9 @@ def test_cp1_planner_and_transport_are_exact_no_collective_degenerations():
         mock.patch.object(latent_cp.dist, "get_rank", return_value=0),
         mock.patch.object(latent_cp.dist, "get_world_size", return_value=1),
         mock.patch.object(
-            latent_cp._LatentAllGatherExchange,
+            latent_cp._LatentRingExchange,
             "apply",
-            side_effect=AssertionError("CP=1 must not launch a collective"),
+            side_effect=AssertionError("CP=1 must not launch P2P"),
         ) as exchange,
         mock.patch.object(
             latent_cp._transport,
@@ -1083,7 +1083,7 @@ def test_cp1_planner_and_transport_are_exact_no_collective_degenerations():
         ) as stream_factory,
     ):
         leases = list(
-            latent_cp.AllGatherTransport(cp_group).iter_payloads(payload, layout.phases)
+            latent_cp.P2PRingTransport(cp_group).iter_payloads(payload, layout.phases)
         )
     assert len(leases) == 1
     assert leases[0].owner == 0
@@ -1092,78 +1092,6 @@ def test_cp1_planner_and_transport_are_exact_no_collective_degenerations():
     exchange.assert_not_called()
     leases[0].tensor.sum().backward()
     torch.testing.assert_close(payload.grad, torch.ones_like(payload), rtol=0, atol=0)
-
-
-def test_all_gather_transport_local_bypass_rank_order_and_single_remote_wait(
-    monkeypatch,
-):
-    """One rank-major gather must expose local data directly and wait once for remotes."""
-
-    cp_size = 4
-    cp_rank = 2
-    cp_group = object()
-    projection_stream = object()
-    local_payload = torch.full((3, 2), float(cp_rank))
-    phases = tuple(
-        SimpleNamespace(phase=phase, owner=(cp_rank - phase) % cp_size)
-        for phase in range(cp_size)
-    )
-    gather_calls = []
-    wait_streams = []
-    active_stream = [None]
-
-    class FakeWork:
-        waited = False
-
-        def wait(self):
-            assert not self.waited
-            self.waited = True
-            wait_streams.append(active_stream[0])
-
-    @contextmanager
-    def use_stream(stream):
-        previous = active_stream[0]
-        active_stream[0] = stream
-        try:
-            yield
-        finally:
-            active_stream[0] = previous
-
-    def apply(payload, group, size, communication_stream, pending):
-        assert payload is local_payload
-        assert group is cp_group
-        assert size == cp_size
-        assert communication_stream is None
-        gathered = torch.stack(
-            [torch.full_like(payload, float(owner)) for owner in range(cp_size)]
-        )
-        pending.work = FakeWork()
-        pending.input_tensor = payload
-        pending.output_tensor = gathered
-        gather_calls.append(gathered)
-        return gathered
-
-    monkeypatch.setattr(
-        latent_cp.dist, "get_process_group_ranks", lambda _group: [7, 11, 19, 23]
-    )
-    monkeypatch.setattr(latent_cp.dist, "get_rank", lambda _group: cp_rank)
-    monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda _group: cp_size)
-    monkeypatch.setattr(latent_cp._transport.torch.cuda, "stream", use_stream)
-    monkeypatch.setattr(latent_cp._LatentAllGatherExchange, "apply", apply)
-
-    leases = latent_cp.AllGatherTransport(cp_group).iter_payloads(
-        local_payload, phases, consumer_stream=projection_stream
-    )
-    local_lease = next(leases)
-    assert local_lease.tensor is local_payload
-    assert local_lease.owner == cp_rank
-    assert len(gather_calls) == 1
-    assert not wait_streams
-
-    remote_leases = list(leases)
-    assert [lease.owner for lease in remote_leases] == [1, 0, 3]
-    assert [lease.tensor[0, 0].item() for lease in remote_leases] == [1.0, 0.0, 3.0]
-    assert wait_streams == [projection_stream]
 
 
 @pytest.mark.parametrize("rope_type", ["rope", "yarn"])
@@ -1412,18 +1340,14 @@ def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
 
     order = []
     projection_stream = object()
-    active_stream = [None]
     phases = tuple(SimpleNamespace(phase=index, owner=index) for index in range(4))
 
     class FakePayload:
         def __init__(self, phase_index):
             self.phase_index = phase_index
-            self.recorded_stream = None
 
         def record_stream(self, stream):
             assert stream is projection_stream
-            assert active_stream[0] is projection_stream
-            self.recorded_stream = stream
 
     class FakeTransport:
         @staticmethod
@@ -1448,23 +1372,13 @@ def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
         @staticmethod
         def _expand_phase_kv(payload, phase):
             assert payload.phase_index == phase.phase
-            if phase.phase == 0:
-                assert payload.recorded_stream is None
-            else:
-                assert active_stream[0] is projection_stream
-                assert payload.recorded_stream is projection_stream
             order.append(("projection", phase.phase))
             return object(), object()
 
     @contextmanager
     def use_stream(stream):
         assert stream is projection_stream
-        previous = active_stream[0]
-        active_stream[0] = stream
-        try:
-            yield
-        finally:
-            active_stream[0] = previous
+        yield
 
     monkeypatch.setattr(latent_cp_module.torch.cuda, "stream", use_stream)
     monkeypatch.setattr(latent_cp_module.torch.cuda, "Event", FakeEvent)
@@ -2840,11 +2754,10 @@ def test_cuda_metadata_and_forward_negative_validation():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("cp_size", [2, 4])
-def test_all_gather_reduce_scatter_payload_bytes_streams_and_explicit_group(
+def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
     cp_size, monkeypatch
 ):
     with _model_parallel(1, cp_size) as pg:
-        caller_stream = torch.cuda.current_stream()
         cp_rank = dist.get_rank(pg.cp)
         lengths = (8 * cp_size,)
         layout = latent_cp.build_zigzag_layout(
@@ -2857,107 +2770,85 @@ def test_all_gather_reduce_scatter_payload_bytes_streams_and_explicit_group(
             device="cuda",
             requires_grad=True,
         )
-        real_all_gather = latent_cp.dist.all_gather_into_tensor
-        real_reduce_scatter = latent_cp.dist.reduce_scatter_tensor
-        collective_records = []
+        real_p2p_op = latent_cp.dist.P2POp
+        real_batch = latent_cp.dist.batch_isend_irecv
+        p2p_records = []
+        batch_calls = []
+        batch_streams = []
         returned_proxies = []
-        wait_records = []
-        reduce_scatter_inputs = []
+        work_wait_streams = []
+        wait_for_compute_stream = []
+        consumer_stream = torch.cuda.current_stream().cuda_stream
         projection_stream = torch.cuda.Stream()
-        alternate_attention_stream = torch.cuda.Stream()
+        wait_count = 0
+
+        def p2p_op(op, tensor, peer, group=None, tag=0):
+            p2p_records.append(
+                (op, tensor.numel(), tensor.element_size(), peer, group, tensor)
+            )
+            return real_p2p_op(op, tensor, peer, group=group, tag=tag)
 
         class WorkProxy:
-            def __init__(self, kind, work):
-                self.kind = kind
+            def __init__(self, work):
                 self.work = work
                 self.waited = False
 
             def wait(self):
+                nonlocal wait_count
                 assert not self.waited
                 self.waited = True
-                wait_records.append(
-                    (self.kind, torch.cuda.current_stream().cuda_stream)
-                )
+                wait_count += 1
+                work_wait_streams.append(torch.cuda.current_stream().cuda_stream)
                 return self.work.wait()
 
-        def all_gather(output, input_, group=None, async_op=False):
-            assert group is pg.cp and async_op
-            work = real_all_gather(output, input_, group=group, async_op=True)
-            proxy = WorkProxy("all_gather", work)
-            returned_proxies.append(proxy)
-            collective_records.append(
-                (
-                    "all_gather",
-                    input_.numel(),
-                    output.numel(),
-                    group,
-                    torch.cuda.current_stream().cuda_stream,
-                )
-            )
-            return proxy
+        def batch(operations):
+            assert all(proxy.waited for proxy in returned_proxies)
+            batch_calls.append(tuple(operations))
+            batch_streams.append(torch.cuda.current_stream().cuda_stream)
+            proxies = [WorkProxy(work) for work in real_batch(operations)]
+            returned_proxies.extend(proxies)
+            return proxies
 
-        def reduce_scatter(
-            output, input_, op=dist.ReduceOp.SUM, group=None, async_op=False
-        ):
-            assert group is pg.cp and async_op and op == dist.ReduceOp.SUM
-            work = real_reduce_scatter(
-                output, input_, op=op, group=group, async_op=True
-            )
-            proxy = WorkProxy("reduce_scatter", work)
-            returned_proxies.append(proxy)
-            reduce_scatter_inputs.append(input_)
-            collective_records.append(
-                (
-                    "reduce_scatter",
-                    input_.numel(),
-                    output.numel(),
-                    group,
-                    torch.cuda.current_stream().cuda_stream,
-                )
-            )
-            return proxy
+        monkeypatch.setattr(latent_cp.dist, "P2POp", p2p_op)
+        monkeypatch.setattr(latent_cp.dist, "batch_isend_irecv", batch)
+        real_launch = latent_cp._transport._launch_ring_exchange
 
-        monkeypatch.setattr(latent_cp.dist, "all_gather_into_tensor", all_gather)
-        monkeypatch.setattr(latent_cp.dist, "reduce_scatter_tensor", reduce_scatter)
-        lease_iterator = latent_cp.AllGatherTransport(pg.cp).iter_payloads(
+        def launch(*args, **kwargs):
+            wait_for_compute_stream.append(args[-1])
+            return real_launch(*args, **kwargs)
+
+        monkeypatch.setattr(latent_cp._transport, "_launch_ring_exchange", launch)
+        lease_iterator = latent_cp.P2PRingTransport(pg.cp).iter_payloads(
             payload, layout.phases, consumer_stream=projection_stream
         )
         first_lease = next(lease_iterator)
-        assert first_lease.tensor is payload
-        assert [record[0] for record in collective_records] == ["all_gather"]
-        assert not returned_proxies[0].waited
+        assert len(batch_calls) == 1
+        assert batch_streams[0] != consumer_stream
+        assert returned_proxies and not any(proxy.waited for proxy in returned_proxies)
         leases = [first_lease, *lease_iterator]
-        assert wait_records == [("all_gather", projection_stream.cuda_stream)]
+        forward_proxy_count = len(returned_proxies)
+        assert forward_proxy_count
+        assert (
+            work_wait_streams == [projection_stream.cuda_stream] * forward_proxy_count
+        )
+        torch.cuda.current_stream().wait_stream(projection_stream)
         assert [lease.owner for lease in leases] == [
             (cp_rank - phase) % cp_size for phase in range(cp_size)
         ]
-        weights = [float(cp_rank * cp_size + phase + 1) for phase in range(cp_size)]
-        phase_losses = [weights[0] * leases[0].tensor.float().sum()]
-        completion_events = []
-        for phase_index, (weight, lease) in enumerate(
-            zip(weights[1:], leases[1:], strict=True), start=1
-        ):
-            # Raw gathered slices have exactly one first consumer: projection_stream.
-            with torch.cuda.stream(projection_stream):
-                lease.tensor.record_stream(projection_stream)
-                projected = weight * lease.tensor.float()
-                projection_ready = torch.cuda.Event()
-                projection_ready.record(projection_stream)
-            attention_stream = (
-                alternate_attention_stream if phase_index % 2 else caller_stream
+        for lease in leases:
+            assert torch.equal(
+                lease.tensor, torch.full_like(lease.tensor, float(lease.owner))
             )
-            attention_stream.wait_event(projection_ready)
-            with torch.cuda.stream(attention_stream):
-                projected.record_stream(attention_stream)
-                phase_losses.append(projected.sum())
-                completion = torch.cuda.Event()
-                completion.record(attention_stream)
-                completion_events.append(completion)
-        for completion in completion_events:
-            caller_stream.wait_event(completion)
-        loss = sum(phase_losses)
+        forward_sends = [p2p_records[2 * phase][5] for phase in range(cp_size - 1)]
+        for send, lease in zip(forward_sends, leases[:-1], strict=True):
+            assert send.data_ptr() == lease.tensor.data_ptr()
+            assert torch.equal(send, lease.tensor)
+        weights = [float(cp_rank * cp_size + phase + 1) for phase in range(cp_size)]
+        loss = sum(
+            weight * lease.tensor.float().sum()
+            for weight, lease in zip(weights, leases)
+        )
         loss.backward()
-        torch.cuda.synchronize()
         expected = sum(
             float(query_rank * cp_size + ((query_rank - cp_rank) % cp_size) + 1)
             for query_rank in range(cp_size)
@@ -2968,31 +2859,22 @@ def test_all_gather_reduce_scatter_payload_bytes_streams_and_explicit_group(
         latent_elements = 8 * (_PRODUCTION_KV_LORA + _ROPE_DIM)
         full_elements = 8 * _PRODUCTION_HEADS * (192 + _VALUE_DIM)
         assert latent_elements < full_elements
-        assert [record[:4] for record in collective_records] == [
-            ("all_gather", latent_elements, cp_size * latent_elements, pg.cp),
-            ("reduce_scatter", cp_size * latent_elements, latent_elements, pg.cp),
-        ]
-        communication_streams = [record[4] for record in collective_records]
-        assert len(set(communication_streams)) == 1
-        assert communication_streams[0] not in {
-            caller_stream.cuda_stream,
-            projection_stream.cuda_stream,
-            alternate_attention_stream.cuda_stream,
-        }
-        assert wait_records == [
-            ("all_gather", projection_stream.cuda_stream),
-            ("reduce_scatter", caller_stream.cuda_stream),
-        ]
-        assert all(proxy.waited for proxy in returned_proxies)
-        assert len(reduce_scatter_inputs) == 1
-        gathered_gradient = reduce_scatter_inputs[0].view(cp_size, *payload.shape)
-        for owner in range(cp_size):
-            phase_index = (cp_rank - owner) % cp_size
-            expected_chunk = 0.0 if owner == cp_rank else weights[phase_index]
-            torch.testing.assert_close(
-                gathered_gradient[owner],
-                torch.full_like(gathered_gradient[owner], expected_chunk),
-            )
+        assert p2p_records
+        assert all(record[1] == latent_elements for record in p2p_records)
+        assert all(record[4] is pg.cp for record in p2p_records)
+        assert len(batch_calls) == 2 * (cp_size - 1)
+        assert len(p2p_records) == 2 * len(batch_calls)
+        assert returned_proxies and all(proxy.waited for proxy in returned_proxies)
+        assert wait_count == len(returned_proxies)
+        assert work_wait_streams[forward_proxy_count:] == [consumer_stream] * (
+            len(returned_proxies) - forward_proxy_count
+        )
+        assert wait_for_compute_stream[: cp_size - 1] == [True] + [False] * (
+            cp_size - 2
+        )
+        assert wait_for_compute_stream[cp_size - 1 :] == [True] * (cp_size - 1)
+        assert len(set(batch_streams)) == 1
+        assert batch_streams[0] != consumer_stream
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
