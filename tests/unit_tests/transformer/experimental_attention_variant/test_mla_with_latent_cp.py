@@ -1045,7 +1045,7 @@ def test_single_sequence_phase_plan_records_contiguous_spans(cp_size: int):
                 assert phase.scatter_slice == phase.q_slice
 
 
-def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
+def test_cp1_planner_and_transport_are_exact_no_collective_degenerations():
     lengths = (7, 5)
     layout = latent_cp.build_zigzag_layout(
         _cumulative(lengths), local_tokens=sum(lengths), cp_size=1, cp_rank=0
@@ -1072,9 +1072,9 @@ def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
         mock.patch.object(latent_cp.dist, "get_rank", return_value=0),
         mock.patch.object(latent_cp.dist, "get_world_size", return_value=1),
         mock.patch.object(
-            latent_cp._LatentRingExchange,
+            latent_cp._LatentAllGatherDirectP2PExchange,
             "apply",
-            side_effect=AssertionError("CP=1 must not launch P2P"),
+            side_effect=AssertionError("CP=1 must not launch communication"),
         ) as exchange,
         mock.patch.object(
             latent_cp._transport,
@@ -1083,7 +1083,9 @@ def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
         ) as stream_factory,
     ):
         leases = list(
-            latent_cp.P2PRingTransport(cp_group).iter_payloads(payload, layout.phases)
+            latent_cp.AllGatherDirectP2PTransport(cp_group).iter_payloads(
+                payload, layout.phases
+            )
         )
     assert len(leases) == 1
     assert leases[0].owner == 0
@@ -1092,6 +1094,127 @@ def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
     exchange.assert_not_called()
     leases[0].tensor.sum().backward()
     torch.testing.assert_close(payload.grad, torch.ones_like(payload), rtol=0, atol=0)
+
+
+def test_all_gather_forward_and_fixed_order_direct_reverse_contract(monkeypatch):
+    """Gather once, bypass local data, and route every remote gradient directly."""
+
+    cp_size = 4
+    cp_rank = 2
+    cp_group = object()
+    reverse_group = object()
+    group_ranks = (7, 11, 19, 23)
+    payload = torch.full((2, 3), float(cp_rank), requires_grad=True)
+    phases = tuple(
+        SimpleNamespace(phase=phase, owner=(cp_rank - phase) % cp_size)
+        for phase in range(cp_size)
+    )
+    operations = []
+    waits = []
+
+    class FakeWork:
+        def __init__(self, label):
+            self.label = label
+            self.waited = False
+
+        def wait(self):
+            assert not self.waited
+            self.waited = True
+            waits.append(self.label)
+
+    def all_gather(output, input_, group=None, async_op=False):
+        assert group is cp_group and async_op
+        assert input_.data_ptr() == payload.data_ptr()
+        output.copy_(
+            torch.cat(
+                [torch.full_like(input_, float(owner)) for owner in range(cp_size)]
+            )
+        )
+        return FakeWork("all_gather")
+
+    def p2p_op(op, tensor, peer, group=None, tag=0):
+        record = SimpleNamespace(op=op, tensor=tensor, peer=peer, group=group, tag=tag)
+        operations.append(record)
+        return record
+
+    def batch(ops):
+        assert tuple(ops) == tuple(operations)
+        for op in ops:
+            assert op.group is reverse_group and op.tag == 0
+            if op.op is latent_cp.dist.irecv:
+                group_rank = group_ranks.index(op.peer)
+                op.tensor.fill_(100.0 + group_rank)
+        # A backend may return fewer Work objects than P2POps. Every actual Work
+        # must still be retained and waited exactly once.
+        return [FakeWork("reverse-0"), FakeWork("reverse-1")]
+
+    monkeypatch.setattr(
+        latent_cp.dist, "get_process_group_ranks", lambda group: group_ranks
+    )
+    monkeypatch.setattr(latent_cp.dist, "get_rank", lambda group: cp_rank)
+    monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda group: cp_size)
+    monkeypatch.setattr(latent_cp.dist, "all_gather_into_tensor", all_gather)
+    monkeypatch.setattr(latent_cp.dist, "P2POp", p2p_op)
+    monkeypatch.setattr(latent_cp.dist, "batch_isend_irecv", batch)
+
+    leases = list(
+        latent_cp.AllGatherDirectP2PTransport(
+            cp_group, reverse_group=reverse_group
+        ).iter_payloads(payload, phases)
+    )
+    assert waits == ["all_gather"]
+    assert leases[0].tensor is payload
+    assert [lease.owner for lease in leases] == [2, 1, 0, 3]
+    assert [lease.tensor[0, 0].item() for lease in leases] == [2.0, 1.0, 0.0, 3.0]
+
+    # Leave phase 2 unused: every rank must still issue the same fixed P2P sequence,
+    # sending an explicit zero gradient for an unused output.
+    loss = 5.0 * leases[0].tensor.sum()
+    loss = loss + 7.0 * leases[1].tensor.sum() + 11.0 * leases[3].tensor.sum()
+    loss.backward()
+
+    expected_peers = []
+    for phase in range(1, cp_size):
+        expected_peers.extend(
+            [
+                (latent_cp.dist.isend, group_ranks[(cp_rank - phase) % cp_size]),
+                (latent_cp.dist.irecv, group_ranks[(cp_rank + phase) % cp_size]),
+            ]
+        )
+    assert [(op.op, op.peer) for op in operations] == expected_peers
+    send_values = [operations[index].tensor[0, 0].item() for index in (0, 2, 4)]
+    assert send_values == [7.0, 0.0, 11.0]
+    assert waits == ["all_gather", "reverse-0", "reverse-1"]
+    expected_remote = sum(
+        100.0 + (cp_rank + phase) % cp_size for phase in range(1, cp_size)
+    )
+    torch.testing.assert_close(
+        payload.grad,
+        torch.full_like(payload, 5.0 + expected_remote),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_reverse_group_selection_requires_exact_rank_order():
+    cp_group = object()
+    equivalent = object()
+    reordered = object()
+    ranks = {
+        cp_group: [3, 7, 11, 15],
+        equivalent: [3, 7, 11, 15],
+        reordered: [3, 11, 7, 15],
+    }
+    with mock.patch.object(
+        latent_cp_module.dist,
+        "get_process_group_ranks",
+        side_effect=lambda group: ranks[group],
+    ):
+        select = latent_cp_module._rank_equivalent_reverse_group
+        assert select(cp_group, None) is cp_group
+        assert select(cp_group, cp_group) is cp_group
+        assert select(cp_group, equivalent) is equivalent
+        assert select(cp_group, reordered) is cp_group
 
 
 @pytest.mark.parametrize("rope_type", ["rope", "yarn"])
@@ -2875,6 +2998,175 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         assert wait_for_compute_stream[cp_size - 1 :] == [True] * (cp_size - 1)
         assert len(set(batch_streams)) == 1
         assert batch_streams[0] != consumer_stream
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("cp_size", [2, 4])
+def test_all_gather_direct_reverse_payload_bytes_streams_and_explicit_group(
+    cp_size, monkeypatch
+):
+    with _model_parallel(1, cp_size) as pg:
+        caller_stream = torch.cuda.current_stream()
+        projection_stream = torch.cuda.Stream()
+        alternate_attention_stream = torch.cuda.Stream()
+        cp_rank = dist.get_rank(pg.cp)
+        group_ranks = tuple(dist.get_process_group_ranks(pg.cp))
+        assert pg.tp_cp is not pg.cp
+        assert tuple(dist.get_process_group_ranks(pg.tp_cp)) == group_ranks
+        assert dist.get_rank(pg.tp_cp) == cp_rank
+        layout = latent_cp.build_zigzag_layout(
+            _cumulative((8 * cp_size,), "cuda"), 8, cp_size, cp_rank
+        )
+        payload = torch.full(
+            (8, _PRODUCTION_KV_LORA + _ROPE_DIM),
+            float(cp_rank),
+            dtype=torch.bfloat16,
+            device="cuda",
+            requires_grad=True,
+        )
+        real_all_gather = latent_cp.dist.all_gather_into_tensor
+        real_p2p_op = latent_cp.dist.P2POp
+        real_batch = latent_cp.dist.batch_isend_irecv
+        gather_records = []
+        p2p_records = []
+        batch_streams = []
+        wait_records = []
+        returned_proxies = []
+
+        class WorkProxy:
+            def __init__(self, kind, work):
+                self.kind = kind
+                self.work = work
+                self.waited = False
+
+            def wait(self):
+                assert not self.waited
+                self.waited = True
+                wait_records.append(
+                    (self.kind, torch.cuda.current_stream().cuda_stream)
+                )
+                return self.work.wait()
+
+        def all_gather(output, input_, group=None, async_op=False):
+            assert group is pg.cp and async_op
+            proxy = WorkProxy(
+                "all_gather",
+                real_all_gather(output, input_, group=group, async_op=True),
+            )
+            returned_proxies.append(proxy)
+            gather_records.append(
+                (
+                    input_.numel(),
+                    output.numel(),
+                    group,
+                    torch.cuda.current_stream().cuda_stream,
+                )
+            )
+            return proxy
+
+        def p2p_op(op, tensor, peer, group=None, tag=0):
+            p2p_records.append((op, tensor, peer, group, tag))
+            return real_p2p_op(op, tensor, peer, group=group, tag=tag)
+
+        def batch(operations):
+            batch_streams.append(torch.cuda.current_stream().cuda_stream)
+            proxies = [WorkProxy("reverse", work) for work in real_batch(operations)]
+            returned_proxies.extend(proxies)
+            return proxies
+
+        monkeypatch.setattr(latent_cp.dist, "all_gather_into_tensor", all_gather)
+        monkeypatch.setattr(latent_cp.dist, "P2POp", p2p_op)
+        monkeypatch.setattr(latent_cp.dist, "batch_isend_irecv", batch)
+        monkeypatch.setattr(
+            latent_cp.dist,
+            "reduce_scatter_tensor",
+            mock.Mock(
+                side_effect=AssertionError("hybrid backward must not reduce-scatter")
+            ),
+        )
+
+        lease_iterator = latent_cp.AllGatherDirectP2PTransport(
+            pg.cp, reverse_group=pg.tp_cp
+        ).iter_payloads(payload, layout.phases, consumer_stream=projection_stream)
+        first_lease = next(lease_iterator)
+        assert first_lease.tensor is payload
+        assert len(gather_records) == 1
+        assert not returned_proxies[0].waited
+        leases = [first_lease, *lease_iterator]
+        assert wait_records == [("all_gather", projection_stream.cuda_stream)]
+        assert [lease.owner for lease in leases] == [
+            (cp_rank - phase) % cp_size for phase in range(cp_size)
+        ]
+        for lease in leases:
+            assert torch.equal(
+                lease.tensor, torch.full_like(lease.tensor, float(lease.owner))
+            )
+
+        weights = [float(cp_rank * cp_size + phase + 1) for phase in range(cp_size)]
+        phase_losses = [weights[0] * leases[0].tensor.float().sum()]
+        completion_events = []
+        for phase_index, (weight, lease) in enumerate(
+            zip(weights[1:], leases[1:], strict=True), start=1
+        ):
+            with torch.cuda.stream(projection_stream):
+                lease.tensor.record_stream(projection_stream)
+                projected = weight * lease.tensor.float()
+                ready = torch.cuda.Event()
+                ready.record(projection_stream)
+            attention_stream = (
+                alternate_attention_stream if phase_index % 2 else caller_stream
+            )
+            attention_stream.wait_event(ready)
+            with torch.cuda.stream(attention_stream):
+                projected.record_stream(attention_stream)
+                phase_losses.append(projected.sum())
+                complete = torch.cuda.Event()
+                complete.record(attention_stream)
+                completion_events.append(complete)
+        for complete in completion_events:
+            caller_stream.wait_event(complete)
+        sum(phase_losses).backward()
+        torch.cuda.synchronize()
+
+        expected = sum(
+            float(query_rank * cp_size + ((query_rank - cp_rank) % cp_size) + 1)
+            for query_rank in range(cp_size)
+        )
+        torch.testing.assert_close(
+            payload.grad, torch.full_like(payload.grad, expected)
+        )
+        latent_elements = 8 * (_PRODUCTION_KV_LORA + _ROPE_DIM)
+        assert gather_records[0][:3] == (
+            latent_elements,
+            cp_size * latent_elements,
+            pg.cp,
+        )
+        assert len(batch_streams) == 1
+        assert batch_streams[0] == gather_records[0][3]
+        assert batch_streams[0] not in {
+            caller_stream.cuda_stream,
+            projection_stream.cuda_stream,
+            alternate_attention_stream.cuda_stream,
+        }
+        assert len(p2p_records) == 2 * (cp_size - 1)
+        expected_peers = []
+        for phase in range(1, cp_size):
+            expected_peers.extend(
+                [
+                    (latent_cp.dist.isend, group_ranks[(cp_rank - phase) % cp_size]),
+                    (latent_cp.dist.irecv, group_ranks[(cp_rank + phase) % cp_size]),
+                ]
+            )
+        assert [(record[0], record[2]) for record in p2p_records] == expected_peers
+        assert all(record[3] is pg.tp_cp and record[4] == 0 for record in p2p_records)
+        assert [record[1][0, 0].item() for record in p2p_records[::2]] == weights[1:]
+        assert all(record[1].numel() == latent_elements for record in p2p_records)
+        assert wait_records[0] == ("all_gather", projection_stream.cuda_stream)
+        assert all(kind == "reverse" for kind, _stream in wait_records[1:])
+        assert all(
+            stream == caller_stream.cuda_stream for _kind, stream in wait_records[1:]
+        )
+        assert returned_proxies and all(proxy.waited for proxy in returned_proxies)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

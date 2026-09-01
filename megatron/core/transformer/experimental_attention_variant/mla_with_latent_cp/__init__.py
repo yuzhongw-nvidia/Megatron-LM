@@ -65,8 +65,10 @@ _qualified_backend_adapter = _backend._qualified_backend_adapter
 _runtime_backend_tuple = _backend._runtime_backend_tuple
 
 LatentCPTransport = _transport.LatentCPTransport
+AllGatherDirectP2PTransport = _transport.AllGatherDirectP2PTransport
 P2PRingTransport = _transport.P2PRingTransport
 PayloadLease = _transport.PayloadLease
+_LatentAllGatherDirectP2PExchange = _transport._LatentAllGatherDirectP2PExchange
 _LatentRingExchange = _transport._LatentRingExchange
 
 __all__ = [
@@ -76,6 +78,7 @@ __all__ = [
     "CUDNN_FRONTEND_SOURCE_REV",
     "CudnnFusedAttentionAdapter",
     "DirectAttentionAdapter",
+    "AllGatherDirectP2PTransport",
     "FA4Adapter",
     "LatentCPError",
     "LatentCPLayoutAdapter",

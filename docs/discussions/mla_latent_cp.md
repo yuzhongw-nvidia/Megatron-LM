@@ -152,7 +152,7 @@ rank enters with a contiguous `[T_r/N, 1, hidden_size]` sequence shard. The exac
    feature helper gathers those shards with the explicit TP group and scatters the complete Q/KV
    latents back to `[T_r/N,...]`. Duplicated TE down projections instead consume and return the
    existing sequence shard directly, so no feature gather/scatter is inserted.
-2. The local profile applies its standalone norms before the ring. The TE profile communicates raw
+2. The local profile applies its standalone norms before transport. The TE profile communicates raw
    latent KV and leaves its standalone norms as identity because normalization remains fused into
    each preserved up projection. Both communicate one `[T_r/N,C+D_r]` payload per TP lane.
 
@@ -168,7 +168,7 @@ rank enters with a contiguous `[T_r/N, 1, hidden_size]` sequence shard. The exac
    over TP before producing local K-content/V heads; on TE it also performs fused RMSNorm. The
    module independently gathers the received K positional shard
    with `gather_from_sequence_parallel_region(..., tensor_parallel_output_grad=True, group=TP)`.
-   Because splitting the contiguous ring payload along its channel dimension produces strided views,
+   Because splitting the contiguous payload along its channel dimension produces strided views,
    TP>1 materializes both latent and positional slices before their TP operations; the collective
    boundary never relies on backend acceptance of noncontiguous inputs. TP1 materializes only the
    latent branch required by the up projection. Its positional view is read directly by the final
@@ -197,7 +197,7 @@ rank enters with a contiguous `[T_r/N, 1, hidden_size]` sequence shard. The exac
    offloading rather than silently changing those semantics.
 
 `pg_collection.cp` contains ranks with the same TP lane, and `pg_collection.tp` contains ranks with
-the same CP ownership. Each CP ring therefore carries a distinct sequence shard rather than a
+the same CP ownership. Each CP transport therefore carries a distinct sequence shard rather than a
 replicated payload. Future A2A work may fuse the TP sequence redistribution with CP layout changes.
 
 ## Tensor and RoPE contract
@@ -237,7 +237,7 @@ Z = concat(Z_kv, K_pos, dim=-1)        # [T_r/N, C + D_r], BF16
 `K_pos` is required: MLA expands it over heads and concatenates it with the content key.
 Communicating only `Z_kv` leaves a remote rank without that Q/K branch. When enabled, RoPE is
 applied on the owner before communication so the receiver needs no position metadata. In no-RoPE
-mode the same payload carries the raw branch. After each ring hop, the TP
+mode the same payload carries the raw branch. For each owner payload, the TP
 group gathers the `N` sequence shards before phase indexing. The K-positional gather uses
 `tensor_parallel_output_grad=True`, so its backward reduce-scatter sums the shared-key gradients
 from all TP-local head shards. Sequence-parallel `linear_kv_up_proj` provides the same ownership
@@ -277,7 +277,7 @@ reduction.
 
 ### Global packed positions are owner metadata when RoPE is enabled
 
-Q and `K_rope` are rotated exactly once, before the ring, with the **original global packed
+Q and `K_rope` are rotated exactly once, before transport, with the **original global packed
 metadata**:
 
 - `cu_global = packed_seq_params.cu_seqlens_q == packed_seq_params.cu_seqlens_kv`;
@@ -314,8 +314,10 @@ B_r = chunk[2P - 1 - r]
 local sequence storage = concat(F_r, B_r)       # length L
 ```
 
-The payload moves clockwise: rank `r` sends to `(r+1) mod P` and receives from `(r-1) mod P`. At
-phase `i`, rank `r` holds the payload owned by `j=(r-i) mod P`.
+The transport launches one rank-major asynchronous all-gather. Rank `r` consumes its original
+payload directly for phase zero, waits for the gather once on the projection stream before the first
+remote phase, then exposes remote owner views in fixed phase order. At phase `i`, rank `r` consumes
+the payload owned by `j=(r-i) mod P`.
 
 | Phase on query rank `r` | Source owner | Q rows | KV rows | Kernel shape per sequence | Mask |
 | --- | --- | --- | --- | --- | --- |
@@ -330,7 +332,7 @@ query chunks. For `j>r`, neither source chunk is visible to `F_r`, while both ar
 
 For `P=1`, arbitrary positive packed lengths are accepted. There is one full/full causal diagonal
 phase, `cu_half == cu_full`, `front_indices` names every row, `back_indices` is empty, and the
-transport yields the local payload once without constructing a P2P operation.
+transport yields the local payload once without constructing a collective or P2P operation.
 
 ### Backend phase metadata
 
@@ -448,28 +450,35 @@ identity is not claimed to be bitwise exact in floating-point.
 Qualification tests cover exactly zero gradients, tiny norms on both sides of the mask threshold,
 extreme phase weights, and very negative LSE. An uncorrected cuDNN backward is never accepted.
 
-## Differentiable P2P ring and recomputation
+## Differentiable gather/direct-P2P transport and recomputation
 
 ### Autograd topology and gradient ownership
 
-`_LatentRingExchange`, local to `transport.py`, is a `torch.autograd.Function` over one payload hop.
-Forward and backward are:
+`_LatentAllGatherDirectP2PExchange`, local to `transport.py`, is one multi-output
+`torch.autograd.Function`. Forward gathers every raw latent payload once. Its output tuple contains
+only the `P-1` remote owner views; phase zero consumes the original local tensor directly. Backward
+receives all remote-view gradients at one boundary and submits one fixed-order P2P batch:
 
 ```text
-forward:  Y_r  = X_(r-1)    # send X_r to r+1, receive from r-1
-backward: dX_r = dY_(r+1)   # send dY_r to r-1, receive from r+1
+phase k on group rank r, 1 <= k < P:
+  forward owner       = (r-k) mod P
+  backward send peer  = owner
+  backward recv peer  = (r+k) mod P
+dX_remote_r = sum(received owner-gradient contributions)
 ```
 
-The attention loop has `P` compute phases and `P-1` exchange nodes. Autograd addition at each node
-accumulates the local phase contribution with the gradient arriving from downstream nodes. Every
-owner's payload gradient therefore contains all query-rank contributions when it reaches the
-owner's original `Z`; no extra hop or latent all-reduce is needed. All ranks build the same graph,
-so backward traverses ring hops in reverse phase order.
+All ranks build the same `2*(P-1)` operation list in ascending phase order. Missing output gradients
+are materialized as explicit zero sends so the P2P population remains identical. The batch uses a
+reverse communicator only when its ordered global-rank tuple exactly matches CP and its local group
+rank is equal; otherwise it uses CP. Every actual Work returned by `batch_isend_irecv` is retained
+and waited. The received stack is summed once on the backward caller stream. Normal autograd then
+adds that remote sum to phase zero's direct local contribution. No chained gradient accumulation,
+full gathered-gradient assembly, or reduce-scatter is required.
 
 Gradient ownership is:
 
 - Q gradients accumulate over all local phases and flow through the local Q projection;
-- payload gradients follow the reverse ring on the same TP sequence lane. The latent component is
+- each remote payload gradient is sent directly to its owner on the same TP sequence lane. The latent component is
   TP-reduce-scattered by sequence-parallel `linear_kv_up_proj`; the shared K-positional component's
   phase gather supplies its sole TP reduce-scatter. The post-RoPE sequence scatter then all-gathers
   that already-summed positional gradient, and the pre-RoPE gather's nonreducing backward splits it
@@ -486,7 +495,8 @@ per-microbatch group through the shared helper and passes that object to every l
 preprocessing, and transport operation without assigning it back to `pg_collection`. Peers are
 resolved from the effective group with
 `torch.distributed.get_process_group_ranks`. Consecutive microbatches may therefore use CP=1 or a
-larger initialized subgroup on one immutable module.
+larger initialized subgroup on one immutable module. Gather input/output and direct-P2P send/receive
+storage remain alive and are recorded on the communication stream until dependencies complete.
 
 ### Phase checkpoint and saved-state scope
 
@@ -521,11 +531,11 @@ fusion updates one shared `main_grad`; only that side effect remains serialized.
 checkpoint path and does not use this stream pipeline.
 
 Full K/V exist only during the initial phase forward, the one-phase-ahead projection window, and the
-short projection replay; they are never sent or stored in ring state.
+short projection replay; they are never sent or stored in transport state.
 
 The intentionally retained activation classes are:
 
-- one latent tensor per differentiable ring node, `O(P*T_r*(C+D_r))` elements;
+- one rank-major gathered latent tensor plus remote views, `O(P*T_r*(C+D_r))` elements;
 - every canonical partial `O_i` in FP32 and `E_i` in FP32, plus final merge state; and
 - local Q/projection inputs required by normal MCore autograd.
 
@@ -590,9 +600,9 @@ in `forward`. Before the layer loop, block-level preprocessing derives one immut
 layout shared by every latent-CP layer, then builds or reuses expensive cuDNN Graph plans and
 canonical ragged bindings. It stores no attention result, performs no rank consensus, and introduces
 no decoder scope or wrapper class. During a phase, the cuDNN adapter only looks up a previously
-prepared binding; it cannot build a graph or derive metadata in the ring. A direct/custom layer call
+prepared binding; it cannot build a graph or derive metadata during transport. A direct/custom layer call
 that bypasses block preprocessing therefore fails in phase zero
-before the first ring hop. Once P2P starts, the module makes no claim to recover from an arbitrary
+before the first transport operation. Once communication starts, the module makes no claim to recover from an arbitrary
 Python, CUDA, or NCCL exception; failures propagate through normal PyTorch/NCCL error handling.
 
 `LatentCPTransport` remains an extension seam. `PayloadLease.tensor` is ordered for use on the

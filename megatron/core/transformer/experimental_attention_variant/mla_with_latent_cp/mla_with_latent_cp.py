@@ -34,7 +34,7 @@ from . import layout as latent_cp_layout
 from . import utils as latent_cp_utils
 from .backend import DirectAttentionAdapter, _qualified_backend_adapter
 from .layout import AlreadyZigZagTHDAdapter
-from .transport import LatentCPTransport, P2PRingTransport, PayloadLease
+from .transport import AllGatherDirectP2PTransport, LatentCPTransport, PayloadLease
 from .utils import LatentCPError, QualifiedBackendTuple, _require
 
 if HAVE_TE:
@@ -49,6 +49,21 @@ else:
     TELayerNormColumnParallelLinear = None
     TELinear = None
     TERowParallelLinear = None
+
+
+def _rank_equivalent_reverse_group(
+    cp_group: dist.ProcessGroup,
+    candidate: dist.ProcessGroup | None,
+) -> dist.ProcessGroup:
+    """Select a distinct reverse communicator only when ordered ranks match CP."""
+
+    if candidate is None or candidate is cp_group:
+        return cp_group
+    if tuple(dist.get_process_group_ranks(candidate)) != tuple(
+        dist.get_process_group_ranks(cp_group)
+    ):
+        return cp_group
+    return candidate
 
 
 def _build_local_latent_norm(
@@ -166,6 +181,10 @@ class MLAWithLatentCP(MLASelfAttention):
             pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
             name=name,
+        )
+        self._static_reverse_cp_group = _rank_equivalent_reverse_group(
+            self.pg_collection.cp,
+            getattr(self.pg_collection, "tp_cp", None),
         )
         self._cp_comm_type = (
             cp_comm_type if cp_comm_type is not None else config.cp_comm_type
@@ -827,7 +846,14 @@ class MLAWithLatentCP(MLASelfAttention):
         query, local_payload = self._project_query_and_payload(
             hidden_states, packed_seq_params, layout, effective_cp_group
         )
-        transport: LatentCPTransport = P2PRingTransport(effective_cp_group)
+        reverse_cp_group = (
+            self._static_reverse_cp_group
+            if effective_cp_group is self.pg_collection.cp
+            else effective_cp_group
+        )
+        transport: LatentCPTransport = AllGatherDirectP2PTransport(
+            effective_cp_group, reverse_group=reverse_cp_group
+        )
 
         merged_output: Tensor | None = None
         merged_lse: Tensor | None = None

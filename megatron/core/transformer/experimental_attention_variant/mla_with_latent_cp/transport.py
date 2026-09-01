@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Differentiable explicit-group P2P transport for MLA latent CP."""
+"""Differentiable collective/P2P transports for MLA latent CP."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ class PayloadLease:
 
 
 class LatentCPTransport(Protocol):
-    """Extension seam for future A2A+P2P transports."""
+    """Transport seam for owner-ordered latent CP payloads."""
 
     def iter_payloads(
         self,
@@ -119,6 +119,276 @@ def _launch_ring_exchange(
     pending.works = works
     pending.send_tensor = payload
     return receive
+
+
+@dataclass
+class _PendingCollective:
+    """Lifetime and readiness state for one asynchronous all-gather."""
+
+    work: Any | None = None
+    input_tensor: Tensor | None = None
+    output_tensor: Tensor | None = None
+    waited: bool = False
+
+    def wait_on_consumer_stream(
+        self, consumer_stream: torch.cuda.Stream | None = None
+    ) -> None:
+        """Order the gather output on exactly one first-consumer stream."""
+
+        _require(not self.waited, "an asynchronous collective was waited twice")
+        _require(self.work is not None, "asynchronous collective lost its work handle")
+        if consumer_stream is None:
+            self.work.wait()
+        else:
+            with torch.cuda.stream(consumer_stream):
+                self.work.wait()
+        self.work = None
+        self.input_tensor = None
+        self.output_tensor = None
+        self.waited = True
+
+
+def _launch_all_gather(
+    payload: Tensor,
+    cp_group: dist.ProcessGroup,
+    cp_size: int,
+    communication_stream: torch.cuda.Stream | None,
+    pending: _PendingCollective,
+) -> Tensor:
+    """Launch one flattened rank-major all-gather without consuming its output."""
+
+    _require(payload.ndim > 0 and payload.is_contiguous(), "payload must be contiguous")
+    input_flat = payload.view(-1)
+    gathered_flat = torch.empty(
+        cp_size * input_flat.numel(), dtype=payload.dtype, device=payload.device
+    )
+    if communication_stream is not None:
+        producer_stream = torch.cuda.current_stream(payload.device)
+        with torch.cuda.stream(communication_stream):
+            communication_stream.wait_stream(producer_stream)
+            work = dist.all_gather_into_tensor(
+                gathered_flat, input_flat, group=cp_group, async_op=True
+            )
+            payload.record_stream(communication_stream)
+            gathered_flat.record_stream(communication_stream)
+    else:
+        work = dist.all_gather_into_tensor(
+            gathered_flat, input_flat, group=cp_group, async_op=True
+        )
+    _require(work is not None, "asynchronous all-gather returned no work handle")
+    pending.work = work
+    pending.input_tensor = input_flat
+    pending.output_tensor = gathered_flat
+    return gathered_flat.view(cp_size, *payload.shape)
+
+
+@dataclass
+class _PendingDirectReverse:
+    """Lifetime and readiness state for one fixed-order reverse P2P batch."""
+
+    works: tuple[Any, ...]
+    send_tensors: tuple[Tensor, ...]
+    receive_tensor: Tensor
+    waited: bool = False
+
+    def wait_on_consumer_stream(
+        self, consumer_stream: torch.cuda.Stream | None = None
+    ) -> None:
+        """Wait every actual batch Work on the backward caller stream."""
+
+        _require(not self.waited, "a reverse P2P batch was waited twice")
+        if consumer_stream is None:
+            for work in self.works:
+                work.wait()
+        else:
+            with torch.cuda.stream(consumer_stream):
+                for work in self.works:
+                    work.wait()
+        self.works = ()
+        self.send_tensors = ()
+        self.waited = True
+
+
+def _launch_direct_reverse(
+    output_gradients: tuple[Tensor | None, ...],
+    reverse_group: dist.ProcessGroup,
+    group_ranks: tuple[int, ...],
+    rank: int,
+    payload_shape: tuple[int, ...],
+    payload_dtype: torch.dtype,
+    payload_device: torch.device,
+    communication_stream: torch.cuda.Stream | None,
+) -> tuple[Tensor, _PendingDirectReverse]:
+    """Route remote-view gradients directly to owners in fixed phase order."""
+
+    cp_size = len(group_ranks)
+    _require(
+        len(output_gradients) == cp_size - 1,
+        "remote gradient count disagrees with CP size",
+    )
+    sends = tuple(
+        (
+            torch.zeros(payload_shape, dtype=payload_dtype, device=payload_device)
+            if gradient is None
+            else gradient.contiguous()
+        )
+        for gradient in output_gradients
+    )
+    _require(
+        all(tuple(send.shape) == payload_shape for send in sends),
+        "remote gradient shape disagrees with the original payload",
+    )
+    receives = torch.empty(
+        (cp_size - 1, *payload_shape),
+        dtype=payload_dtype,
+        device=payload_device,
+    )
+    operations = []
+    for phase, send in enumerate(sends, start=1):
+        owner_peer = group_ranks[(rank - phase) % cp_size]
+        consumer_peer = group_ranks[(rank + phase) % cp_size]
+        operations.extend(
+            (
+                dist.P2POp(dist.isend, send, owner_peer, group=reverse_group),
+                dist.P2POp(
+                    dist.irecv,
+                    receives[phase - 1],
+                    consumer_peer,
+                    group=reverse_group,
+                ),
+            )
+        )
+
+    if communication_stream is None:
+        works = tuple(dist.batch_isend_irecv(operations))
+    else:
+        producer_stream = torch.cuda.current_stream(payload_device)
+        with torch.cuda.stream(communication_stream):
+            communication_stream.wait_stream(producer_stream)
+            works = tuple(dist.batch_isend_irecv(operations))
+            for send in sends:
+                send.record_stream(communication_stream)
+            receives.record_stream(communication_stream)
+    _require(works, "a reverse P2P batch returned no work handle")
+    return receives, _PendingDirectReverse(works, sends, receives)
+
+
+class _LatentAllGatherDirectP2PExchange(torch.autograd.Function):
+    """One all-gather forward with a fixed-order direct P2P backward."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        payload: Tensor,
+        cp_group: dist.ProcessGroup,
+        reverse_group: dist.ProcessGroup,
+        group_ranks: tuple[int, ...],
+        rank: int,
+        communication_stream: torch.cuda.Stream | None,
+        pending: _PendingCollective,
+    ) -> tuple[Tensor, ...]:
+        """Return owner-ordered remote views while retaining one gather Work."""
+
+        cp_size = len(group_ranks)
+        gathered = _launch_all_gather(
+            payload, cp_group, cp_size, communication_stream, pending
+        )
+        ctx.set_materialize_grads(False)
+        ctx.reverse_group = reverse_group
+        ctx.group_ranks = group_ranks
+        ctx.rank = rank
+        ctx.payload_shape = tuple(payload.shape)
+        ctx.payload_dtype = payload.dtype
+        ctx.payload_device = payload.device
+        ctx.communication_stream = communication_stream
+        return tuple(gathered[(rank - phase) % cp_size] for phase in range(1, cp_size))
+
+    @staticmethod
+    def backward(ctx: Any, *output_gradients: Tensor | None) -> tuple[Any, ...]:
+        """Send each phase gradient to its owner and sum received own-gradients."""
+
+        caller_stream = (
+            torch.cuda.current_stream(ctx.payload_device)
+            if ctx.communication_stream is not None
+            else None
+        )
+        received, pending = _launch_direct_reverse(
+            output_gradients,
+            ctx.reverse_group,
+            ctx.group_ranks,
+            ctx.rank,
+            ctx.payload_shape,
+            ctx.payload_dtype,
+            ctx.payload_device,
+            ctx.communication_stream,
+        )
+        pending.wait_on_consumer_stream(caller_stream)
+        grad_payload = received.sum(dim=0)
+        return grad_payload, None, None, None, None, None, None
+
+
+class AllGatherDirectP2PTransport:
+    """One async gather, local bypass, and fixed-order direct reverse P2P."""
+
+    def __init__(
+        self,
+        cp_group: dist.ProcessGroup,
+        reverse_group: dist.ProcessGroup | None = None,
+    ):
+        self.cp_group = cp_group
+        self.group_ranks = tuple(dist.get_process_group_ranks(cp_group))
+        self.rank = dist.get_rank(cp_group)
+        self.size = dist.get_world_size(cp_group)
+        _require(len(self.group_ranks) == self.size, "invalid CP peer list")
+        self.reverse_group = cp_group if reverse_group is None else reverse_group
+        reverse_ranks = tuple(dist.get_process_group_ranks(self.reverse_group))
+        _require(
+            reverse_ranks == self.group_ranks,
+            "reverse CP communicator must preserve the forward CP rank order",
+        )
+        _require(
+            dist.get_rank(self.reverse_group) == self.rank, "CP group ranks disagree"
+        )
+
+    def iter_payloads(
+        self,
+        local_payload: Tensor,
+        phase_plan: tuple[PhaseSpec, ...],
+        consumer_stream: torch.cuda.Stream | None = None,
+    ) -> Iterator[PayloadLease]:
+        """Yield local data directly and remote gather views after one dependency."""
+
+        _require(len(phase_plan) == self.size, "phase-plan length must equal CP size")
+        for phase_index, phase in enumerate(phase_plan):
+            expected_owner = (self.rank - phase_index) % self.size
+            _require(
+                phase.phase == phase_index, "phase-plan indices must be contiguous"
+            )
+            _require(
+                phase.owner == expected_owner,
+                "phase-plan owner order disagrees with the CP group",
+            )
+
+        local_phase, *remote_phases = phase_plan
+        if self.size == 1:
+            yield PayloadLease(owner=local_phase.owner, tensor=local_payload)
+            return
+
+        pending = _PendingCollective()
+        communication_stream = _communication_stream(local_payload)
+        remote_payloads = _LatentAllGatherDirectP2PExchange.apply(
+            local_payload,
+            self.cp_group,
+            self.reverse_group,
+            self.group_ranks,
+            self.rank,
+            communication_stream,
+            pending,
+        )
+        yield PayloadLease(owner=local_phase.owner, tensor=local_payload)
+        pending.wait_on_consumer_stream(consumer_stream)
+        for phase, remote_payload in zip(remote_phases, remote_payloads, strict=True):
+            yield PayloadLease(owner=phase.owner, tensor=remote_payload)
 
 
 class _LatentRingExchange(torch.autograd.Function):
