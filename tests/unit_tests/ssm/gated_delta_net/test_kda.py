@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import parallel_state
+from megatron.core.activations import situlu
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
@@ -186,8 +187,14 @@ def test_kda_forward_backward(f_lora_rank, gate_lora_rank):
     )
     try:
         model_parallel_cuda_manual_seed(123)
-        config = _make_config(f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank)
+        config = replace(
+            _make_config(f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank),
+            activation_func=situlu,
+            gated_linear_unit=True,
+        )
         kda = _build_kda(config)
+        assert kda.act_fn is F.silu
+        assert kda.activation == "silu"
         legacy_fused = f_lora_rank is None and gate_lora_rank is None
         assert kda.use_legacy_fused_projections == legacy_fused
         if legacy_fused:
