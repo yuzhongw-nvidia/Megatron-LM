@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from argparse import ArgumentParser
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ import torch
 import megatron.core.extensions.transformer_engine as te_extension
 from megatron.core.activations import situlu
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.arguments import _add_network_size_args
 
 
 class _FakeActivation:
@@ -90,6 +92,16 @@ def test_situlu_reference_matches_fixed_values():
     )
 
     torch.testing.assert_close(situlu(x), expected, rtol=1e-6, atol=1e-5)
+
+
+def test_situ_glu_cli_selects_te_or_pytorch_backend():
+    parser = _add_network_size_args(ArgumentParser())
+
+    default_args = parser.parse_args(["--situ-glu"])
+    fallback_args = parser.parse_args(["--situ-glu", "--use-pytorch-situ-glu"])
+
+    assert default_args.use_pytorch_situ_glu is False
+    assert fallback_args.use_pytorch_situ_glu is True
 
 
 def test_transformer_config_accepts_situ_glu_defaults():

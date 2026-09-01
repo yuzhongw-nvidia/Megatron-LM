@@ -1413,6 +1413,8 @@ def validate_args(args, defaults={}):
 
     # Checks.
     use_situ_glu = getattr(args, 'situ_glu', False)
+    if getattr(args, 'use_pytorch_situ_glu', False) and not use_situ_glu:
+        raise ValueError("--use-pytorch-situ-glu requires --situ-glu.")
     if use_situ_glu:
         if args.swiglu or args.quick_geglu or args.squared_relu:
             raise ValueError(
@@ -2255,7 +2257,7 @@ def core_transformer_config_from_args(args, config_class=None):
     if use_situ_glu:
         kw_args['activation_func'] = situlu
         kw_args['gated_linear_unit'] = True
-        kw_args['use_te_activation_func'] = True
+        kw_args['use_te_activation_func'] = not getattr(args, 'use_pytorch_situ_glu', False)
         kw_args['bias_activation_fusion'] = False
     elif args.swiglu:
         kw_args['activation_func'] = F.silu
@@ -3021,6 +3023,12 @@ def _add_network_size_args(parser):
             'Use SiTU-GLU in all dense and MoE FFNs. TE-backed paths select SiTUGLU '
             'or ScaledSiTUGLU; other paths use the PyTorch reference.'
         ),
+    )
+    group.add_argument(
+        '--use-pytorch-situ-glu',
+        action='store_true',
+        help='Use the PyTorch SiTU-GLU implementation instead of Transformer Engine. '
+        'Requires --situ-glu.',
     )
     group.add_argument(
         '--quick-geglu',
