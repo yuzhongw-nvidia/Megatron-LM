@@ -503,16 +503,16 @@ gradient-accumulation-fusion side effects and parameter hooks while removing the
 forward. The FA4 adapter retains the non-reentrant phase-checkpoint fallback until its qualified
 public API exposes an equally narrow split forward/backward ownership boundary.
 
-For the cuDNN selective-recompute path, phase zero expands K/V on the ordinary stream and its
-attention is enqueued before the phase iterator requests and stages the next lease. When the
-iterator resumes, the next latent-KV up projection plus K/V packing are submitted on one
-adapter-shared projection stream while the current attention is already resident on its execution
-stream. A recorded event orders only the stream that consumes that K/V. Forward attention phases
-alternate between the ordinary stream and one adapter-shared attention stream, and partial merges
-are submitted only after every phase attention launch. The strict host enqueue order is therefore
-`expand(0), attention(0), expand(1), attention(1), ...`; it overlaps phase `i+1` projection and
-neighboring attention phases with phase `i` attention without retaining a differentiable projection
-graph. Forward expansion runs under
+For the cuDNN selective-recompute path, phase zero expands K/V on the ordinary stream. Before each
+phase is yielded, the iterator requests the next lease so the P2P ring remains one hop ahead, but it
+does not expand that lease yet. The caller enqueues the current attention, then resumes the iterator
+and submits the prefetched lease's latent-KV up projection plus K/V packing on one adapter-shared
+projection stream. A recorded event orders only the stream that consumes that K/V. Forward
+attention phases alternate between the ordinary stream and one adapter-shared attention stream, and
+partial merges are submitted only after every phase attention launch. The strict host order is
+therefore `lease(1), attention(0), expand(1), lease(2), attention(1), expand(2), ...`; communication
+stays prefetched while phase `i+1` projection and neighboring attention phases overlap phase `i`
+attention without retaining a differentiable projection graph. Forward expansion runs under
 `no_grad`. Each custom autograd node is created on the stream that executes its phase, so PyTorch's
 producer/consumer stream contract returns that phase's replay and cuDNN backward to the same
 canonical stream. Neighboring phase backward work can therefore overlap. The adapter separately

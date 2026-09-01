@@ -735,9 +735,16 @@ class MLAWithLatentCP(MLASelfAttention):
         current_ready: torch.cuda.Event | None = None
 
         for phase_index in range(len(phases)):
-            # Suspend before staging the next phase. The caller first enqueues the
-            # current attention, then resumes this generator so the next projection
-            # can overlap work that is already resident on an attention stream.
+            # Keep the ring one lease ahead, but suspend before expanding that lease.
+            # The caller first enqueues the current attention, then resumes this
+            # generator so the next projection can overlap work that is already
+            # resident on an attention stream.
+            next_phase: latent_cp_layout.PhaseSpec | None = None
+            next_lease: PayloadLease | None = None
+            if phase_index + 1 < len(phases):
+                next_phase = phases[phase_index + 1]
+                next_lease = next(leases)
+
             yield (
                 current_phase,
                 current_lease,
@@ -746,10 +753,10 @@ class MLAWithLatentCP(MLASelfAttention):
                 current_ready,
             )
 
-            if phase_index + 1 >= len(phases):
+            if next_phase is None or next_lease is None:
                 continue
-            current_phase = phases[phase_index + 1]
-            current_lease = next(leases)
+            current_phase = next_phase
+            current_lease = next_lease
             current_payload = current_lease.tensor
             with torch.cuda.stream(projection_stream):
                 current_payload.record_stream(projection_stream)
