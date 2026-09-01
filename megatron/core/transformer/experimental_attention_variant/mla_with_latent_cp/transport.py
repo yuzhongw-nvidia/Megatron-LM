@@ -63,28 +63,24 @@ def _communication_stream(payload: Tensor) -> torch.cuda.Stream | None:
 class _PendingExchange:
     """CUDA readiness state for one prefetched receive."""
 
-    ready_event: torch.cuda.Event | None = None
-    ready_stream: torch.cuda.Stream | None = None
+    works: tuple[Any, ...] = ()
     send_tensor: Tensor | None = None
     waited: bool = False
 
     def wait_on_consumer_stream(
         self, consumer_stream: torch.cuda.Stream | None = None
     ) -> None:
-        """Install one event dependency on an explicit or current consumer stream."""
+        """Order one prefetched receive on an explicit or current consumer stream."""
 
         _require(not self.waited, "a prefetched ring payload was consumed twice")
-        _require(
-            (self.ready_event is None) == (self.ready_stream is None),
-            "a prefetched ring payload has incomplete CUDA readiness state",
-        )
-        if self.ready_event is not None:
-            if consumer_stream is None:
-                consumer_stream = torch.cuda.current_stream()
-            if consumer_stream != self.ready_stream:
-                consumer_stream.wait_event(self.ready_event)
-        self.ready_event = None
-        self.ready_stream = None
+        if consumer_stream is None:
+            for work in self.works:
+                work.wait()
+        else:
+            with torch.cuda.stream(consumer_stream):
+                for work in self.works:
+                    work.wait()
+        self.works = ()
         self.waited = True
         self.send_tensor = None
 
@@ -117,15 +113,10 @@ def _launch_ring_exchange(
             # current_stream() is the communication stream inside this context.
             communication_stream.wait_stream(producer_stream)
         works = tuple(dist.batch_isend_irecv(operations))
-        _require(works, "a CUDA P2P exchange returned no work handles")
-        for work in works:
-            work.wait()
-        ready_event = torch.cuda.Event()
-        ready_event.record(communication_stream)
+        _require(works, "a CUDA P2P exchange returned no work handle")
         payload.record_stream(communication_stream)
         receive.record_stream(communication_stream)
-    pending.ready_event = ready_event
-    pending.ready_stream = communication_stream
+    pending.works = works
     pending.send_tensor = payload
     return receive
 
