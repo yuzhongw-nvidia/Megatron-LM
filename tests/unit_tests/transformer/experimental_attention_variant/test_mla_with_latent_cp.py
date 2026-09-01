@@ -1333,82 +1333,63 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
     assert adapter.backward_calls == 1
 
 
-def test_cudnn_phase_stream_pair_allocates_attention_before_reservation(monkeypatch):
-    """The alternate phase stream must precede one persistent downstream reservation."""
-
-    allocations = []
-
-    class FakeStream:
-        def __init__(self, *, device):
-            self.device = device
-            self.ordinal = len(allocations)
-            allocations.append(self)
-
-    monkeypatch.setattr(torch.cuda, "Stream", FakeStream)
-
-    reservation, attention = latent_cp_cudnn_backend._allocate_phase_stream_pair(3)
-
-    assert allocations == [attention, reservation]
-    assert reservation is not attention
-    assert reservation.device == attention.device == 3
-    assert attention.ordinal == 0
-    assert reservation.ordinal == 1
-
-
-def test_recomputed_phase_generator_projects_on_canonical_phase_stream(
+def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
     monkeypatch,
 ):
-    """The next projection follows current attention on its own canonical stream."""
+    """The next projection must be staged only after current attention is enqueued."""
 
     order = []
+    projection_stream = object()
     phases = tuple(SimpleNamespace(phase=index, owner=index) for index in range(4))
-    phase_streams = tuple(object() for _ in phases)
-    active_stream = None
 
     class FakePayload:
         def __init__(self, phase_index):
             self.phase_index = phase_index
 
         def record_stream(self, stream):
-            assert stream is phase_streams[self.phase_index]
+            assert stream is projection_stream
 
     class FakeTransport:
         @staticmethod
-        def iter_payloads(_local_payload, phase_plan, consumer_streams=None):
+        def iter_payloads(_local_payload, phase_plan, consumer_stream=None):
             assert phase_plan is phases
-            assert consumer_streams is phase_streams
+            assert consumer_stream is projection_stream
             for phase in phase_plan:
                 yield SimpleNamespace(
                     owner=phase.owner, tensor=FakePayload(phase.phase)
                 )
 
+    class FakeBackend:
+        @staticmethod
+        def projection_stream():
+            return projection_stream
+
+    class FakeEvent:
+        def record(self, stream):
+            assert stream is projection_stream
+
     class Harness:
         @staticmethod
         def _expand_phase_kv(payload, phase):
             assert payload.phase_index == phase.phase
-            assert active_stream is (
-                None if phase.phase == 0 else phase_streams[phase.phase]
-            )
             order.append(("projection", phase.phase))
             return object(), object()
 
     @contextmanager
     def use_stream(stream):
-        nonlocal active_stream
-        assert active_stream is None
-        active_stream = stream
-        try:
-            yield
-        finally:
-            active_stream = None
+        assert stream is projection_stream
+        yield
 
     monkeypatch.setattr(latent_cp_module.torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(latent_cp_module.torch.cuda, "Event", FakeEvent)
     phase_inputs = latent_cp_module.MLAWithLatentCP._iter_recomputed_phases(
-        Harness(), FakeTransport(), FakePayload(-1), phases, phase_streams
+        Harness(), FakeBackend(), FakeTransport(), FakePayload(-1), phases
     )
-    for phase, lease, _key, _value in phase_inputs:
+    ready = []
+    for phase, lease, _key, _value, phase_ready in phase_inputs:
         assert lease.owner == phase.owner
         order.append(("attention", phase.phase))
+        ready.append(phase_ready)
 
     assert order == [
         ("projection", 0),
@@ -1420,6 +1401,8 @@ def test_recomputed_phase_generator_projects_on_canonical_phase_stream(
         ("projection", 3),
         ("attention", 3),
     ]
+    assert ready[0] is None
+    assert all(isinstance(event, FakeEvent) for event in ready[1:])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -2792,17 +2775,11 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         p2p_records = []
         batch_calls = []
         batch_streams = []
-        batch_work_counts = []
         returned_proxies = []
         work_wait_streams = []
         wait_for_compute_stream = []
-        current_stream = torch.cuda.current_stream()
-        consumer_stream = current_stream.cuda_stream
-        alternate_stream = torch.cuda.Stream()
-        phase_streams = tuple(
-            current_stream if phase % 2 == 0 else alternate_stream
-            for phase in range(cp_size)
-        )
+        consumer_stream = torch.cuda.current_stream().cuda_stream
+        projection_stream = torch.cuda.Stream()
         wait_count = 0
 
         def p2p_op(op, tensor, peer, group=None, tag=0):
@@ -2830,7 +2807,6 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
             batch_streams.append(torch.cuda.current_stream().cuda_stream)
             proxies = [WorkProxy(work) for work in real_batch(operations)]
             returned_proxies.extend(proxies)
-            batch_work_counts.append(len(proxies))
             return proxies
 
         monkeypatch.setattr(latent_cp.dist, "P2POp", p2p_op)
@@ -2843,7 +2819,7 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
 
         monkeypatch.setattr(latent_cp._transport, "_launch_ring_exchange", launch)
         lease_iterator = latent_cp.P2PRingTransport(pg.cp).iter_payloads(
-            payload, layout.phases, consumer_streams=phase_streams
+            payload, layout.phases, consumer_stream=projection_stream
         )
         first_lease = next(lease_iterator)
         assert len(batch_calls) == 1
@@ -2852,14 +2828,10 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         leases = [first_lease, *lease_iterator]
         forward_proxy_count = len(returned_proxies)
         assert forward_proxy_count
-        assert work_wait_streams == [
-            phase_streams[phase].cuda_stream
-            for phase, work_count in zip(
-                range(1, cp_size), batch_work_counts, strict=True
-            )
-            for _work in range(work_count)
-        ]
-        current_stream.wait_stream(alternate_stream)
+        assert (
+            work_wait_streams == [projection_stream.cuda_stream] * forward_proxy_count
+        )
+        torch.cuda.current_stream().wait_stream(projection_stream)
         assert [lease.owner for lease in leases] == [
             (cp_rank - phase) % cp_size for phase in range(cp_size)
         ]
