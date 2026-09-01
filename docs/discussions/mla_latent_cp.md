@@ -504,23 +504,18 @@ forward. The FA4 adapter retains the non-reentrant phase-checkpoint fallback unt
 public API exposes an equally narrow split forward/backward ownership boundary.
 
 For the cuDNN selective-recompute path, phase zero expands K/V on the ordinary stream and its
-attention is enqueued before the phase iterator requests and stages the next lease. Forward phases
-alternate between the ordinary stream and one adapter-shared attention stream. The prefetched
-receive waits directly on its phase's canonical stream; latent-KV up projection, K/V packing, and
-attention are then submitted in order on that same stream. This removes the projection-ready
-record/wait chain without moving the next P2P launch ahead of current attention. The adapter retains
-one idle default-priority stream as a CUDA-connection reservation before constructing the alternate
-attention stream. The reservation owns no tensor, kernel, event, or synchronization; it preserves
-the previously qualified connection placement of the alternate attention and ring streams while
-projection itself remains on the canonical phase streams. This is an explicit scheduling primitive,
-not a data or correctness dependency, and its allocation order is unit-tested. The strict host
-enqueue order remains
-`expand(0), attention(0), expand(1), attention(1), ...`; phase `i+1` projection can overlap phase
-`i` attention on the other canonical stream without retaining a differentiable projection graph.
-Forward expansion runs under `no_grad`, and partial merges are submitted only after every phase
-attention launch. Each custom autograd node is created on the stream that executes its phase, so
-PyTorch's producer/consumer stream contract returns that phase's replay and cuDNN backward to the
-same canonical stream. Neighboring phase backward work can therefore overlap. The adapter separately
+attention is enqueued before the phase iterator requests and stages the next lease. When the
+iterator resumes, the next latent-KV up projection plus K/V packing are submitted on one
+adapter-shared projection stream while the current attention is already resident on its execution
+stream. A recorded event orders only the stream that consumes that K/V. Forward attention phases
+alternate between the ordinary stream and one adapter-shared attention stream, and partial merges
+are submitted only after every phase attention launch. The strict host enqueue order is therefore
+`expand(0), attention(0), expand(1), attention(1), ...`; it overlaps phase `i+1` projection and
+neighboring attention phases with phase `i` attention without retaining a differentiable projection
+graph. Forward expansion runs under
+`no_grad`. Each custom autograd node is created on the stream that executes its phase, so PyTorch's
+producer/consumer stream contract returns that phase's replay and cuDNN backward to the same
+canonical stream. Neighboring phase backward work can therefore overlap. The adapter separately
 chains projection-gradient completion events across those streams because TE gradient-accumulation
 fusion updates one shared `main_grad`; only that side effect remains serialized. FA4 keeps its
 checkpoint path and does not use this stream pipeline.
@@ -568,10 +563,10 @@ communication stream. The public `torch.distributed.batch_isend_irecv` batch con
 objects ordered as `[isend(next), irecv(previous)]`, and every operation sets
 `group=effective_cp_group`. For a compute-produced payload, the communication stream waits for its
 producer. The returned work handles remain pending while the current phase computes; when the
-consumer next requests the prefetched receive, every handle is waited exactly once. The ordinary
-backend path uses its current attention stream. cuDNN projection pipelining supplies the complete
-per-phase ordinary/secondary stream plan, so receive completion feeds K/V expansion on the same
-stream that will execute that phase's attention. Ring autograd nodes remain on the ordinary stream.
+consumer next requests the prefetched receive, every handle is waited exactly once on that explicit
+consumer stream. The ordinary backend path uses the attention stream; cuDNN projection pipelining
+uses the adapter-shared projection stream, so receive completion can feed K/V expansion without
+stalling current-phase attention. Ring autograd nodes themselves remain on the ordinary stream.
 The producer stream is captured before entering the communication-stream context; querying
 the current stream after that switch would return the communication stream itself and silently remove
 the dependency.
@@ -926,9 +921,7 @@ Two small protocols keep future collectives out of attention math:
 
 ```text
 LatentCPLayoutAdapter.prepare(local_hidden, packed_params, cp_group) -> LayoutView
-LatentCPTransport.iter_payloads(
-    local_payload, phase_plan, consumer_streams=None
-) -> Iterator[PayloadLease]
+LatentCPTransport.iter_payloads(local_payload, phase_plan) -> Iterator[PayloadLease]
 ```
 
 `LayoutView` owns front/back indices, phase cumulative lengths, owner global-position mapping, and
@@ -1052,15 +1045,11 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    full-K/V size. For CP=2/4, prove forward owner routing, reverse gradient routing, fixed peer order,
    that every recorded `P2POp` constructor receives the effective CP group, and that the next
    exchange is submitted on the dedicated stream before the current lease is yielded. Every returned
-   work must be waited exactly once: forward waits follow the explicitly supplied
-   ordinary/secondary phase-stream plan, while reverse-autograd waits remain on the ordinary
-   consumer stream. Each cuDNN phase's receive wait, K/V projection, attention forward, and custom
-   backward must execute on its canonical stream without an intermediate projection-ready event,
-   and the adapter stream-pair allocator must create exactly one persistent, work-free connection
-   reservation before the alternate attention stream, while projection-gradient side effects remain
-   explicitly event-serialized. The reservation is not accepted as a synchronization or payload
-   owner. Relay sends must alias the corresponding immutable lease rather than stage a D2D copy.
-   After construction, patch
+   work must be waited exactly once: forward waits run on an explicitly supplied projection stream,
+   while reverse-autograd waits remain on the ordinary consumer stream. Alternating cuDNN forward
+   phases and their custom backwards must execute on the same ordinary/secondary canonical streams,
+   while projection-gradient side effects remain explicitly event-serialized. Relay sends must alias the
+   corresponding immutable lease rather than stage a D2D copy. After construction, patch
    `parallel_state.get_tensor_model_parallel_group`,
    `get_context_parallel_group`, and `get_tensor_and_context_parallel_group` to raise throughout
    the complete TP=2 x CP=2 production forward/backward; test-harness collectives remain explicitly

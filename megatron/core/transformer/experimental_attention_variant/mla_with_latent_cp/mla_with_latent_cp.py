@@ -699,21 +699,30 @@ class MLAWithLatentCP(MLASelfAttention):
 
     def _iter_recomputed_phases(
         self,
+        backend: DirectAttentionAdapter,
         transport: LatentCPTransport,
         local_payload: Tensor,
         phases: tuple[latent_cp_layout.PhaseSpec, ...],
-        phase_streams: tuple[torch.cuda.Stream, ...],
-    ) -> Iterator[tuple[latent_cp_layout.PhaseSpec, PayloadLease, Tensor, Tensor]]:
-        """Stage each next projection on its canonical cuDNN phase stream."""
+    ) -> Iterator[
+        tuple[
+            latent_cp_layout.PhaseSpec,
+            PayloadLease,
+            Tensor,
+            Tensor,
+            torch.cuda.Event | None,
+        ]
+    ]:
+        """Pipeline each next latent-KV expansion with the current cuDNN phase."""
 
-        _require(phases, "phase plan must not be empty")
+        stream_factory = getattr(backend, "projection_stream", None)
         _require(
-            len(phase_streams) == len(phases),
-            "phase-stream plan length must equal phase count",
+            callable(stream_factory), "recomputed backend has no projection stream"
         )
+        projection_stream = stream_factory()
+        _require(phases, "phase plan must not be empty")
         leases = iter(
             transport.iter_payloads(
-                local_payload, phases, consumer_streams=phase_streams
+                local_payload, phases, consumer_stream=projection_stream
             )
         )
 
@@ -723,6 +732,7 @@ class MLAWithLatentCP(MLASelfAttention):
             current_key, current_value = self._expand_phase_kv(
                 current_lease.tensor, current_phase
             )
+        current_ready: torch.cuda.Event | None = None
 
         for phase_index in range(len(phases)):
             # Suspend before staging the next phase. The caller first enqueues the
@@ -733,6 +743,7 @@ class MLAWithLatentCP(MLASelfAttention):
                 current_lease,
                 current_key,
                 current_value,
+                current_ready,
             )
 
             if phase_index + 1 >= len(phases):
@@ -740,13 +751,14 @@ class MLAWithLatentCP(MLASelfAttention):
             current_phase = phases[phase_index + 1]
             current_lease = next(leases)
             current_payload = current_lease.tensor
-            phase_stream = phase_streams[phase_index + 1]
-            with torch.cuda.stream(phase_stream):
-                current_payload.record_stream(phase_stream)
+            with torch.cuda.stream(projection_stream):
+                current_payload.record_stream(projection_stream)
                 with torch.no_grad():
                     current_key, current_value = self._expand_phase_kv(
                         current_payload, current_phase
                     )
+                current_ready = torch.cuda.Event()
+                current_ready.record(projection_stream)
 
         _require(
             next(leases, None) is None, "transport yielded too many payload leases"
@@ -865,7 +877,6 @@ class MLAWithLatentCP(MLASelfAttention):
         projection_parameters: tuple[Tensor, ...] = ()
         consumer_stream = torch.cuda.current_stream(query.device)
         attention_stream: torch.cuda.Stream | None = None
-        phase_streams: tuple[torch.cuda.Stream, ...] | None = None
         phase_queries: tuple[Tensor, ...] | None = None
         pending_merges: list[
             tuple[
@@ -898,20 +909,15 @@ class MLAWithLatentCP(MLASelfAttention):
             query_ready = torch.cuda.Event()
             query_ready.record(consumer_stream)
             attention_stream.wait_event(query_ready)
-            phase_streams = tuple(
-                attention_stream if phase_index % 2 == 1 else consumer_stream
-                for phase_index in range(len(layout.phases))
-            )
         if recomputed_forward is None:
             leases = transport.iter_payloads(local_payload, layout.phases)
             phase_inputs = (
-                (phase, lease, None, None)
+                (phase, lease, None, None, None)
                 for phase, lease in zip(layout.phases, leases, strict=True)
             )
         else:
-            _require(phase_streams is not None, "canonical phase streams are missing")
             phase_inputs = self._iter_recomputed_phases(
-                transport, local_payload, layout.phases, phase_streams
+                backend, transport, local_payload, layout.phases
             )
 
         for phase_index, (
@@ -919,6 +925,7 @@ class MLAWithLatentCP(MLASelfAttention):
             lease,
             phase_key,
             phase_value,
+            phase_ready,
         ) in enumerate(phase_inputs):
             lease_count += 1
             _require(
@@ -955,9 +962,6 @@ class MLAWithLatentCP(MLASelfAttention):
                     "recomputed phase lost its pre-expanded K/V tensors",
                 )
                 execute_off_main = phase_index % 2 == 1
-                _require(
-                    phase_streams is not None, "canonical phase streams are missing"
-                )
                 completion_event: torch.cuda.Event | None = None
                 if execute_off_main:
                     _require(
@@ -965,7 +969,10 @@ class MLAWithLatentCP(MLASelfAttention):
                         "alternate attention stream is missing",
                     )
                     completion_event = torch.cuda.Event()
-                ready_stream = phase_streams[phase_index]
+                ready_stream = attention_stream if execute_off_main else consumer_stream
+                _require(ready_stream is not None, "phase execution stream is missing")
+                if phase_ready is not None:
+                    ready_stream.wait_event(phase_ready)
                 q_phase.record_stream(ready_stream)
                 phase_key.record_stream(ready_stream)
                 phase_value.record_stream(ready_stream)

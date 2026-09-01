@@ -322,21 +322,6 @@ def _resolve_cudnn_frontend_version(cudnn: Any) -> str:
     return str(version)
 
 
-def _allocate_phase_stream_pair(
-    device_index: int,
-) -> tuple[torch.cuda.Stream, torch.cuda.Stream]:
-    """Reserve the established CUDA connection before the alternate phase stream.
-
-    Projection now runs on the canonical phase streams. Keeping the first default-priority stream
-    alive preserves the previously qualified connection placement of the alternate attention and
-    ring streams without inserting work or synchronization on the reservation.
-    """
-
-    reservation = torch.cuda.Stream(device=device_index)
-    attention = torch.cuda.Stream(device=device_index)
-    return reservation, attention
-
-
 class CudnnFusedAttentionAdapter:
     """Direct public cuDNN Frontend Graph adapter for fully ragged BF16 SDPA.
 
@@ -367,10 +352,8 @@ class CudnnFusedAttentionAdapter:
         with torch.cuda.device(self.device_index):
             capability = torch.cuda.get_device_capability(self.device_index)
             self._handle = self.cudnn.create_handle()
-            (
-                self._phase_stream_reservation,
-                self._attention_stream,
-            ) = _allocate_phase_stream_pair(self.device_index)
+            self._projection_stream = torch.cuda.Stream(device=self.device_index)
+            self._attention_stream = torch.cuda.Stream(device=self.device_index)
         self.identity: QualifiedBackendTuple = (
             AttnBackend.fused,
             self.frontend_version,
@@ -1023,6 +1006,15 @@ class CudnnFusedAttentionAdapter:
             expand_phase_kv,
             *projection_parameters,
         )
+
+    def projection_stream(self) -> torch.cuda.Stream:
+        """Return the adapter-shared stream used to prepare the next phase's K/V."""
+
+        _require(
+            torch.cuda.current_device() == self.device_index,
+            "projection stream belongs to a different CUDA device",
+        )
+        return self._projection_stream
 
     def attention_stream(self) -> torch.cuda.Stream:
         """Return the second stream used by alternating forward attention phases."""
