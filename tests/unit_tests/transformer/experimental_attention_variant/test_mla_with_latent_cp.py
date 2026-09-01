@@ -1094,27 +1094,6 @@ def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
     torch.testing.assert_close(payload.grad, torch.ones_like(payload), rtol=0, atol=0)
 
 
-def test_reverse_group_selection_requires_exact_rank_order():
-    cp_group = object()
-    equivalent = object()
-    reordered = object()
-    ranks = {
-        cp_group: [3, 7, 11, 15],
-        equivalent: [3, 7, 11, 15],
-        reordered: [3, 11, 7, 15],
-    }
-    with mock.patch.object(
-        latent_cp_module.dist,
-        "get_process_group_ranks",
-        side_effect=lambda group: ranks[group],
-    ):
-        select = latent_cp_module._rank_equivalent_reverse_group
-        assert select(cp_group, None) is cp_group
-        assert select(cp_group, cp_group) is cp_group
-        assert select(cp_group, equivalent) is equivalent
-        assert select(cp_group, reordered) is cp_group
-
-
 @pytest.mark.parametrize("rope_type", ["rope", "yarn"])
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_independent_packed_zigzag_global_positions(rope_type: str, cp_size: int):
@@ -2839,13 +2818,9 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
             return real_launch(*args, **kwargs)
 
         monkeypatch.setattr(latent_cp._transport, "_launch_ring_exchange", launch)
-        assert pg.tp_cp is not pg.cp
-        assert dist.get_process_group_ranks(pg.tp_cp) == dist.get_process_group_ranks(
-            pg.cp
+        lease_iterator = latent_cp.P2PRingTransport(pg.cp).iter_payloads(
+            payload, layout.phases, consumer_stream=projection_stream
         )
-        lease_iterator = latent_cp.P2PRingTransport(
-            pg.cp, reverse_group=pg.tp_cp
-        ).iter_payloads(payload, layout.phases, consumer_stream=projection_stream)
         first_lease = next(lease_iterator)
         assert len(batch_calls) == 1
         assert batch_streams[0] != consumer_stream
@@ -2886,11 +2861,7 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         assert latent_elements < full_elements
         assert p2p_records
         assert all(record[1] == latent_elements for record in p2p_records)
-        forward_record_count = 2 * (cp_size - 1)
-        assert all(record[4] is pg.cp for record in p2p_records[:forward_record_count])
-        assert all(
-            record[4] is pg.tp_cp for record in p2p_records[forward_record_count:]
-        )
+        assert all(record[4] is pg.cp for record in p2p_records)
         assert len(batch_calls) == 2 * (cp_size - 1)
         assert len(p2p_records) == 2 * len(batch_calls)
         assert returned_proxies and all(proxy.waited for proxy in returned_proxies)

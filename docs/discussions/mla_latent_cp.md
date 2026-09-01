@@ -482,14 +482,10 @@ Gradient ownership is:
 The constructor requires `pg_collection` and retains its `cp`/`tp` groups. Static forwards use the
 stored CP group. For dynamic CP, the data scheduler owns creation and generic consistency checks for
 the paired `PackedSeqParams.local_cp_size/cp_group` fields. A dynamic forward resolves the
-per-microbatch group through the shared helper and passes that object to every layout, RoPE, and
-preprocessing operation without assigning it back to `pg_collection`. For static CP, a distinct
-`tp_cp` communicator may carry reverse P2P only when its ordered global ranks exactly match the
-stored CP group; this is the TP=1 production case and preserves the same peers while separating the
-forward and reverse NCCL streams. A missing, reordered, or larger candidate falls back to the CP
-communicator. Dynamic CP likewise uses its effective microbatch group in both directions because no
-rank-equivalent secondary communicator is guaranteed. Peers are resolved from the effective group
-with `torch.distributed.get_process_group_ranks`. Consecutive microbatches may therefore use CP=1 or a
+per-microbatch group through the shared helper and passes that object to every layout, RoPE,
+preprocessing, and transport operation without assigning it back to `pg_collection`. Peers are
+resolved from the effective group with
+`torch.distributed.get_process_group_ranks`. Consecutive microbatches may therefore use CP=1 or a
 larger initialized subgroup on one immutable module.
 
 ### Phase checkpoint and saved-state scope
@@ -582,14 +578,10 @@ lease retains send storage until its work handles complete. Every backward hop s
 compute-produced gradient. The generator yields phase `i` on the ordinary attention stream while the
 one-hop receive remains in flight, then waits only when phase `i+1` requests that receive.
 
-Backward submits `[isend(previous), irecv(next)]` and waits for the reverse receive before returning
-`dX_r`. When static CP has a rank-equivalent `tp_cp` group, those reverse operations use that
-distinct communicator while forward operations remain on `cp`; otherwise both directions use the
-effective CP group. The manual CUDA communication stream and all work waits keep the same ordering
-contract, while the separate NCCL communicator permits reverse-only priority policy without
-preempting forward attention. Send and receive tensors are recorded on the communication stream,
-and the pending lease retains send storage until every work handle completes. CP=1 creates no stream
-and submits no P2P. Fixed payload shapes, peer order, operation lists, and phase counts remain
+Backward submits `[isend(previous), irecv(next)]` on the same communication stream and waits for the
+reverse receive before returning `dX_r`. Send and receive tensors are recorded on the communication
+stream, and the pending lease retains send storage until every work handle completes. CP=1 creates no
+stream and submits no P2P. Fixed payload shapes, peer order, operation lists, and phase counts remain
 identical across ranks, preventing mismatched-message and parity-order deadlocks.
 
 Feature-static config, package, runtime, and capability checks run in the layer constructor, using
