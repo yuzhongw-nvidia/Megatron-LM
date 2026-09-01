@@ -65,12 +65,13 @@ _qualified_backend_adapter = _backend._qualified_backend_adapter
 _runtime_backend_tuple = _backend._runtime_backend_tuple
 
 LatentCPTransport = _transport.LatentCPTransport
-P2PRingTransport = _transport.P2PRingTransport
+AllGatherTransport = _transport.AllGatherTransport
 PayloadLease = _transport.PayloadLease
-_LatentRingExchange = _transport._LatentRingExchange
+_LatentAllGatherExchange = _transport._LatentAllGatherExchange
 
 __all__ = [
     "AlreadyZigZagTHDAdapter",
+    "AllGatherTransport",
     "BackendNotQualifiedError",
     "BackendPlanNotSupportedError",
     "CUDNN_FRONTEND_SOURCE_REV",
@@ -81,7 +82,6 @@ __all__ = [
     "LatentCPLayoutAdapter",
     "LatentCPTransport",
     "MLAWithLatentCP",
-    "P2PRingTransport",
     "PayloadLease",
     "PhaseSpec",
     "QUALIFIED_BACKEND_CONFIGS",
