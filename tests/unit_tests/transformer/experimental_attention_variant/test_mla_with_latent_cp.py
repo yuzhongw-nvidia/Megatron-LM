@@ -1094,6 +1094,176 @@ def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
     torch.testing.assert_close(payload.grad, torch.ones_like(payload), rtol=0, atol=0)
 
 
+def test_ring_completion_event_is_recorded_after_both_work_dependencies(
+    monkeypatch,
+):
+    """The communication stream must finish wiring P2P readiness before handoff."""
+
+    order = []
+    active_stream = [None]
+
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_stream(self, producer):
+            order.append(("producer_wait", self.name, producer.name))
+
+        def wait_event(self, event):
+            order.append(("consumer_wait", self.name, event.name))
+
+    producer_stream = FakeStream("producer")
+    communication_stream = FakeStream("communication")
+    consumer_stream = FakeStream("consumer")
+    active_stream[0] = producer_stream
+
+    @contextmanager
+    def use_stream(stream):
+        previous = active_stream[0]
+        active_stream[0] = stream
+        try:
+            yield
+        finally:
+            active_stream[0] = previous
+
+    class FakeTensor:
+        device = torch.device("cuda", 0)
+
+        def __init__(self, name):
+            self.name = name
+
+        def record_stream(self, stream):
+            order.append(("record_tensor", self.name, stream.name))
+
+    class FakeWork:
+        def __init__(self, name):
+            self.name = name
+            self.waited = False
+
+        def wait(self):
+            assert not self.waited
+            self.waited = True
+            order.append(("work_wait", self.name, active_stream[0].name))
+
+    class FakeEvent:
+        name = "ready"
+
+        def record(self, stream):
+            order.append(("event_record", self.name, stream.name))
+
+    payload = FakeTensor("send")
+    receive = FakeTensor("receive")
+    batch_work = FakeWork("batch")
+    batch_result = [(batch_work,)]
+
+    def batch(_operations):
+        order.append(("p2p_launch", active_stream[0].name))
+        return batch_result[0]
+
+    monkeypatch.setattr(latent_cp._transport.torch, "empty_like", lambda _x: receive)
+    monkeypatch.setattr(
+        latent_cp._transport.torch.cuda,
+        "current_stream",
+        lambda _device=None: active_stream[0],
+    )
+    monkeypatch.setattr(latent_cp._transport.torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(latent_cp._transport.torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(
+        latent_cp._transport.dist,
+        "P2POp",
+        lambda op, tensor, peer, group=None: (op, tensor, peer, group),
+    )
+    monkeypatch.setattr(latent_cp._transport.dist, "batch_isend_irecv", batch)
+
+    pending = latent_cp._transport._PendingExchange()
+    actual = latent_cp._transport._launch_ring_exchange(
+        payload,
+        object(),
+        1,
+        2,
+        communication_stream,
+        pending,
+        True,
+    )
+    assert actual is receive
+    assert order[:4] == [
+        ("producer_wait", "communication", "producer"),
+        ("p2p_launch", "communication"),
+        ("work_wait", "batch", "communication"),
+        ("event_record", "ready", "communication"),
+    ]
+    assert batch_work.waited
+    assert not any(entry[0] == "consumer_wait" for entry in order)
+
+    pending.wait_on_consumer_stream(consumer_stream)
+    assert order[-1] == ("consumer_wait", "consumer", "ready")
+    assert sum(entry[0] == "consumer_wait" for entry in order) == 1
+    with pytest.raises(ValueError, match="consumed twice"):
+        pending.wait_on_consumer_stream(consumer_stream)
+    assert sum(entry[0] == "consumer_wait" for entry in order) == 1
+    same_stream_pending = latent_cp._transport._PendingExchange(
+        ready_event=FakeEvent(), ready_stream=communication_stream
+    )
+    same_stream_pending.wait_on_consumer_stream(communication_stream)
+    assert sum(entry[0] == "consumer_wait" for entry in order) == 1
+
+    order.clear()
+    batch_result[0] = ()
+    with pytest.raises(ValueError, match="returned no work handles"):
+        latent_cp._transport._launch_ring_exchange(
+            payload,
+            object(),
+            1,
+            2,
+            communication_stream,
+            latent_cp._transport._PendingExchange(),
+            True,
+        )
+    assert order == [
+        ("producer_wait", "communication", "producer"),
+        ("p2p_launch", "communication"),
+    ]
+
+    order.clear()
+    split_works = (FakeWork("send"), FakeWork("receive"))
+    batch_result[0] = split_works
+    latent_cp._transport._launch_ring_exchange(
+        payload,
+        object(),
+        1,
+        2,
+        communication_stream,
+        latent_cp._transport._PendingExchange(),
+        True,
+    )
+    assert order[:5] == [
+        ("producer_wait", "communication", "producer"),
+        ("p2p_launch", "communication"),
+        ("work_wait", "send", "communication"),
+        ("work_wait", "receive", "communication"),
+        ("event_record", "ready", "communication"),
+    ]
+    assert all(work.waited for work in split_works)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ring_completion_handoff_has_no_same_stream_self_dependency():
+    """A ready event recorded on its producer stream must be consumable there."""
+
+    communication_stream = torch.cuda.Stream()
+    ready_event = torch.cuda.Event()
+    with torch.cuda.stream(communication_stream):
+        ready_event.record(communication_stream)
+    pending = latent_cp._transport._PendingExchange(
+        ready_event=ready_event, ready_stream=communication_stream
+    )
+    pending.wait_on_consumer_stream(communication_stream)
+    communication_stream.synchronize()
+    assert pending.waited
+    assert pending.ready_event is None
+    assert pending.ready_stream is None
+
+
 @pytest.mark.parametrize("rope_type", ["rope", "yarn"])
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_independent_packed_zigzag_global_positions(rope_type: str, cp_size: int):
@@ -2824,13 +2994,11 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         first_lease = next(lease_iterator)
         assert len(batch_calls) == 1
         assert batch_streams[0] != consumer_stream
-        assert returned_proxies and not any(proxy.waited for proxy in returned_proxies)
+        assert returned_proxies and all(proxy.waited for proxy in returned_proxies)
         leases = [first_lease, *lease_iterator]
         forward_proxy_count = len(returned_proxies)
         assert forward_proxy_count
-        assert (
-            work_wait_streams == [projection_stream.cuda_stream] * forward_proxy_count
-        )
+        assert work_wait_streams == [batch_streams[0]] * forward_proxy_count
         torch.cuda.current_stream().wait_stream(projection_stream)
         assert [lease.owner for lease in leases] == [
             (cp_rank - phase) % cp_size for phase in range(cp_size)
@@ -2866,9 +3034,7 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
         assert len(p2p_records) == 2 * len(batch_calls)
         assert returned_proxies and all(proxy.waited for proxy in returned_proxies)
         assert wait_count == len(returned_proxies)
-        assert work_wait_streams[forward_proxy_count:] == [consumer_stream] * (
-            len(returned_proxies) - forward_proxy_count
-        )
+        assert work_wait_streams == [batch_streams[0]] * len(returned_proxies)
         assert wait_for_compute_stream[: cp_size - 1] == [True] + [False] * (
             cp_size - 2
         )

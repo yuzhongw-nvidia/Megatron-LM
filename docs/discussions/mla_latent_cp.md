@@ -562,11 +562,17 @@ Before yielding phase `i`, every rank submits the exchange for phase `i+1` on on
 communication stream. The public `torch.distributed.batch_isend_irecv` batch contains `P2POp`
 objects ordered as `[isend(next), irecv(previous)]`, and every operation sets
 `group=effective_cp_group`. For a compute-produced payload, the communication stream waits for its
-producer. The returned work handles remain pending while the current phase computes; when the
-consumer next requests the prefetched receive, every handle is waited exactly once on that explicit
-consumer stream. The ordinary backend path uses the attention stream; cuDNN projection pipelining
-uses the adapter-shared projection stream, so receive completion can feed K/V expansion without
-stalling current-phase attention. Ring autograd nodes themselves remain on the ordinary stream.
+producer. Immediately after the P2P batch launch, every returned work handle installs its CUDA
+readiness dependency while the communication stream is current. NCCL coalescing returns one Work for
+the complete send/receive batch, while a non-coalescing backend may return one Work per operation; an
+empty result is invalid. A single event is recorded on the communication stream only after all actual
+returned handles have been waited. When the consumer next requests the prefetched receive, it waits
+exactly once on this
+event instead of invoking `Work.wait` from the projection or ordinary stream. A consumer that is
+already the communication stream relies on stream order and does not enqueue a self-dependency. The
+ordinary backend path uses the attention stream; cuDNN projection pipelining uses the adapter-shared
+projection stream, so receive completion can feed K/V expansion without stalling current-phase
+attention. Ring autograd nodes themselves remain on the ordinary stream.
 The producer stream is captured before entering the communication-stream context; querying
 the current stream after that switch would return the communication stream itself and silently remove
 the dependency.
@@ -574,15 +580,16 @@ the dependency.
 Only the first hop waits for the ordinary compute stream. A later hop relays the received tensor
 directly: NCCL send and phase attention are both read-only consumers of the same immutable payload,
 so no D2D staging copy or false dependency on the preceding phase's attention is needed. The pending
-lease retains send storage until its work handles complete. Every backward hop still waits for its
-compute-produced gradient. The generator yields phase `i` on the ordinary attention stream while the
-one-hop receive remains in flight, then waits only when phase `i+1` requests that receive.
+lease retains send storage until the consumer event dependency is installed. Every backward hop still
+waits for its compute-produced gradient. The generator yields phase `i` on the ordinary attention
+stream while the one-hop receive remains in flight, then installs the event dependency only when
+phase `i+1` requests that receive.
 
 Backward submits `[isend(previous), irecv(next)]` on the same communication stream and waits for the
 reverse receive before returning `dX_r`. Send and receive tensors are recorded on the communication
-stream, and the pending lease retains send storage until every work handle completes. CP=1 creates no
-stream and submits no P2P. Fixed payload shapes, peer order, operation lists, and phase counts remain
-identical across ranks, preventing mismatched-message and parity-order deadlocks.
+stream, and the pending lease retains send storage until its single completion handoff is wired. CP=1
+creates no stream and submits no P2P. Fixed payload shapes, peer order, operation lists, and phase
+counts remain identical across ranks, preventing mismatched-message and parity-order deadlocks.
 
 Feature-static config, package, runtime, and capability checks run in the layer constructor, using
 the configured maximum CP/TP groups where group properties are needed. Cheap activation checks run
