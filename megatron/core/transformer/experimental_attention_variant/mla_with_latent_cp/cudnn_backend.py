@@ -352,6 +352,7 @@ class CudnnFusedAttentionAdapter:
         with torch.cuda.device(self.device_index):
             capability = torch.cuda.get_device_capability(self.device_index)
             self._handle = self.cudnn.create_handle()
+            self._projection_stream = torch.cuda.Stream(device=self.device_index)
             self._attention_stream = torch.cuda.Stream(device=self.device_index)
         self.identity: QualifiedBackendTuple = (
             AttnBackend.fused,
@@ -1005,6 +1006,15 @@ class CudnnFusedAttentionAdapter:
             expand_phase_kv,
             *projection_parameters,
         )
+
+    def projection_stream(self) -> torch.cuda.Stream:
+        """Return the adapter-shared stream used to prepare the next phase's K/V."""
+
+        _require(
+            torch.cuda.current_device() == self.device_index,
+            "projection stream belongs to a different CUDA device",
+        )
+        return self._projection_stream
 
     def attention_stream(self) -> torch.cuda.Stream:
         """Return the second stream used by alternating forward attention phases."""
