@@ -1094,114 +1094,6 @@ def test_cp1_planner_and_transport_are_exact_no_ring_degenerations():
     torch.testing.assert_close(payload.grad, torch.ones_like(payload), rtol=0, atol=0)
 
 
-def test_ring_prefetch_enqueues_complete_relay_chain_before_first_remote_consumer(
-    monkeypatch,
-):
-    """The host must enqueue every forward relay before consuming a remote lease."""
-
-    cp_size = 4
-    cp_group = object()
-    communication_stream = object()
-    consumer_stream = object()
-    local_payload = SimpleNamespace(name="local", storage=object())
-    phases = tuple(
-        SimpleNamespace(phase=phase, owner=(-phase) % cp_size)
-        for phase in range(cp_size)
-    )
-    launches = []
-    waits = []
-
-    class FakeWork:
-        def __init__(self, relay):
-            self.relay = relay
-            self.waited = False
-
-        def wait(self):
-            assert not self.waited
-            self.waited = True
-            waits.append((self.relay, consumer_stream))
-
-    @contextmanager
-    def use_stream(stream):
-        assert stream is consumer_stream
-        yield
-
-    def apply(
-        send,
-        group,
-        previous_peer,
-        next_peer,
-        stream,
-        pending,
-        wait_for_compute_stream,
-    ):
-        relay = len(launches)
-        receive = SimpleNamespace(
-            name=f"receive{relay}", storage=object(), source_send=send
-        )
-        work = FakeWork(relay)
-        pending.works = (work,)
-        pending.send_tensor = send
-        launches.append(
-            {
-                "send": send,
-                "receive": receive,
-                "group": group,
-                "previous_peer": previous_peer,
-                "next_peer": next_peer,
-                "stream": stream,
-                "wait_for_compute_stream": wait_for_compute_stream,
-                "work": work,
-            }
-        )
-        return receive
-
-    monkeypatch.setattr(
-        latent_cp.dist, "get_process_group_ranks", lambda _group: list(range(cp_size))
-    )
-    monkeypatch.setattr(latent_cp.dist, "get_rank", lambda _group: 0)
-    monkeypatch.setattr(latent_cp.dist, "get_world_size", lambda _group: cp_size)
-    monkeypatch.setattr(
-        latent_cp._transport,
-        "_communication_stream",
-        lambda _payload: communication_stream,
-    )
-    monkeypatch.setattr(latent_cp._LatentRingExchange, "apply", apply)
-    monkeypatch.setattr(latent_cp._transport.torch.cuda, "stream", use_stream)
-
-    leases = latent_cp.P2PRingTransport(cp_group).iter_payloads(
-        local_payload, phases, consumer_stream=consumer_stream
-    )
-    local_lease = next(leases)
-
-    assert local_lease.tensor is local_payload
-    assert len(launches) == cp_size - 1
-    assert not waits
-    assert launches[0]["send"] is local_payload
-    assert all(
-        launches[relay]["send"] is launches[relay - 1]["receive"]
-        for relay in range(1, cp_size - 1)
-    )
-    assert len({id(launch["receive"].storage) for launch in launches}) == cp_size - 1
-    assert all(
-        launch["send"].storage is not launch["receive"].storage for launch in launches
-    )
-    assert all(launch["group"] is cp_group for launch in launches)
-    assert all(launch["stream"] is communication_stream for launch in launches)
-    assert [launch["wait_for_compute_stream"] for launch in launches] == [
-        True,
-        False,
-        False,
-    ]
-
-    remote_leases = list(leases)
-    assert [lease.tensor for lease in remote_leases] == [
-        launch["receive"] for launch in launches
-    ]
-    assert waits == [(relay, consumer_stream) for relay in range(cp_size - 1)]
-    assert all(launch["work"].waited for launch in launches)
-
-
 @pytest.mark.parametrize("rope_type", ["rope", "yarn"])
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_independent_packed_zigzag_global_positions(rope_type: str, cp_size: int):
@@ -2910,10 +2802,7 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
                 return self.work.wait()
 
         def batch(operations):
-            if len(batch_calls) < cp_size - 1:
-                assert not any(proxy.waited for proxy in returned_proxies)
-            else:
-                assert all(proxy.waited for proxy in returned_proxies)
+            assert all(proxy.waited for proxy in returned_proxies)
             batch_calls.append(tuple(operations))
             batch_streams.append(torch.cuda.current_stream().cuda_stream)
             proxies = [WorkProxy(work) for work in real_batch(operations)]
@@ -2933,7 +2822,7 @@ def test_ring_forward_reverse_backward_payload_bytes_and_explicit_group(
             payload, layout.phases, consumer_stream=projection_stream
         )
         first_lease = next(lease_iterator)
-        assert len(batch_calls) == cp_size - 1
+        assert len(batch_calls) == 1
         assert batch_streams[0] != consumer_stream
         assert returned_proxies and not any(proxy.waited for proxy in returned_proxies)
         leases = [first_lease, *lease_iterator]

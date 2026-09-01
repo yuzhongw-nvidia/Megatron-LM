@@ -558,18 +558,15 @@ any of them later requires explicit nested-checkpoint and saved-tensor/offload t
 
 ### Pipelined transport, lifetimes, and deadlock ordering
 
-Before yielding the local phase, every rank submits all `P-1` forward relays in FIFO order on one
-process/device communication stream. The public `torch.distributed.batch_isend_irecv` batch for
-each relay contains `P2POp` objects ordered as `[isend(next), irecv(previous)]`, and every operation
-sets `group=effective_cp_group`. Relay zero sends the immutable local payload. Each later relay sends
-only the distinct receive tensor allocated by its predecessor; same-stream FIFO order makes that
-receive ready before it is relayed without a host-side inter-phase launch gap. For a compute-produced
-local payload, the communication stream first waits for its producer. Returned work handles remain
-pending until the consumer requests the corresponding remote lease, when every handle is waited
-exactly once on that explicit consumer stream. The ordinary backend uses the attention stream;
-cuDNN projection pipelining uses the adapter-shared projection stream, so receive completion feeds
-K/V expansion without stalling current-phase attention. Ring autograd nodes remain on the ordinary
-stream.
+Before yielding phase `i`, every rank submits the exchange for phase `i+1` on one process/device
+communication stream. The public `torch.distributed.batch_isend_irecv` batch contains `P2POp`
+objects ordered as `[isend(next), irecv(previous)]`, and every operation sets
+`group=effective_cp_group`. For a compute-produced payload, the communication stream waits for its
+producer. The returned work handles remain pending while the current phase computes; when the
+consumer next requests the prefetched receive, every handle is waited exactly once on that explicit
+consumer stream. The ordinary backend path uses the attention stream; cuDNN projection pipelining
+uses the adapter-shared projection stream, so receive completion can feed K/V expansion without
+stalling current-phase attention. Ring autograd nodes themselves remain on the ordinary stream.
 The producer stream is captured before entering the communication-stream context; querying
 the current stream after that switch would return the communication stream itself and silently remove
 the dependency.
@@ -577,12 +574,9 @@ the dependency.
 Only the first hop waits for the ordinary compute stream. A later hop relays the received tensor
 directly: NCCL send and phase attention are both read-only consumers of the same immutable payload,
 so no D2D staging copy or false dependency on the preceding phase's attention is needed. The pending
-lease retains send storage until its work handles complete. Eager forward staging holds `P` latent
-payload references plus `P-1` lightweight pending states, bounded by
-`O(P*T_r*(C+D_r))` tensor elements and `O(P)` host objects; it creates no full K/V or additional
-CUDA event/wait/synchronize. Every backward hop still waits for its compute-produced gradient. The
-generator yields phases in the unchanged owner/consumer order and waits only when a remote lease is
-requested; projection and attention enqueue order is unchanged.
+lease retains send storage until its work handles complete. Every backward hop still waits for its
+compute-produced gradient. The generator yields phase `i` on the ordinary attention stream while the
+one-hop receive remains in flight, then waits only when phase `i+1` requests that receive.
 
 Backward submits `[isend(previous), irecv(next)]` on the same communication stream and waits for the
 reverse receive before returning `dX_r`. Send and receive tensors are recorded on the communication
@@ -935,9 +929,8 @@ output restoration. V1's `AlreadyZigZagTHDAdapter` validates and returns views. 
 `ContiguousToZigZagAdapter` can use public `CpPartitionModeConverter`, but remains separate rather
 than hiding an eager conversion in the attention module.
 
-`P2PRingTransport` pre-enqueues the bounded forward relay chain, then yields each owner plus a
-consumer-stream-ordered payload. A future `HierarchicalA2AP2PTransport` can consume a layout plan
-and combine
+`P2PRingTransport` yields an owner plus a consumer-stream-ordered payload while prefetching the next
+hop. A future `HierarchicalA2AP2PTransport` can consume a layout plan and combine
 contiguous-to-zigzag permutation with low-level A2A, then expose the same owner order and readiness
 contract. Its process groups must be injected, for
 example through `pg_collection.hcp`; no global `parallel_state` read is introduced.
@@ -1050,15 +1043,13 @@ All tests live in the new experimental test file; existing MLA tests remain unto
    gradient, gate gradient, and every base parameter gradient for elementwise and headwise modes.
 4. **Payload and ring tests.** Assert each forward P2P tensor has `T_r*(C+D_r)` elements, never the
    full-K/V size. For CP=2/4, prove forward owner routing, reverse gradient routing, fixed peer order,
-   and that every recorded `P2POp` constructor receives the effective CP group. Before the local
-   lease is yielded, all `P-1` forward batches must be submitted FIFO on one dedicated stream: the
-   first send aliases the immutable local payload, each later send aliases the preceding distinct
-   receive, and no work is consumed early. Every returned work must be waited exactly once: forward
-   waits run on an explicitly supplied projection stream, while reverse-autograd waits remain on the
-   ordinary consumer stream. No extra event/wait/synchronize may be introduced. Alternating cuDNN
-   forward phases and their custom backwards must execute on the same ordinary/secondary canonical
-   streams, while projection-gradient side effects remain explicitly event-serialized. After
-   construction, patch
+   that every recorded `P2POp` constructor receives the effective CP group, and that the next
+   exchange is submitted on the dedicated stream before the current lease is yielded. Every returned
+   work must be waited exactly once: forward waits run on an explicitly supplied projection stream,
+   while reverse-autograd waits remain on the ordinary consumer stream. Alternating cuDNN forward
+   phases and their custom backwards must execute on the same ordinary/secondary canonical streams,
+   while projection-gradient side effects remain explicitly event-serialized. Relay sends must alias the
+   corresponding immutable lease rather than stage a D2D copy. After construction, patch
    `parallel_state.get_tensor_model_parallel_group`,
    `get_context_parallel_group`, and `get_tensor_and_context_parallel_group` to raise throughout
    the complete TP=2 x CP=2 production forward/backward; test-harness collectives remain explicitly
