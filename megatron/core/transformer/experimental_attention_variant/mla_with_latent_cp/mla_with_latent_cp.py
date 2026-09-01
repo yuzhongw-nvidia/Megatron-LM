@@ -719,10 +719,39 @@ class MLAWithLatentCP(MLASelfAttention):
             callable(stream_factory), "recomputed backend has no projection stream"
         )
         projection_stream = stream_factory()
+        staged_received: (
+            tuple[
+                latent_cp_layout.PhaseSpec,
+                PayloadLease,
+                Tensor,
+                Tensor,
+                torch.cuda.Event,
+            ]
+            | None
+        ) = None
+
+        def stage_received_phase(
+            phase: latent_cp_layout.PhaseSpec, lease: PayloadLease
+        ) -> None:
+            """Submit projection before transport relays the received payload."""
+
+            nonlocal staged_received
+            _require(staged_received is None, "received phase was staged twice")
+            with torch.cuda.stream(projection_stream):
+                lease.tensor.record_stream(projection_stream)
+                with torch.no_grad():
+                    key, value = self._expand_phase_kv(lease.tensor, phase)
+                ready = torch.cuda.Event()
+                ready.record(projection_stream)
+            staged_received = (phase, lease, key, value, ready)
+
         _require(phases, "phase plan must not be empty")
         leases = iter(
             transport.iter_payloads(
-                local_payload, phases, consumer_stream=projection_stream
+                local_payload,
+                phases,
+                consumer_stream=projection_stream,
+                on_receive_ready=stage_received_phase,
             )
         )
 
@@ -735,16 +764,8 @@ class MLAWithLatentCP(MLASelfAttention):
         current_ready: torch.cuda.Event | None = None
 
         for phase_index in range(len(phases)):
-            # Keep the ring one lease ahead, but suspend before expanding that lease.
-            # The caller first enqueues the current attention, then resumes this
-            # generator so the next projection can overlap work that is already
-            # resident on an attention stream.
-            next_phase: latent_cp_layout.PhaseSpec | None = None
-            next_lease: PayloadLease | None = None
-            if phase_index + 1 < len(phases):
-                next_phase = phases[phase_index + 1]
-                next_lease = next(leases)
-
+            # Resume only after current attention is enqueued; the transport then
+            # projects the prefetched receive before relaying it to the next rank.
             yield (
                 current_phase,
                 current_lease,
@@ -753,23 +774,28 @@ class MLAWithLatentCP(MLASelfAttention):
                 current_ready,
             )
 
-            if next_phase is None or next_lease is None:
+            if phase_index + 1 >= len(phases):
                 continue
-            current_phase = next_phase
-            current_lease = next_lease
-            current_payload = current_lease.tensor
-            with torch.cuda.stream(projection_stream):
-                current_payload.record_stream(projection_stream)
-                with torch.no_grad():
-                    current_key, current_value = self._expand_phase_kv(
-                        current_payload, current_phase
-                    )
-                current_ready = torch.cuda.Event()
-                current_ready.record(projection_stream)
+            current_phase = phases[phase_index + 1]
+            current_lease = next(leases)
+            _require(
+                staged_received is not None,
+                "transport did not stage its received phase",
+            )
+            staged_phase, staged_lease, current_key, current_value, current_ready = (
+                staged_received
+            )
+            _require(staged_phase == current_phase, "transport staged the wrong phase")
+            _require(
+                staged_lease is current_lease,
+                "transport yielded a different lease than its ready callback",
+            )
+            staged_received = None
 
         _require(
             next(leases, None) is None, "transport yielded too many payload leases"
         )
+        _require(staged_received is None, "transport left a staged phase unconsumed")
 
     def _phase_attention(
         self,

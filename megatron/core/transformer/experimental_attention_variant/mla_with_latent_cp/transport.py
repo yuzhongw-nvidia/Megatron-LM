@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
-from typing import Any, Iterator, Protocol
+from typing import Any, Callable, Iterator, Protocol
 
 import torch
 import torch.distributed as dist
@@ -33,8 +33,13 @@ class LatentCPTransport(Protocol):
         local_payload: Tensor,
         phase_plan: tuple[PhaseSpec, ...],
         consumer_stream: torch.cuda.Stream | None = None,
+        on_receive_ready: Callable[[PhaseSpec, PayloadLease], None] | None = None,
     ) -> Iterator[PayloadLease]:
-        """Yield one payload lease per phase, ordered on the requested consumer stream."""
+        """Yield one consumer-ordered lease per phase.
+
+        ``on_receive_ready`` runs for each non-local phase after its receive is
+        ordered on ``consumer_stream`` and before that payload is relayed.
+        """
         ...
 
 
@@ -187,8 +192,14 @@ class P2PRingTransport:
         local_payload: Tensor,
         phase_plan: tuple[PhaseSpec, ...],
         consumer_stream: torch.cuda.Stream | None = None,
+        on_receive_ready: Callable[[PhaseSpec, PayloadLease], None] | None = None,
     ) -> Iterator[PayloadLease]:
-        """Yield each payload after ordering the selected consumer behind its receive."""
+        """Yield each payload after ordering the selected consumer behind its receive.
+
+        A received-payload callback is invoked before the same immutable payload
+        is relayed, allowing its consumer work to be enqueued without waiting for
+        the next P2P launch on the host.
+        """
         _require(len(phase_plan) == self.size, "phase-plan length must equal CP size")
         for phase_index, phase in enumerate(phase_plan):
             expected_owner = (self.rank - phase_index) % self.size
@@ -208,6 +219,9 @@ class P2PRingTransport:
         for phase_index, phase in enumerate(phase_plan):
             if pending is not None:
                 pending.wait_on_consumer_stream(consumer_stream)
+            lease = PayloadLease(owner=phase.owner, tensor=payload)
+            if phase_index > 0 and on_receive_ready is not None:
+                on_receive_ready(phase, lease)
 
             next_payload: Tensor | None = None
             next_pending: _PendingExchange | None = None
@@ -223,7 +237,7 @@ class P2PRingTransport:
                     phase_index == 0,
                 )
 
-            yield PayloadLease(owner=phase.owner, tensor=payload)
+            yield lease
             if next_payload is not None and next_pending is not None:
                 payload = next_payload
                 pending = next_pending
