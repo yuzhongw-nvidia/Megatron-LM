@@ -201,29 +201,26 @@ class P2PRingTransport:
             )
 
         payload = local_payload
-        pending: _PendingExchange | None = None
         communication_stream = (
             _communication_stream(local_payload) if self.size > 1 else None
         )
+        payloads = [payload]
+        pendings: list[_PendingExchange] = []
+        for relay_index in range(self.size - 1):
+            pending = _PendingExchange()
+            payload = _LatentRingExchange.apply(
+                payload,
+                self.cp_group,
+                self.previous_peer,
+                self.next_peer,
+                communication_stream,
+                pending,
+                relay_index == 0,
+            )
+            payloads.append(payload)
+            pendings.append(pending)
+
         for phase_index, phase in enumerate(phase_plan):
-            if pending is not None:
-                pending.wait_on_consumer_stream(consumer_stream)
-
-            next_payload: Tensor | None = None
-            next_pending: _PendingExchange | None = None
-            if phase_index + 1 < self.size:
-                next_pending = _PendingExchange()
-                next_payload = _LatentRingExchange.apply(
-                    payload,
-                    self.cp_group,
-                    self.previous_peer,
-                    self.next_peer,
-                    communication_stream,
-                    next_pending,
-                    phase_index == 0,
-                )
-
-            yield PayloadLease(owner=phase.owner, tensor=payload)
-            if next_payload is not None and next_pending is not None:
-                payload = next_payload
-                pending = next_pending
+            if phase_index > 0:
+                pendings[phase_index - 1].wait_on_consumer_stream(consumer_stream)
+            yield PayloadLease(owner=phase.owner, tensor=payloads[phase_index])
