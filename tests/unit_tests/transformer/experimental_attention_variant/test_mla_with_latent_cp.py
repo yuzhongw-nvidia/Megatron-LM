@@ -1333,10 +1333,10 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
     assert adapter.backward_calls == 1
 
 
-def test_recomputed_phase_generator_prefetches_lease_but_defers_projection(
+def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
     monkeypatch,
 ):
-    """Keep communication ahead while staging projection after current attention."""
+    """The next projection must be staged only after current attention is enqueued."""
 
     order = []
     projection_stream = object()
@@ -1355,7 +1355,6 @@ def test_recomputed_phase_generator_prefetches_lease_but_defers_projection(
             assert phase_plan is phases
             assert consumer_stream is projection_stream
             for phase in phase_plan:
-                order.append(("lease", phase.phase))
                 yield SimpleNamespace(
                     owner=phase.owner, tensor=FakePayload(phase.phase)
                 )
@@ -1393,15 +1392,11 @@ def test_recomputed_phase_generator_prefetches_lease_but_defers_projection(
         ready.append(phase_ready)
 
     assert order == [
-        ("lease", 0),
         ("projection", 0),
-        ("lease", 1),
         ("attention", 0),
         ("projection", 1),
-        ("lease", 2),
         ("attention", 1),
         ("projection", 2),
-        ("lease", 3),
         ("attention", 2),
         ("projection", 3),
         ("attention", 3),
