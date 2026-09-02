@@ -13,6 +13,7 @@ It does not import MCore projection, RoPE, attention, CP, FA4, cuDNN, or TE code
 from __future__ import annotations
 
 import gc
+import inspect
 import json
 import math
 import os
@@ -1456,21 +1457,35 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
     assert adapter.backward_calls == 1
 
 
-def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
+def test_recomputed_phase_scheduler_enqueues_in_one_frame_without_generator(
     monkeypatch,
 ):
-    """The next projection must be staged only after current attention is enqueued."""
+    """Projection, attention, and deferred merge keep one exact enqueue schedule."""
 
     order = []
-    projection_stream = object()
     phases = tuple(SimpleNamespace(phase=index, owner=index) for index in range(4))
 
-    class FakePayload:
-        def __init__(self, phase_index):
+    class FakeStream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            order.append(("wait_event", self.name, event.kind, event.phase))
+
+    consumer_stream = FakeStream("consumer")
+    projection_stream = FakeStream("projection")
+    attention_stream = FakeStream("attention")
+    active_stream = consumer_stream
+    active_projection = None
+    active_apply = None
+
+    class FakeTensor:
+        def __init__(self, kind, phase_index):
+            self.kind = kind
             self.phase_index = phase_index
 
         def record_stream(self, stream):
-            assert stream is projection_stream
+            order.append(("record_stream", self.kind, self.phase_index, stream.name))
 
     class FakeTransport:
         @staticmethod
@@ -1478,9 +1493,12 @@ def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
             assert phase_plan is phases
             assert consumer_stream is projection_stream
             for phase in phase_plan:
+                order.append(("lease", phase.phase))
                 yield SimpleNamespace(
-                    owner=phase.owner, tensor=FakePayload(phase.phase)
+                    owner=phase.owner,
+                    tensor=FakeTensor("payload", phase.phase),
                 )
+            order.append(("leases_exhausted",))
 
     class FakeBackend:
         @staticmethod
@@ -1488,44 +1506,139 @@ def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
             return projection_stream
 
     class FakeEvent:
+        kind = None
+        phase = None
+
         def record(self, stream):
-            assert stream is projection_stream
+            nonlocal active_apply, active_projection
+            if stream is projection_stream:
+                self.kind = "ready"
+                self.phase = active_projection
+            else:
+                assert stream is attention_stream
+                self.kind = "complete"
+                self.phase = active_apply
+            order.append(("record_event", self.kind, self.phase, stream.name))
 
     class Harness:
+        softmax_scale = 0.25
+
         @staticmethod
         def _expand_phase_kv(payload, phase):
+            nonlocal active_projection
             assert payload.phase_index == phase.phase
-            order.append(("projection", phase.phase))
-            return object(), object()
+            active_projection = phase.phase
+            order.append(("projection", phase.phase, active_stream.name))
+            return (
+                FakeTensor("key", phase.phase),
+                FakeTensor("value", phase.phase),
+            )
 
     @contextmanager
     def use_stream(stream):
-        assert stream is projection_stream
-        yield
+        nonlocal active_stream
+        previous = active_stream
+        active_stream = stream
+        try:
+            yield
+        finally:
+            active_stream = previous
+
+    def recomputed_forward(
+        query,
+        payload,
+        key,
+        value,
+        phase,
+        softmax_scale,
+        expand_phase_kv,
+        *projection_parameters,
+    ):
+        nonlocal active_apply
+        assert query.phase_index == phase.phase
+        assert payload.phase_index == phase.phase
+        assert key.phase_index == phase.phase
+        assert value.phase_index == phase.phase
+        assert softmax_scale == 0.25
+        assert expand_phase_kv == Harness._expand_phase_kv
+        assert projection_parameters == ("projection-parameter",)
+        active_apply = phase.phase
+        order.append(("apply", phase.phase, active_stream.name))
+        return (
+            FakeTensor("output", phase.phase),
+            FakeTensor("lse", phase.phase),
+        )
+
+    def merge_phase(phase, _output, _lse):
+        order.append(("merge", phase.phase, active_stream.name))
 
     monkeypatch.setattr(latent_cp_module.torch.cuda, "stream", use_stream)
     monkeypatch.setattr(latent_cp_module.torch.cuda, "Event", FakeEvent)
-    phase_inputs = latent_cp_module.MLAWithLatentCP._iter_recomputed_phases(
-        Harness(), FakeBackend(), FakeTransport(), FakePayload(-1), phases
+    scheduler = latent_cp_module.MLAWithLatentCP._enqueue_recomputed_phases
+    assert not inspect.isgeneratorfunction(scheduler)
+    lease_count = scheduler(
+        Harness(),
+        FakeBackend(),
+        FakeTransport(),
+        FakeTensor("payload", -1),
+        phases,
+        tuple(FakeTensor("query", phase.phase) for phase in phases),
+        consumer_stream,
+        attention_stream,
+        recomputed_forward,
+        ("projection-parameter",),
+        merge_phase,
     )
-    ready = []
-    for phase, lease, _key, _value, phase_ready in phase_inputs:
-        assert lease.owner == phase.owner
-        order.append(("attention", phase.phase))
-        ready.append(phase_ready)
 
+    assert lease_count == len(phases)
     assert order == [
-        ("projection", 0),
-        ("attention", 0),
-        ("projection", 1),
-        ("attention", 1),
-        ("projection", 2),
-        ("attention", 2),
-        ("projection", 3),
-        ("attention", 3),
+        ("lease", 0),
+        ("projection", 0, "consumer"),
+        ("record_stream", "query", 0, "consumer"),
+        ("record_stream", "key", 0, "consumer"),
+        ("record_stream", "value", 0, "consumer"),
+        ("apply", 0, "consumer"),
+        ("lease", 1),
+        ("record_stream", "payload", 1, "projection"),
+        ("projection", 1, "projection"),
+        ("record_event", "ready", 1, "projection"),
+        ("wait_event", "attention", "ready", 1),
+        ("record_stream", "query", 1, "attention"),
+        ("record_stream", "key", 1, "attention"),
+        ("record_stream", "value", 1, "attention"),
+        ("apply", 1, "attention"),
+        ("record_event", "complete", 1, "attention"),
+        ("lease", 2),
+        ("record_stream", "payload", 2, "projection"),
+        ("projection", 2, "projection"),
+        ("record_event", "ready", 2, "projection"),
+        ("wait_event", "consumer", "ready", 2),
+        ("record_stream", "query", 2, "consumer"),
+        ("record_stream", "key", 2, "consumer"),
+        ("record_stream", "value", 2, "consumer"),
+        ("apply", 2, "consumer"),
+        ("lease", 3),
+        ("record_stream", "payload", 3, "projection"),
+        ("projection", 3, "projection"),
+        ("record_event", "ready", 3, "projection"),
+        ("wait_event", "attention", "ready", 3),
+        ("record_stream", "query", 3, "attention"),
+        ("record_stream", "key", 3, "attention"),
+        ("record_stream", "value", 3, "attention"),
+        ("apply", 3, "attention"),
+        ("record_event", "complete", 3, "attention"),
+        ("leases_exhausted",),
+        ("merge", 0, "consumer"),
+        ("wait_event", "consumer", "complete", 1),
+        ("record_stream", "output", 1, "consumer"),
+        ("record_stream", "lse", 1, "consumer"),
+        ("merge", 1, "consumer"),
+        ("merge", 2, "consumer"),
+        ("wait_event", "consumer", "complete", 3),
+        ("record_stream", "output", 3, "consumer"),
+        ("record_stream", "lse", 3, "consumer"),
+        ("merge", 3, "consumer"),
     ]
-    assert ready[0] is None
-    assert all(isinstance(event, FakeEvent) for event in ready[1:])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
