@@ -185,6 +185,29 @@ class _CudnnSDPAFunction(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, None, None, None
 
 
+def _record_recomputed_phase_input_storages(
+    query: Tensor,
+    payload: Tensor,
+    key: Tensor,
+    value: Tensor,
+    stream: torch.cuda.Stream,
+) -> None:
+    """Record only ephemeral K/V storages on their phase execution stream.
+
+    The selective-recompute autograd boundary saves ``query`` and ``payload``
+    until backward, so their allocations cannot be recycled after forward
+    enqueues their last use. Expanded K/V are deliberately not saved and still
+    need allocator stream records. Record aliased K/V storage only once.
+    """
+
+    del query, payload
+    key_storage_id = key.untyped_storage()._cdata
+    value_storage_id = value.untyped_storage()._cdata
+    key.record_stream(stream)
+    if value_storage_id != key_storage_id:
+        value.record_stream(stream)
+
+
 class _CudnnRecomputedPhaseFunction(torch.autograd.Function):
     """Run cuDNN SDPA while recomputing only latent-KV expansion in backward.
 
@@ -1006,6 +1029,18 @@ class CudnnFusedAttentionAdapter:
             expand_phase_kv,
             *projection_parameters,
         )
+
+    @staticmethod
+    def record_recomputed_phase_input_storages(
+        query: Tensor,
+        payload: Tensor,
+        key: Tensor,
+        value: Tensor,
+        stream: torch.cuda.Stream,
+    ) -> None:
+        """Apply the saved-input lifetime contract for one recomputed phase."""
+
+        _record_recomputed_phase_input_storages(query, payload, key, value, stream)
 
     def projection_stream(self) -> torch.cuda.Stream:
         """Return the adapter-shared stream used to prepare the next phase's K/V."""

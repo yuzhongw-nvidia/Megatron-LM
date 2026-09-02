@@ -771,7 +771,6 @@ class MLAWithLatentCP(MLASelfAttention):
             current_lease = next(leases)
             current_payload = current_lease.tensor
             with torch.cuda.stream(projection_stream):
-                current_payload.record_stream(projection_stream)
                 with torch.no_grad():
                     current_key, current_value = self._expand_phase_kv(
                         current_payload, current_phase
@@ -900,6 +899,9 @@ class MLAWithLatentCP(MLASelfAttention):
                 )
 
         recomputed_forward = getattr(backend, "forward_recomputed_phase", None)
+        record_recomputed_inputs = getattr(
+            backend, "record_recomputed_phase_input_storages", None
+        )
         projection_parameters: tuple[Tensor, ...] = ()
         consumer_stream = torch.cuda.current_stream(query.device)
         attention_stream: torch.cuda.Stream | None = None
@@ -913,6 +915,10 @@ class MLAWithLatentCP(MLASelfAttention):
             ]
         ] = []
         if recomputed_forward is not None:
+            _require(
+                callable(record_recomputed_inputs),
+                "recomputed backend has no saved-input storage recorder",
+            )
             projection_parameters = tuple(
                 parameter
                 for parameter in self.linear_kv_up_proj.parameters()
@@ -999,9 +1005,13 @@ class MLAWithLatentCP(MLASelfAttention):
                 _require(ready_stream is not None, "phase execution stream is missing")
                 if phase_ready is not None:
                     ready_stream.wait_event(phase_ready)
-                q_phase.record_stream(ready_stream)
-                phase_key.record_stream(ready_stream)
-                phase_value.record_stream(ready_stream)
+                _require(
+                    callable(record_recomputed_inputs),
+                    "recomputed backend lost its saved-input storage recorder",
+                )
+                record_recomputed_inputs(
+                    q_phase, payload_phase, phase_key, phase_value, ready_stream
+                )
 
                 def launch_recomputed_phase() -> tuple[Tensor, Tensor]:
                     return recomputed_forward(
