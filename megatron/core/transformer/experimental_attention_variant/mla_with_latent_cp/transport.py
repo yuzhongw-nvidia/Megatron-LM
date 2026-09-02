@@ -390,16 +390,6 @@ class AllGatherDirectP2PTransport:
         for phase, remote_payload in zip(remote_phases, remote_payloads, strict=True):
             yield PayloadLease(owner=phase.owner, tensor=remote_payload)
 
-    def materialize_payloads(
-        self,
-        local_payload: Tensor,
-        phase_plan: tuple[PhaseSpec, ...],
-        consumer_stream: torch.cuda.Stream | None = None,
-    ) -> tuple[PayloadLease, ...]:
-        """Resolve all raw gather leases before the first projection consumer."""
-
-        return tuple(self.iter_payloads(local_payload, phase_plan, consumer_stream))
-
 
 class _LatentRingExchange(torch.autograd.Function):
     """One explicit-group clockwise ring hop with the exact reverse backward hop."""

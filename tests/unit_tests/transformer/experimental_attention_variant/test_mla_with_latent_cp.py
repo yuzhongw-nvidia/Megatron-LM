@@ -1082,8 +1082,10 @@ def test_cp1_planner_and_transport_are_exact_no_collective_degenerations():
             side_effect=AssertionError("CP=1 must not create a communication stream"),
         ) as stream_factory,
     ):
-        leases = latent_cp.AllGatherDirectP2PTransport(cp_group).materialize_payloads(
-            payload, layout.phases
+        leases = list(
+            latent_cp.AllGatherDirectP2PTransport(cp_group).iter_payloads(
+                payload, layout.phases
+            )
         )
     assert len(leases) == 1
     assert leases[0].owner == 0
@@ -1155,9 +1157,11 @@ def test_all_gather_forward_and_fixed_order_direct_reverse_contract(monkeypatch)
     monkeypatch.setattr(latent_cp.dist, "P2POp", p2p_op)
     monkeypatch.setattr(latent_cp.dist, "batch_isend_irecv", batch)
 
-    leases = latent_cp.AllGatherDirectP2PTransport(
-        cp_group, reverse_group=reverse_group
-    ).materialize_payloads(payload, phases)
+    leases = list(
+        latent_cp.AllGatherDirectP2PTransport(
+            cp_group, reverse_group=reverse_group
+        ).iter_payloads(payload, phases)
+    )
     assert waits == ["all_gather"]
     assert leases[0].tensor is payload
     assert [lease.owner for lease in leases] == [2, 1, 0, 3]
@@ -1478,9 +1482,6 @@ def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
                     owner=phase.owner, tensor=FakePayload(phase.phase)
                 )
 
-        def materialize_payloads(self, *args, **kwargs):
-            return tuple(self.iter_payloads(*args, **kwargs))
-
     class FakeBackend:
         @staticmethod
         def projection_stream():
@@ -1514,111 +1515,6 @@ def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
         ready.append(phase_ready)
 
     assert order == [
-        ("projection", 0),
-        ("attention", 0),
-        ("projection", 1),
-        ("attention", 1),
-        ("projection", 2),
-        ("attention", 2),
-        ("projection", 3),
-        ("attention", 3),
-    ]
-    assert ready[0] is None
-    assert all(isinstance(event, FakeEvent) for event in ready[1:])
-
-
-def test_recomputed_phase_generator_materializes_remote_leases_before_local_attention(
-    monkeypatch,
-):
-    """Resolve every remote lease before local attention without expanding remote KV."""
-
-    order = []
-    projection_stream = object()
-    phases = tuple(SimpleNamespace(phase=index, owner=index) for index in range(4))
-    local_payload = torch.tensor(1.0, requires_grad=True)
-
-    class FakePayload:
-        def __init__(self, phase_index, value):
-            self.phase_index = phase_index
-            self.value = value
-
-        def record_stream(self, stream):
-            assert stream is projection_stream
-
-    class FakeTransport:
-        def __init__(self):
-            self.wait_count = 0
-            self.completed = False
-
-        def iter_payloads(self, payload, phase_plan, consumer_stream=None):
-            assert payload is local_payload
-            assert phase_plan is phases
-            assert consumer_stream is projection_stream
-            order.append(("transport_start", None))
-            for phase in phase_plan:
-                if phase.phase == 1:
-                    self.wait_count += 1
-                    order.append(("wait", phase.phase))
-                order.append(("lease", phase.phase))
-                yield SimpleNamespace(
-                    owner=phase.owner,
-                    tensor=FakePayload(phase.phase, payload * (phase.phase + 1)),
-                )
-            self.completed = True
-            order.append(("transport_complete", None))
-
-        def materialize_payloads(self, payload, phase_plan, consumer_stream=None):
-            return tuple(self.iter_payloads(payload, phase_plan, consumer_stream))
-
-    class FakeBackend:
-        @staticmethod
-        def projection_stream():
-            return projection_stream
-
-    class FakeEvent:
-        def record(self, stream):
-            assert stream is projection_stream
-
-    class Harness:
-        def __init__(self, transport):
-            self.transport = transport
-
-        def _expand_phase_kv(self, payload, phase):
-            assert self.transport.completed
-            assert payload.phase_index == phase.phase
-            order.append(("projection", phase.phase))
-            return payload.value, payload.value * 0
-
-    @contextmanager
-    def use_stream(stream):
-        assert stream is projection_stream
-        yield
-
-    transport = FakeTransport()
-    monkeypatch.setattr(latent_cp_module.torch.cuda, "stream", use_stream)
-    monkeypatch.setattr(latent_cp_module.torch.cuda, "Event", FakeEvent)
-    phase_inputs = latent_cp_module.MLAWithLatentCP._iter_recomputed_phases(
-        Harness(transport), FakeBackend(), transport, local_payload, phases
-    )
-    outputs = []
-    ready = []
-    for phase, lease, key, value, phase_ready in phase_inputs:
-        assert lease.owner == phase.owner
-        order.append(("attention", phase.phase))
-        outputs.append(key + value)
-        ready.append(phase_ready)
-
-    torch.stack(outputs).sum().backward()
-    assert local_payload.grad.item() == 10.0
-    assert transport.wait_count == 1
-    assert order == [
-        ("transport_start", None),
-        ("lease", 0),
-        ("wait", 1),
-        ("lease", 1),
-        ("lease", 2),
-        ("lease", 3),
-        ("transport_complete", None),
         ("projection", 0),
         ("attention", 0),
         ("projection", 1),
@@ -3189,13 +3085,14 @@ def test_all_gather_direct_reverse_payload_bytes_streams_and_explicit_group(
             ),
         )
 
-        leases = latent_cp.AllGatherDirectP2PTransport(
+        lease_iterator = latent_cp.AllGatherDirectP2PTransport(
             pg.cp, reverse_group=pg.tp_cp
-        ).materialize_payloads(
-            payload, layout.phases, consumer_stream=projection_stream
-        )
-        assert leases[0].tensor is payload
+        ).iter_payloads(payload, layout.phases, consumer_stream=projection_stream)
+        first_lease = next(lease_iterator)
+        assert first_lease.tensor is payload
         assert len(gather_records) == 1
+        assert not returned_proxies[0].waited
+        leases = [first_lease, *lease_iterator]
         assert wait_records == [("all_gather", projection_stream.cuda_stream)]
         assert [lease.owner for lease in leases] == [
             (cp_rank - phase) % cp_size for phase in range(cp_size)
