@@ -739,14 +739,21 @@ class MLAWithLatentCP(MLASelfAttention):
         )
         projection_stream = stream_factory()
         _require(phases, "phase plan must not be empty")
-        leases = iter(
-            transport.iter_payloads(
-                local_payload, phases, consumer_stream=projection_stream
-            )
+        materialize_payloads = getattr(transport, "materialize_payloads", None)
+        _require(
+            callable(materialize_payloads),
+            "recomputed phases require one-collective lease materialization",
+        )
+        leases = materialize_payloads(
+            local_payload, phases, consumer_stream=projection_stream
+        )
+        _require(
+            len(leases) == len(phases),
+            "transport lease count disagrees with the phase plan",
         )
 
         current_phase = phases[0]
-        current_lease = next(leases)
+        current_lease = leases[0]
         with torch.no_grad():
             current_key, current_value = self._expand_phase_kv(
                 current_lease.tensor, current_phase
@@ -768,7 +775,7 @@ class MLAWithLatentCP(MLASelfAttention):
             if phase_index + 1 >= len(phases):
                 continue
             current_phase = phases[phase_index + 1]
-            current_lease = next(leases)
+            current_lease = leases[phase_index + 1]
             current_payload = current_lease.tensor
             with torch.cuda.stream(projection_stream):
                 current_payload.record_stream(projection_stream)
@@ -778,10 +785,6 @@ class MLAWithLatentCP(MLASelfAttention):
                     )
                 current_ready = torch.cuda.Event()
                 current_ready.record(projection_stream)
-
-        _require(
-            next(leases, None) is None, "transport yielded too many payload leases"
-        )
 
     def _phase_attention(
         self,
