@@ -530,16 +530,6 @@ chains projection-gradient completion events across those streams because TE gra
 fusion updates one shared `main_grad`; only that side effect remains serialized. FA4 keeps its
 checkpoint path and does not use this stream pipeline.
 
-The same custom boundary owns the phase Q view and raw latent payload until backward. Their Python
-references remain live before the boundary is created, so the phase handoff does not add allocator
-`record_stream` entries for those saved tensors. Expanded K/V are intentionally absent from saved
-state and retain allocator protection on the attention stream. The recorder deduplicates only exact
-storage aliases and otherwise records K and V separately; the native/compiled pack contract is free
-to return distinct storage. Transport input/output records on the communication stream, Work waits,
-projection-ready events, attention-completion events, and phase enqueue order are unchanged. This
-ownership rule is specific to fused-cuDNN selective recomputation; FA4 and legacy full-KV execution
-retain their existing lifetime handling.
-
 Full K/V exist only during the initial phase forward, the one-phase-ahead projection window, and the
 short projection replay; they are never sent or stored in transport state.
 

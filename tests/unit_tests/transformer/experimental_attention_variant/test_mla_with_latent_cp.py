@@ -1456,99 +1456,6 @@ def test_cudnn_selective_recompute_matches_native_projection_gradients():
     assert adapter.backward_calls == 1
 
 
-def test_cudnn_recomputed_phase_ctx_owns_query_and_payload_only():
-    """The selective autograd boundary must retain raw inputs, not expanded K/V."""
-
-    class FakeAdapter:
-        @staticmethod
-        def _execute_forward(query, key, value, *_args):
-            return query + key + value, torch.zeros(query.shape[:2])
-
-    query = torch.randn(3, 1, 2, requires_grad=True)
-    payload = torch.randn(3, 2, requires_grad=True)
-    key = torch.randn(3, 1, 2)
-    value = torch.randn(3, 1, 2)
-    weight = torch.randn(1, requires_grad=True)
-    cu = torch.tensor([0, 3], dtype=torch.int32)
-    indices = torch.arange(3)
-    phase = latent_cp.PhaseSpec(
-        phase=0,
-        owner=0,
-        kind="diagonal",
-        q_indices=indices,
-        kv_indices=indices,
-        cu_seqlens_q=cu,
-        cu_seqlens_kv=cu,
-        max_seqlen_q=3,
-        max_seqlen_kv=3,
-        causal=True,
-    )
-    saved_storage_ids = []
-
-    def pack_saved(tensor):
-        saved_storage_ids.append(tensor.untyped_storage()._cdata)
-        return tensor
-
-    def expand_phase_kv(_payload, _phase):
-        raise AssertionError("forward ownership probe must not replay projection")
-
-    with torch.autograd.graph.saved_tensors_hooks(pack_saved, lambda tensor: tensor):
-        latent_cp_cudnn_backend._CudnnRecomputedPhaseFunction.apply(
-            query,
-            payload,
-            key,
-            value,
-            phase,
-            1.0,
-            FakeAdapter(),
-            expand_phase_kv,
-            weight,
-        )
-
-    assert query.untyped_storage()._cdata in saved_storage_ids
-    assert payload.untyped_storage()._cdata in saved_storage_ids
-    assert key.untyped_storage()._cdata not in saved_storage_ids
-    assert value.untyped_storage()._cdata not in saved_storage_ids
-
-
-def test_recomputed_phase_records_only_distinct_unowned_kv_storages():
-    """Saved raw inputs need no allocator record; aliased K/V need only one."""
-
-    records = []
-    ready_stream = object()
-
-    class FakeStorage:
-        def __init__(self, identity):
-            self._cdata = identity
-
-    class FakeTensor:
-        def __init__(self, label, storage_identity):
-            self.label = label
-            self.storage = FakeStorage(storage_identity)
-
-        def untyped_storage(self):
-            return self.storage
-
-        def record_stream(self, stream):
-            records.append((self.label, stream))
-
-    query = FakeTensor("query", 1)
-    payload = FakeTensor("payload", 2)
-    key = FakeTensor("key", 3)
-    aliased_value = FakeTensor("value", 3)
-    latent_cp_cudnn_backend._record_recomputed_phase_input_storages(
-        query, payload, key, aliased_value, ready_stream
-    )
-    assert records == [("key", ready_stream)]
-
-    records.clear()
-    distinct_value = FakeTensor("value", 4)
-    latent_cp_cudnn_backend._record_recomputed_phase_input_storages(
-        query, payload, key, distinct_value, ready_stream
-    )
-    assert records == [("key", ready_stream), ("value", ready_stream)]
-
-
 def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
     monkeypatch,
 ):
@@ -1557,7 +1464,6 @@ def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
     order = []
     projection_stream = object()
     phases = tuple(SimpleNamespace(phase=index, owner=index) for index in range(4))
-    payload_record_calls = []
 
     class FakePayload:
         def __init__(self, phase_index):
@@ -1565,7 +1471,6 @@ def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
 
         def record_stream(self, stream):
             assert stream is projection_stream
-            payload_record_calls.append(self.phase_index)
 
     class FakeTransport:
         @staticmethod
@@ -1621,7 +1526,6 @@ def test_recomputed_phase_generator_enqueues_attention_before_next_projection(
     ]
     assert ready[0] is None
     assert all(isinstance(event, FakeEvent) for event in ready[1:])
-    assert payload_record_calls == []
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
