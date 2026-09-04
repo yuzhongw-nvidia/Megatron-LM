@@ -263,12 +263,12 @@ def get_batches_on_this_cp_rank(
             assert contiguous_packed_seq_params is not None
             assert contiguous_packed_seq_params.total_tokens is not None
             thd_plan = build_thd_cp_layout_plan(
-                zigzag_metadata.rank_order_indices,
-                contiguous_packed_seq_params.total_tokens,
-                cp_group,
-                sequence_parallel,
-                tp_group,
-                tp_cp_group,
+                rank_order_indices=zigzag_metadata.rank_order_indices,
+                source_token_count=contiguous_packed_seq_params.total_tokens,
+                cp_group=cp_group,
+                sequence_parallel=sequence_parallel,
+                tp_group=tp_group,
+                tp_cp_group=tp_cp_group,
             )
         return ContextParallelBatch(
             boundary_layout=boundary_layout,

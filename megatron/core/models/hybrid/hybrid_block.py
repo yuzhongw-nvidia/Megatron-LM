@@ -188,6 +188,7 @@ class HybridStack(MegatronModule):
                 cp_group=self.cp_group,
                 tp_group=self.tp_group,
                 tp_cp_group=self.tp_cp_group,
+                cuda_graph_impl=self.config.cuda_graph_impl,
             )
         if getattr(self.config, "mla_down_proj_fusion", False):
             submodules = self._fuse_mla_down_proj(submodules)
@@ -461,7 +462,7 @@ class HybridStack(MegatronModule):
         cp_layout_state = None
         if self._cp_layout_manager is not None:
             cp_layout_state = self._cp_layout_manager.build_forward_state(
-                packed_seq_params,
+                packed_seq_params=packed_seq_params,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 thd_plan=cp_layout_plan,
             )

@@ -3482,6 +3482,9 @@ class TestMultiTokenPredictionHybrid:
         cp_group = types.SimpleNamespace(size=lambda: 2)
         tp_group = object()
         tp_cp_group = object()
+        expected_cp_group = cp_group
+        expected_tp_group = tp_group
+        expected_tp_cp_group = tp_cp_group
         model.pg_collection = types.SimpleNamespace(
             cp=cp_group, tp=tp_group, tp_cp=tp_cp_group, dp_cp=metric_avg_group
         )
@@ -3495,23 +3498,23 @@ class TestMultiTokenPredictionHybrid:
         )
 
         def convert_cp_layout_spy(
-            layer_hidden_states,
+            input_,
             source_layout,
             target_layout,
-            passed_cp_group,
+            cp_group,
             sequence_parallel,
-            passed_tp_group,
-            passed_tp_cp_group,
+            tp_group,
+            tp_cp_group,
             thd_plan,
         ):
             assert source_layout == "contiguous"
             assert target_layout == "zigzag"
-            assert passed_cp_group is cp_group
+            assert cp_group is expected_cp_group
             assert sequence_parallel
-            assert passed_tp_group is tp_group
-            assert passed_tp_cp_group is tp_cp_group
+            assert tp_group is expected_tp_group
+            assert tp_cp_group is expected_tp_cp_group
             assert thd_plan is cp_layout_plan
-            assert layer_hidden_states is hidden_states
+            assert input_ is hidden_states
             return zigzag_hidden_states
 
         monkeypatch.setattr(

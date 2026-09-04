@@ -2206,25 +2206,25 @@ class MultiTokenPredictionBlock(MegatronModule):
             if cp_batch is None:
                 raise ValueError("cp_batch is required when MTP uses a different CP layout")
             hidden_states = convert_cp_layout(
-                hidden_states,
-                source_layout,
-                target_layout,
-                self.cp_group,
-                self.sequence_parallel,
-                self.tp_group,
-                self.tp_cp_group,
-                cp_batch.thd_plan,
+                input_=hidden_states,
+                source_layout=source_layout,
+                target_layout=target_layout,
+                cp_group=self.cp_group,
+                sequence_parallel=self.sequence_parallel,
+                tp_group=self.tp_group,
+                tp_cp_group=self.tp_cp_group,
+                thd_plan=cp_batch.thd_plan,
             )
             if mhc_multistream is not None:
                 mhc_multistream = convert_cp_layout(
-                    mhc_multistream,
-                    source_layout,
-                    target_layout,
-                    self.cp_group,
-                    self.sequence_parallel,
-                    self.tp_group,
-                    self.tp_cp_group,
-                    cp_batch.thd_plan,
+                    input_=mhc_multistream,
+                    source_layout=source_layout,
+                    target_layout=target_layout,
+                    cp_group=self.cp_group,
+                    sequence_parallel=self.sequence_parallel,
+                    tp_group=self.tp_group,
+                    tp_cp_group=self.tp_cp_group,
+                    thd_plan=cp_batch.thd_plan,
                 )
             packed_seq_params = cp_batch.get_packed_seq_params(target_layout)
             layout_batch = cp_batch.get_batch(target_layout)
