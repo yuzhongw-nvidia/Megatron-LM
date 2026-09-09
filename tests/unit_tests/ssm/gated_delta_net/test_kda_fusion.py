@@ -178,6 +178,7 @@ def test_fused_low_rank_kda_parallel_correctness(tmp_path_dist_ckpt, linear_cp_m
         rtol=1e-2,
         input_grad_atol=3.2e-2,
         input_grad_rtol=1e-2,
+        cosine_similarity_threshold=0.9999,
         compare_param_grads=True,
         tp=1,
         cp=2,
