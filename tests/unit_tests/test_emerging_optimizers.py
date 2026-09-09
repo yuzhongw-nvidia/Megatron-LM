@@ -12,7 +12,10 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -40,7 +43,13 @@ from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
-    from emerging_optimizers.soap import SOAP
+
+    try:
+        from emerging_optimizers.soap import SOAP
+    except ModuleNotFoundError as error:
+        if error.name != 'emerging_optimizers.soap':
+            raise
+        from emerging_optimizers.legacy_soap import SOAP
 else:
     SOAP = None
     Lion = None
@@ -739,7 +748,9 @@ class TestMuonOptimizerMultiRankTP:
         )
         model = GPTModel(
             config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_local_spec(multi_latent_attention=True),
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
+                multi_latent_attention=True
+            ),
             vocab_size=32,
             max_sequence_length=8,
             pre_process=False,
@@ -1206,6 +1217,8 @@ def test_muon_optimizer_uniform_per_head_splits_use_batched_ns():
 )
 def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
     """The pinned Emerging-Optimizers 3D Newton-Schulz path matches 2D head calls."""
+    from emerging_optimizers import utils as eopt_utils
+
     torch.manual_seed(42)
     grad = torch.randn(8, 16, dtype=torch.float32, device='cuda')
     param = torch.nn.Parameter(torch.zeros_like(grad))
@@ -1222,13 +1235,15 @@ def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
         pg_collection=None,
     )
 
-    actual = optimizer.orthogonalize(param, grad)
-    expected = torch.cat(
-        [
-            optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
-            for head in torch.split(grad, [2] * 4)
-        ]
-    )
+    # OrthogonalizedOptimizer.step() applies this context around orthogonalize().
+    with eopt_utils.fp32_matmul_precision(optimizer.fp32_matmul_prec):
+        actual = optimizer.orthogonalize(param, grad)
+        expected = torch.cat(
+            [
+                optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
+                for head in torch.split(grad, [2] * 4)
+            ]
+        )
     torch.testing.assert_close(actual, expected)
 
 
