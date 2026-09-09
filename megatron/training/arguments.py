@@ -2855,6 +2855,9 @@ def _add_network_size_args(parser):
         "apply_dsa_kernel_fusion",
         "dsa_kernel_backend",
         "mamba_training_ssm_states_dtype",
+        # defined manually in _add_network_size_args; the config field is filled
+        # by the hasattr-gated copy in core_transformer_config_from_args
+        "hybrid_layer_pattern",
         # Parsed manually as a JSON object below.
         "moe_megakernel_backend_config",
     ]
