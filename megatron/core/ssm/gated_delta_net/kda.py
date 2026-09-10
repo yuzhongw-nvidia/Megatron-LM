@@ -42,6 +42,11 @@ except ImportError:  # pragma: no cover
     chunk_kda = None
     HAVE_FLA_KDA = False
 
+try:
+    from megatron.core.fusions.fused_pre_kda import fused_streamed_pre_kda
+except ImportError:
+    fused_streamed_pre_kda = None
+
 
 @dataclass
 class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
@@ -86,6 +91,11 @@ class KimiDeltaAttention(_GDNBase):
         if not HAVE_FLA or not HAVE_FLA_KDA:  # pragma: no cover
             raise ImportError(
                 "FLA KDA is not installed. Install flash-linear-attention with KDA support."
+            )
+        if config.gdn_pre_gated_delta_rule_fusion and fused_streamed_pre_kda is None:
+            raise ImportError(
+                "gdn_pre_gated_delta_rule_fusion for KDA requires the streamed "
+                "fusion dependencies, including causal-conv1d."
             )
 
         if config.fp8:
@@ -235,6 +245,11 @@ class KimiDeltaAttention(_GDNBase):
         """Set KDA dimensions, projection checkpoint metadata, and kernel callable."""
 
         self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
+        if self.config.deterministic_mode and self.gdn_pre_gated_delta_rule_fusion:
+            raise ValueError(
+                "Pre-GDR fusion is non-deterministic, but deterministic_mode=True. "
+                "Disable gdn_pre_gated_delta_rule_fusion or deterministic_mode."
+            )
         self.use_legacy_fused_projections = (
             self.config.kda_f_lora_rank is None and self.config.kda_gate_lora_rank is None
         )
@@ -316,9 +331,8 @@ class KimiDeltaAttention(_GDNBase):
         """Apply per-head RMSNorm followed by KDA's sigmoid output gate."""
 
         x_dtype = x.dtype
-        x = x.reshape(-1, self.value_head_dim)
-        x = self.out_norm(x)
-        gate = gate.reshape(-1, self.value_head_dim)
+        original_shape = x.shape
+        x = self.out_norm(x.reshape(-1, self.value_head_dim)).reshape(original_shape)
         return (x * torch.sigmoid(gate.float())).to(x_dtype)
 
     def forward(
@@ -583,11 +597,6 @@ class KimiDeltaAttention(_GDNBase):
         )
         nvtx_range_pop(suffix="in_proj")
 
-        if self.gdn_pre_gated_delta_rule_fusion:
-            raise NotImplementedError(
-                "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
-            )
-
         if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
             raise ValueError(
                 "KDA chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
@@ -599,20 +608,48 @@ class KimiDeltaAttention(_GDNBase):
                 "chunk-local causal-conv inputs can change later chunk numerics."
             )
 
-        nvtx_range_push(suffix="pre_gated_delta_rule")
-        query, key, value, gate, beta, raw_g, A_log, dt_bias = self.pre_gated_delta_rule(
-            qkv_or_qkvfg,
-            beta,
-            batch,
-            seq_len_post_headwise,
-            cp_size_headwise,
-            cp_group_headwise,
-            cu_seqlens_q,
-            chunkwise_cp_context,
-            packed_seq_params=packed_seq_params,
-            raw_g=raw_g,
-            gate=gate,
-        )
+        if self.gdn_pre_gated_delta_rule_fusion:
+            nvtx_range_push(suffix="fused_streamed_pre_kda")
+            seq_idx = (
+                packed_seq_params.seq_idx
+                if packed_seq_params is not None
+                and packed_seq_params.qkv_format == "thd"
+                and cp_size_chunkwise == 1
+                else None
+            )
+            fused_cu_seqlens_q = (
+                cu_seqlens_q
+                if packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
+                else None
+            )
+            query, key, value, gate, beta, raw_g, A_log, dt_bias = self._fused_streamed_pre_kda(
+                qkv_or_qkvfg,
+                beta,
+                cu_seqlens_q=fused_cu_seqlens_q,
+                seq_idx=seq_idx,
+                cp_group=cp_group_chunkwise if cp_size_chunkwise > 1 else None,
+                cp_group_headwise=cp_group_headwise,
+                cp_size_headwise=cp_size_headwise,
+                raw_g=raw_g,
+                gate=gate,
+            )
+            nvtx_range_pop(suffix="fused_streamed_pre_kda")
+        else:
+            nvtx_range_push(suffix="pre_gated_delta_rule")
+            query, key, value, gate, beta, raw_g, A_log, dt_bias = self.pre_gated_delta_rule(
+                qkv_or_qkvfg,
+                beta,
+                batch,
+                seq_len_post_headwise,
+                cp_size_headwise,
+                cp_group_headwise,
+                cu_seqlens_q,
+                chunkwise_cp_context,
+                packed_seq_params=packed_seq_params,
+                raw_g=raw_g,
+                gate=gate,
+            )
+            nvtx_range_pop(suffix="pre_gated_delta_rule")
         kernel_inputs = {
             "q": query,
             "k": key,
@@ -622,7 +659,6 @@ class KimiDeltaAttention(_GDNBase):
             "A_log": A_log,
             "dt_bias": dt_bias,
         }
-        nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(
@@ -840,6 +876,70 @@ class KimiDeltaAttention(_GDNBase):
             A_log_local_cp,
             dt_bias_local_cp,
         )
+
+    def _fused_streamed_pre_kda(
+        self,
+        qkv_or_qkvfg,
+        beta,
+        cu_seqlens_q=None,
+        seq_idx=None,
+        cp_group=None,
+        cp_group_headwise=None,
+        cp_size_headwise=1,
+        raw_g=None,
+        gate=None,
+    ):
+        """Call the streamed KDA fusion with legacy or standalone projection tensors."""
+
+        if self.use_legacy_fused_projections:
+            if raw_g is not None or gate is not None:
+                raise ValueError("Legacy KDA projections must pass raw_g and gate in qkvfg.")
+            qkv, raw_g, gate = torch.split(
+                qkv_or_qkvfg, self._get_feat_dim_split(cp_size_headwise), dim=-1
+            )
+        else:
+            if raw_g is None or gate is None:
+                raise ValueError("Non-legacy KDA projections require standalone raw_g and gate.")
+            qkv = qkv_or_qkvfg
+
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
+        conv1d_weight = get_parameter_local_cp(
+            self.conv1d.weight,
+            dim=0,
+            cp_group=cp_group_headwise,
+            split_sections=qkv_channels_split_sections,
+        )
+        conv1d_bias = (
+            get_parameter_local_cp(
+                self.conv1d.bias,
+                dim=0,
+                cp_group=cp_group_headwise,
+                split_sections=qkv_channels_split_sections,
+            )
+            if self.conv_bias
+            else None
+        )
+        A_log = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group_headwise)
+        dt_bias = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group_headwise)
+        outputs = fused_streamed_pre_kda(
+            qkv,
+            raw_g,
+            gate,
+            beta,
+            conv1d_weight,
+            conv1d_bias,
+            num_heads=A_log.numel(),
+            head_dim=self.key_head_dim,
+            use_qk_l2norm=self.use_qk_l2norm,
+            cu_seqlens=cu_seqlens_q,
+            seq_idx=seq_idx,
+            cp_group=cp_group,
+        )
+        return (*outputs, A_log, dt_bias)
 
     @staticmethod
     def _validate_packed_cu_seqlens(
