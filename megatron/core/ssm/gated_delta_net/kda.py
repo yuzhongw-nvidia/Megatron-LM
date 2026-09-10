@@ -42,6 +42,11 @@ except ImportError:  # pragma: no cover
     chunk_kda = None
     HAVE_FLA_KDA = False
 
+try:
+    from megatron.core.fusions.fused_pre_kda import fused_streamed_pre_kda
+except ImportError:
+    fused_streamed_pre_kda = None
+
 
 @dataclass
 class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
@@ -86,6 +91,11 @@ class KimiDeltaAttention(_GDNBase):
         if not HAVE_FLA or not HAVE_FLA_KDA:  # pragma: no cover
             raise ImportError(
                 "FLA KDA is not installed. Install flash-linear-attention with KDA support."
+            )
+        if config.gdn_pre_gated_delta_rule_fusion and fused_streamed_pre_kda is None:
+            raise ImportError(
+                "gdn_pre_gated_delta_rule_fusion for KDA requires the streamed "
+                "fusion dependencies, including causal-conv1d."
             )
 
         if config.fp8:
@@ -891,14 +901,6 @@ class KimiDeltaAttention(_GDNBase):
             if raw_g is None or gate is None:
                 raise ValueError("Non-legacy KDA projections require standalone raw_g and gate.")
             qkv = qkv_or_qkvfg
-
-        try:
-            from megatron.core.fusions.fused_pre_kda import fused_streamed_pre_kda
-        except ImportError as exc:
-            raise ImportError(
-                "gdn_pre_gated_delta_rule_fusion for KDA requires the streamed "
-                "fusion dependencies, including causal-conv1d."
-            ) from exc
 
         qkv_channels_split_sections = [
             self.qk_dim_local_tp,
