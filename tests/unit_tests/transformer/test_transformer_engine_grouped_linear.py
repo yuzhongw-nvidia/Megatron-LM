@@ -93,6 +93,19 @@ def test_split_grouped_checkpoint_tensor_rejects_zero_dim():
         module._split_grouped_checkpoint_tensor(tensor, "weight")
 
 
+def test_split_extra_state_preserves_empty_fp8_state_for_each_gemm():
+    module = _grouped_linear_stub(num_gemms=3)
+    module.fp8_meta = {"fp8_checkpoint": True}
+    module.fp8 = True
+    module.fp8_calibration = False
+    empty_state = torch.empty(0, dtype=torch.uint8)
+
+    splits = module._split_extra_state(empty_state)
+
+    assert len(splits) == module.num_gemms
+    assert all(split is empty_state for split in splits)
+
+
 def test_normalize_grouped_parameter_keys_indexed_to_grouped_weight_only():
     module = _grouped_linear_stub(num_gemms=3, use_bias=False, single_grouped_weight=True)
     indexed = [torch.tensor([float(i), float(i) + 0.5]) for i in range(3)]

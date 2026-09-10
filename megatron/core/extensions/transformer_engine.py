@@ -2503,7 +2503,15 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             if not fp8_checkpoint:
                 return [state] * self.num_gemms
 
-            state = self._decode_extra_state(state)
+            decoded_state = self._decode_extra_state(state)
+            # Block-scaling recipes such as MXFP8 do not carry persistent FP8 metadata,
+            # so Transformer Engine represents their extra state as an empty tensor.
+            # Preserve that empty state for each split GEMM instead of treating it as
+            # delayed-scaling metadata below.
+            if decoded_state is None:
+                return [state] * self.num_gemms
+
+            state = decoded_state
             extra_states = []
             extra_fp8_variables = state["extra_fp8_variables"]
             extra_fp8_variables["num_gemms"] = 1
