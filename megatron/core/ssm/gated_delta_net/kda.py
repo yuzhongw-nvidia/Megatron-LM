@@ -527,6 +527,7 @@ class KimiDeltaAttention(_GDNBase):
                     cu_seqlens_q,
                     packed_seq_params,
                     chunkwise_cp_context,
+                    strict_runtime_validation,
                 )
 
             # Quantized recompute must restore TE's FP8/FP4 state, matching the
@@ -557,6 +558,7 @@ class KimiDeltaAttention(_GDNBase):
                 cu_seqlens_q,
                 packed_seq_params,
                 chunkwise_cp_context,
+                strict_runtime_validation,
             )
 
         if back_to_input_converter is not None:
@@ -578,6 +580,7 @@ class KimiDeltaAttention(_GDNBase):
         cu_seqlens_q,
         packed_seq_params,
         chunkwise_cp_context,
+        strict_runtime_validation,
     ):
         """Core KDA computation (projections -> conv1d -> KDA -> norm -> out_proj)."""
 
@@ -672,6 +675,7 @@ class KimiDeltaAttention(_GDNBase):
                 cp_size_headwise=cp_size_headwise,
                 raw_g=raw_g,
                 gate=gate,
+                strict_runtime_validation=strict_runtime_validation,
             )
             nvtx_range_pop(suffix="fused_streamed_pre_kda")
         else:
@@ -923,17 +927,18 @@ class KimiDeltaAttention(_GDNBase):
         cp_size_headwise=1,
         raw_g=None,
         gate=None,
+        strict_runtime_validation=True,
     ):
         """Call the streamed KDA fusion with legacy or standalone projection tensors."""
 
         if self.use_legacy_fused_projections:
-            if raw_g is not None or gate is not None:
+            if strict_runtime_validation and (raw_g is not None or gate is not None):
                 raise ValueError("Legacy KDA projections must pass raw_g and gate in qkvfg.")
             qkv, raw_g, gate = torch.split(
                 qkv_or_qkvfg, self._get_feat_dim_split(cp_size_headwise), dim=-1
             )
         else:
-            if raw_g is None or gate is None:
+            if strict_runtime_validation and (raw_g is None or gate is None):
                 raise ValueError("Non-legacy KDA projections require standalone raw_g and gate.")
             qkv = qkv_or_qkvfg
 
@@ -973,6 +978,7 @@ class KimiDeltaAttention(_GDNBase):
             cu_seqlens=cu_seqlens_q,
             seq_idx=seq_idx,
             cp_group=cp_group,
+            strict_runtime_validation=strict_runtime_validation,
         )
         return (*outputs, A_log, dt_bias)
 
