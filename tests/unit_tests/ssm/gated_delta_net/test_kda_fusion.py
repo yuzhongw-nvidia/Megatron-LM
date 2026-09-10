@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 import torch
 
+from megatron.core.fusions import fused_pre_kda as fused_pre_kda_module
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, KimiDeltaAttention
@@ -117,6 +118,45 @@ class TestFusedPreKDA:
         )
 
         self._compare_forward_backward(reference, fused, hidden_states)
+
+    def test_activation_recompute_initial_forward_skips_backward_state(self, monkeypatch):
+        """Allocate Q/K SiLU state only in the backward-triggered recomputation."""
+
+        config = replace(
+            _make_config(f_lora_rank=8, gate_lora_rank=12),
+            deterministic_mode=False,
+            gdn_pre_gated_delta_rule_fusion=True,
+            recompute_granularity="selective",
+            recompute_modules=["gdn"],
+        )
+        kda = build_kda(config)
+        hidden_states = torch.randn(
+            (32, 2, config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        save_silu_calls = []
+        original_forward = fused_pre_kda_module._triton_pre_kda_forward
+
+        def record_save_silu(*args, **kwargs):
+            save_silu = kwargs["save_silu"]
+            save_silu_calls.append(save_silu)
+            result = original_forward(*args, **kwargs)
+            if not save_silu:
+                assert result[6] is None
+            return result
+
+        monkeypatch.setattr(fused_pre_kda_module, "_triton_pre_kda_forward", record_save_silu)
+
+        output, _ = kda(hidden_states, None)
+        assert save_silu_calls == [False]
+
+        output.float().sum().backward()
+
+        assert save_silu_calls == [False, True]
+        assert hidden_states.grad is not None
+        assert kda.conv1d.weight.grad is not None
 
     def test_fused_and_unfused_packed_low_rank_forward_backward_match(self):
         """Match packed THD forward and backward with an independent F projection."""

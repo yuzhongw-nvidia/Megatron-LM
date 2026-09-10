@@ -577,10 +577,13 @@ def _triton_pre_kda_forward(
     *,
     num_heads: int,
     head_dim: int,
+    save_silu: bool = True,
     cu_seqlens: Optional[Tensor] = None,
     cp_group=None,
     cp_size: int = 1,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Optional[Tensor], int, int]:
+) -> Tuple[
+    Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor], int, int
+]:
     """Run the shared QKV kernels and the KDA-specific tail kernel."""
 
     seq_len, batch, total_channels = qkv.shape
@@ -622,9 +625,13 @@ def _triton_pre_kda_forward(
     query = qk_out[0]
     key = qk_out[1]
     value = torch.empty((batch, seq_len, num_heads, head_dim), dtype=qkv.dtype, device=device)
-    silu_qk_save = torch.empty(
-        (batch, seq_len, 2 * qk_channels), dtype=qkv.dtype, device=device
-    ).permute(0, 2, 1)
+    if save_silu:
+        silu_qk_save: Optional[Tensor] = torch.empty(
+            (batch, seq_len, 2 * qk_channels), dtype=qkv.dtype, device=device
+        ).permute(0, 2, 1)
+    else:
+        silu_qk_save = None
+    silu_qk_buffer = qkv if silu_qk_save is None else silu_qk_save
     weight_2d = conv1d_weight.view(conv1d_weight.shape[0], conv1d_weight.shape[-1])
 
     main_stream = torch.cuda.current_stream(device=device)
@@ -649,7 +656,7 @@ def _triton_pre_kda_forward(
             qkv,
             weight_2d,
             qk_out,
-            silu_qk_save,
+            silu_qk_buffer,
             left_boundary,
             cu_seqlens=cu_seqlens,
             global_token_offset=global_token_offset,
@@ -664,7 +671,7 @@ def _triton_pre_kda_forward(
             num_groups=2,
             has_left_boundary=has_left_boundary,
             apply_l2=True,
-            save_silu=True,
+            save_silu=save_silu,
         )
     with torch.cuda.stream(v_stream):
         _launch_conv_silu_project(
@@ -921,10 +928,12 @@ class FusedPreKDAFunction(torch.autograd.Function):
             conv1d_weight,
             num_heads=num_heads,
             head_dim=head_dim,
+            save_silu=True,
             cu_seqlens=cu_seqlens,
             cp_group=cp_group,
             cp_size=cp_size,
         )
+        assert silu_qk_save is not None
         ctx.has_left_boundary = left_boundary is not None
         ctx.global_token_offset = global_token_offset
         ctx.global_seq_len = global_seq_len
@@ -1053,6 +1062,9 @@ def fused_streamed_pre_kda(
     )
     assert conv1d_bias is None, "Conv bias is not supported by fused_streamed_pre_kda."
     assert use_qk_l2norm, "use_qk_l2norm=False is not supported by fused_streamed_pre_kda."
+    needs_backward = torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (qkv, raw_g, gate, beta, conv1d_weight)
+    )
 
     cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size > 1:
@@ -1088,10 +1100,26 @@ def fused_streamed_pre_kda(
             f"got qkv shape {tuple(qkv.shape)}."
         )
         cu_seqlens = cu_seqlens.contiguous()
-        if cp_size == 1:
+        if cp_size == 1 and needs_backward:
             seq_idx = _resolve_packed_seq_idx(cu_seqlens, seq_idx, qkv.shape[0])
     else:
         assert seq_idx is None, "seq_idx requires cu_seqlens for packed THD mode."
+
+    if not needs_backward:
+        query, key, value, gate_out, beta_out, raw_g_out, _, _, _, _ = _triton_pre_kda_forward(
+            qkv,
+            raw_g,
+            gate,
+            beta,
+            conv1d_weight,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            save_silu=False,
+            cu_seqlens=cu_seqlens,
+            cp_group=cp_group,
+            cp_size=cp_size,
+        )
+        return query, key, value, gate_out, beta_out, raw_g_out
 
     return FusedPreKDAFunction.apply(
         qkv,
