@@ -189,6 +189,12 @@ def test_kda_per_head_muon_uses_rank_major_projection_layout(
         model_parallel_cuda_manual_seed(123)
         config = _make_config(tp_size=2, f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank)
         kda = _build_kda(config)
+        assert kda.beta_proj.weight.shape == (
+            config.linear_num_key_heads,
+            config.hidden_size,
+        )
+        assert not getattr(kda.beta_proj.weight, "tensor_model_parallel", False)
+        assert not getattr(kda.beta_proj.weight, "sequence_parallel", False)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         optimizer = get_megatron_optimizer(
             config=OptimizerConfig(
