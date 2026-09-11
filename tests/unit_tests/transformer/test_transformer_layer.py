@@ -109,6 +109,49 @@ class TestParallelTransformerLayer:
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
 
+    def test_fp8_mlp_recompute_binds_padding_mask_to_forward(self, monkeypatch):
+        """FP8 recompute must not pass MLP kwargs through TE checkpoint."""
+        import megatron.core.extensions.transformer_engine as transformer_engine
+        import megatron.core.transformer.transformer_layer as transformer_layer_module
+
+        layer = self.parallel_transformer_layer
+        layer.config.fp8 = "hybrid"
+        layer.recompute_mlp = True
+
+        seen = {}
+
+        class RecordingMLP(torch.nn.Module):
+            def forward(self, hidden_states, padding_mask=None):
+                seen["padding_mask"] = padding_mask
+                return hidden_states + 1, None
+
+        layer.mlp = RecordingMLP()
+        monkeypatch.setattr(
+            layer,
+            "_forward_pre_mlp_layernorm",
+            lambda hidden_states, mhc_recompute_manager=None: hidden_states,
+        )
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_push", lambda **kwargs: None)
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_pop", lambda **kwargs: None)
+
+        def checkpoint(forward_func, _distribute, _rng_tracker, _tp_group, *args, **kwargs):
+            seen["checkpoint_kwargs"] = kwargs
+            return forward_func(*args)
+
+        monkeypatch.setattr(transformer_engine, "te_checkpoint", checkpoint)
+
+        hidden_states = torch.randn(4, 2, layer.config.hidden_size)
+        padding_mask = torch.ones(2, 4, dtype=torch.bool)
+        output_with_bias, residual = layer._forward_mlp_output_with_bias(
+            hidden_states, padding_mask=padding_mask
+        )
+
+        assert seen["checkpoint_kwargs"] == {}
+        assert seen["padding_mask"] is padding_mask
+        assert torch.equal(output_with_bias[0], hidden_states + 1)
+        assert output_with_bias[1] is None
+        assert residual is hidden_states
+
     def test_offload_scope_in_cuda_graph_preserves_gpt_rules(self):
         """The shared helper keeps the existing GPT attention/dense-MLP scope rules."""
         layer = self.parallel_transformer_layer
