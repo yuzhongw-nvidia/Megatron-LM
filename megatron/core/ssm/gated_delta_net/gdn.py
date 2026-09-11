@@ -716,6 +716,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                     cu_seqlens_q,
                     packed_seq_params,
                     chunkwise_cp_context,
+                    strict_runtime_validation,
                 )
 
             if self.config.fp8 or self.config.fp4:
@@ -745,6 +746,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 cu_seqlens_q,
                 packed_seq_params,
                 chunkwise_cp_context,
+                strict_runtime_validation,
             )
 
         if back_to_input_converter is not None:
@@ -766,6 +768,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         cu_seqlens_q,
         packed_seq_params,
         chunkwise_cp_context,
+        strict_runtime_validation,
     ):
         """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
         # Input projection
@@ -803,6 +806,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 seq_idx=seq_idx,
                 cp_group=cp_group_chunkwise if cp_size_chunkwise > 1 else None,
                 cp_group_headwise=cp_group_headwise,
+                strict_runtime_validation=strict_runtime_validation,
             )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
@@ -1013,7 +1017,13 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         )
 
     def _fused_streamed_pre_gated_delta_rule(
-        self, qkvzba, cu_seqlens_q=None, seq_idx=None, cp_group=None, cp_group_headwise=None
+        self,
+        qkvzba,
+        cu_seqlens_q=None,
+        seq_idx=None,
+        cp_group=None,
+        cp_group_headwise=None,
+        strict_runtime_validation=True,
     ):
         """Call the streamed fused pre-GDR wrapper."""
 
@@ -1059,6 +1069,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             cu_seqlens=cu_seqlens_q,
             seq_idx=seq_idx,
             cp_group=cp_group,
+            strict_runtime_validation=strict_runtime_validation,
         )
 
 
