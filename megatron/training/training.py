@@ -3419,7 +3419,36 @@ def train_step(
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    fingerprint_path = os.environ.get("MCORE_PRE_CLIP_GRAD_FINGERPRINT_PATH")
+    fingerprint_iteration = (
+        int(os.environ.get("MCORE_PRE_CLIP_GRAD_FINGERPRINT_ITERATION", "1"))
+        if fingerprint_path
+        else None
+    )
+    capture_pre_clip_gradient = bool(fingerprint_path) and iteration + 1 == fingerprint_iteration
+    original_prepare_grads = None
+    if capture_pre_clip_gradient:
+        from megatron.training.gradient_fingerprint import dump_pre_clip_optimizer_grad_fingerprint
+
+        original_prepare_grads = optimizer.prepare_grads
+
+        def prepare_grads_with_fingerprint():
+            found_inf = original_prepare_grads()
+            dump_pre_clip_optimizer_grad_fingerprint(
+                model=model,
+                optimizer=optimizer,
+                iteration=iteration + 1,
+                found_inf=found_inf,
+                output_path=fingerprint_path,
+            )
+            return found_inf
+
+        optimizer.prepare_grads = prepare_grads_with_fingerprint
+    try:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    finally:
+        if original_prepare_grads is not None:
+            optimizer.prepare_grads = original_prepare_grads
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
