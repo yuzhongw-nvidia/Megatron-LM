@@ -386,16 +386,65 @@ def dump_pre_clip_optimizer_grad_fingerprint(
 
     payload = {"coordinates": coordinates, "errors": local_errors, "records": records}
     world_size = torch.distributed.get_world_size()
-    gathered_payloads = [None] * world_size if coordinates["global_rank"] == 0 else None
-    torch.distributed.gather_object(payload, gathered_payloads, dst=0)
+    global_rank = coordinates["global_rank"]
+    destination = Path(output_path)
+    rank_payload = destination.with_name(f".{destination.name}.rank-{global_rank:05d}.json")
+    temporary_rank_payload = rank_payload.with_name(f".{rank_payload.name}.{os.getpid()}.tmp")
+
+    transport_error = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            raise FileExistsError(f"refusing to overwrite existing fingerprint: {destination}")
+        if rank_payload.exists():
+            raise FileExistsError(f"refusing to overwrite rank payload: {rank_payload}")
+        with temporary_rank_payload.open("x", encoding="utf-8") as output:
+            json.dump(payload, output, sort_keys=True, separators=(",", ":"))
+            output.write("\n")
+        os.replace(temporary_rank_payload, rank_payload)
+    except (OSError, TypeError, ValueError) as error:
+        transport_error = (
+            f"rank {global_rank} payload write failed: {type(error).__name__}: {error}"
+        )
+        try:
+            temporary_rank_payload.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"MCORE_PRE_CLIP_GRAD_FINGERPRINT_GATE=FAIL error={transport_error}", flush=True)
+
+    transport_status = torch.tensor(
+        [1 if transport_error else 0],
+        dtype=torch.int32,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    torch.distributed.all_reduce(transport_status, op=torch.distributed.ReduceOp.MAX)
+    rank_payloads = [
+        destination.with_name(f".{destination.name}.rank-{rank:05d}.json")
+        for rank in range(world_size)
+    ]
+    if transport_status.item():
+        if global_rank == 0:
+            for payload_path in rank_payloads:
+                try:
+                    payload_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        raise RuntimeError(
+            transport_error or "another rank failed to stage its gradient fingerprint payload"
+        )
 
     root_error = None
-    if coordinates["global_rank"] == 0:
+    if global_rank == 0:
         try:
+            gathered_payloads = []
+            for payload_path in rank_payloads:
+                with payload_path.open(encoding="utf-8") as input_file:
+                    gathered_payloads.append(json.load(input_file))
             canonical, errors, warnings = _canonicalize_records(gathered_payloads)
             result = {
                 "schema_version": 1,
                 "scope": "prepared_layerwise_fp32_master_gradients_before_clipping",
+                "transport": "shared_filesystem_rank_payloads",
                 "iteration": iteration,
                 "found_inf": bool(found_inf),
                 "world_size": world_size,
@@ -409,8 +458,6 @@ def dump_pre_clip_optimizer_grad_fingerprint(
                 "canonical": canonical,
                 "rank_payloads": gathered_payloads,
             }
-            destination = Path(output_path)
-            destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists():
                 raise FileExistsError(f"refusing to overwrite existing fingerprint: {destination}")
             temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
@@ -439,6 +486,12 @@ def dump_pre_clip_optimizer_grad_fingerprint(
         ) as error:
             root_error = f"{type(error).__name__}: {error}"
             print(f"MCORE_PRE_CLIP_GRAD_FINGERPRINT_GATE=FAIL error={root_error}", flush=True)
+        finally:
+            for payload_path in rank_payloads:
+                try:
+                    payload_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     status = torch.tensor(
         [1 if root_error else 0],
