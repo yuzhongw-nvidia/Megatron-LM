@@ -110,17 +110,68 @@ class TestStepBookkeeping:
         assert tracer._stopped  # 2 captured == max_steps
 
 
-@pytest.mark.parametrize("kind", ["hidden_states", "logits"])
-def test_sidecar_loader_roundtrip(tmp_path, kind):
-    """The bf16 sidecar loaders reconstruct the exact tensor from the .bin +
-    record offsets (the byte-format contract shared with the analysis tools)."""
-    tensor = torch.randn(3, 4, dtype=torch.bfloat16)
-    (tmp_path / f"{kind}_rank0.bin").write_bytes(tensor.view(torch.int16).numpy().tobytes())
-    nbytes = tensor.numel() * 2
+@pytest.mark.parametrize(
+    ("kind", "dtype"),
+    (("hidden_states", torch.bfloat16), ("logits", torch.bfloat16), ("logits", torch.float32)),
+)
+def test_sidecar_loader_roundtrip(tmp_path, kind, dtype):
+    """Sidecar loaders reconstruct the exact tensor from the binary record metadata."""
+    tensor = torch.randn(3, 4, dtype=dtype)
+    tensor_bytes = (
+        tensor.view(torch.int16).numpy().tobytes()
+        if dtype == torch.bfloat16
+        else tensor.numpy().tobytes()
+    )
+    (tmp_path / f"{kind}_rank0.bin").write_bytes(tensor_bytes)
+    nbytes = len(tensor_bytes)
     if kind == "hidden_states":
         rec = {"rank": 0, "hs_offset": 0, "hs_bytes": nbytes, "hs_shape": [3, 4]}
         out = load_hidden_states_for_record(rec, str(tmp_path))
     else:
-        rec = {"rank": 0, "logit_offset": 0, "logit_bytes": nbytes, "logit_shape": [3, 4]}
+        rec = {
+            "rank": 0,
+            "logit_offset": 0,
+            "logit_bytes": nbytes,
+            "logit_shape": [3, 4],
+            "logit_dtype": str(dtype).removeprefix("torch."),
+        }
         out = load_logits_for_record(rec, str(tmp_path))
     assert torch.equal(out, tensor)
+
+
+def test_auxiliary_capture_filters_rank_and_decoder_layer(tmp_path):
+    """Large sidecars can be restricted without suppressing route-index records."""
+    tracer = RouterTracer(
+        str(tmp_path),
+        max_steps=1,
+        rank=3,
+        training_mode=True,
+        capture_hidden_states=True,
+        capture_logits=True,
+        capture_global_ranks={3},
+        capture_decoder_layers={5},
+        logits_dtype=torch.float32,
+    )
+    assert tracer._capture_auxiliary_data("decoder", 5)
+    tracer.capture_global_ranks = {2}
+    assert not tracer._capture_auxiliary_data("decoder", 5)
+    tracer.capture_global_ranks = {3}
+    assert not tracer._capture_auxiliary_data("decoder", 3)
+    assert not tracer._capture_auxiliary_data("mtp", 5)
+    module = MagicMock()
+    module.gating.side_effect = lambda hidden_states: hidden_states.float()
+    hidden_states = torch.randn(4, 8, dtype=torch.bfloat16)
+    outputs = (torch.zeros(4, 2), torch.tensor([[0, 1]] * 4, dtype=torch.int32))
+
+    tracer._record(module, (hidden_states,), outputs, identity=("decoder", None, 3))
+    tracer._record(module, (hidden_states,), outputs, identity=("decoder", None, 5))
+    tracer._record(module, (hidden_states,), outputs, identity=("mtp", 0, 5))
+    tracer.flush()
+
+    records = _read_jsonl(tracer.output_path)
+    assert len(records) == 3
+    assert "hs_offset" not in records[0] and "logit_offset" not in records[0]
+    assert "hs_offset" in records[1] and records[1]["logit_dtype"] == "float32"
+    assert "hs_offset" not in records[2] and "logit_offset" not in records[2]
+    assert torch.equal(load_hidden_states_for_record(records[1], str(tmp_path)), hidden_states)
+    assert torch.equal(load_logits_for_record(records[1], str(tmp_path)), hidden_states.float())

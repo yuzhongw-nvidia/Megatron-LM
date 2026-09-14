@@ -19,6 +19,8 @@ Optional sidecar binary files written:
   record gains `logit_offset`, `logit_bytes`, `logit_shape` fields.
 
 Use `load_hidden_states_for_record` / `load_logits_for_record` to read sidecar tensors.
+Logit records include `logit_dtype` when the sidecar is captured in float32;
+records without it retain the legacy bfloat16 interpretation.
 
 Note: Python forward hooks do not fire during CUDA graph replay.  Run with `--cuda-graph-impl none`.
 """
@@ -91,6 +93,35 @@ def init_moe_router_tracer(
     global _MOE_ROUTER_TRACER
     if _MOE_ROUTER_TRACER is not None:
         return
+
+    def parse_optional_int_set(value: Optional[str], name: str) -> Optional[set[int]]:
+        if value is None or not value.strip():
+            return None
+        try:
+            result = {int(item.strip()) for item in value.split(",") if item.strip()}
+        except ValueError as error:
+            raise ValueError(
+                f"{name} must contain comma-separated integers, got {value!r}"
+            ) from error
+        if not result or any(item < 0 for item in result):
+            raise ValueError(f"{name} must contain non-negative integers, got {value!r}")
+        return result
+
+    capture_global_ranks = parse_optional_int_set(
+        os.environ.get("MCORE_MOE_ROUTER_TRACE_CAPTURE_GLOBAL_RANKS"),
+        "MCORE_MOE_ROUTER_TRACE_CAPTURE_GLOBAL_RANKS",
+    )
+    capture_decoder_layers = parse_optional_int_set(
+        os.environ.get("MCORE_MOE_ROUTER_TRACE_CAPTURE_DECODER_LAYERS"),
+        "MCORE_MOE_ROUTER_TRACE_CAPTURE_DECODER_LAYERS",
+    )
+    logits_dtype_name = os.environ.get("MCORE_MOE_ROUTER_TRACE_LOGITS_DTYPE", "bfloat16")
+    logits_dtype = {"bfloat16": torch.bfloat16, "float32": torch.float32}.get(logits_dtype_name)
+    if logits_dtype is None:
+        raise ValueError(
+            "MCORE_MOE_ROUTER_TRACE_LOGITS_DTYPE must be bfloat16 or float32, "
+            f"got {logits_dtype_name!r}"
+        )
     _MOE_ROUTER_TRACER = RouterTracer(
         output_dir,
         max_steps,
@@ -99,6 +130,9 @@ def init_moe_router_tracer(
         capture_hidden_states=capture_hidden_states,
         capture_logits=capture_logits,
         dump_router_weights=dump_router_weights,
+        capture_global_ranks=capture_global_ranks,
+        capture_decoder_layers=capture_decoder_layers,
+        logits_dtype=logits_dtype,
     )
     atexit.register(_MOE_ROUTER_TRACER.flush)
 
@@ -138,7 +172,8 @@ def load_logits_for_record(record: dict, trace_dir: str) -> torch.Tensor:
         trace_dir: Directory containing logits_rank{rank}.bin.
 
     Returns:
-        Tensor of shape [num_tokens, num_experts] in bfloat16.
+        Tensor of shape [num_tokens, num_experts] in the recorded dtype. Older
+        records without ``logit_dtype`` default to bfloat16.
     """
     if "logit_offset" not in record:
         raise ValueError("Record does not contain logit metadata.")
@@ -148,8 +183,14 @@ def load_logits_for_record(record: dict, trace_dir: str) -> torch.Tensor:
         data = f.read(record["logit_bytes"])
     # torch.frombuffer keeps the bytearray alive via the tensor's storage, so the
     # view is safe to return without copying.
-    arr = torch.frombuffer(bytearray(data), dtype=torch.int16)
-    return arr.view(torch.bfloat16).reshape(record["logit_shape"])
+    dtype_name = record.get("logit_dtype", "bfloat16")
+    if dtype_name == "bfloat16":
+        arr = torch.frombuffer(bytearray(data), dtype=torch.int16).view(torch.bfloat16)
+    elif dtype_name == "float32":
+        arr = torch.frombuffer(bytearray(data), dtype=torch.float32)
+    else:
+        raise ValueError(f"Unsupported router-logit sidecar dtype {dtype_name!r}.")
+    return arr.reshape(record["logit_shape"])
 
 
 class RouterTracer:
@@ -172,6 +213,9 @@ class RouterTracer:
         capture_hidden_states: bool = False,
         capture_logits: bool = False,
         dump_router_weights: bool = False,
+        capture_global_ranks: Optional[set[int]] = None,
+        capture_decoder_layers: Optional[set[int]] = None,
+        logits_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         self.output_dir = output_dir
         self.max_steps = max_steps
@@ -185,6 +229,11 @@ class RouterTracer:
         self.capture_hidden_states = capture_hidden_states
         self.capture_logits = capture_logits
         self.dump_router_weights = dump_router_weights
+        self.capture_global_ranks = capture_global_ranks
+        self.capture_decoder_layers = capture_decoder_layers
+        if logits_dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError(f"Unsupported router-logit sidecar dtype {logits_dtype}.")
+        self.logits_dtype = logits_dtype
         self._router_state: dict = {}
         self._hook_handles: List[torch.utils.hooks.RemovableHook] = []
 
@@ -288,6 +337,14 @@ class RouterTracer:
             return None
         return hs
 
+    def _capture_auxiliary_data(self, block: str, layer: int) -> bool:
+        """Return whether this rank/layer is selected for large sidecar data."""
+        if self.capture_global_ranks is not None and self.rank not in self.capture_global_ranks:
+            return False
+        if self.capture_decoder_layers is not None:
+            return block == "decoder" and layer in self.capture_decoder_layers
+        return True
+
     def _make_index_record(self, top_indices_cpu, step, block, mtp_idx, layer) -> dict:
         """Assemble a JSONL record dict for one layer's top-K indices."""
         record: dict = {
@@ -321,6 +378,7 @@ class RouterTracer:
                 return
             block, mtp_idx, layer = "decoder", None, int(layer_number)
         layer_key = (block, mtp_idx, layer)
+        capture_auxiliary_data = self._capture_auxiliary_data(block, layer)
 
         if not self.training_mode:
             # Detect step boundaries via layer repeats.
@@ -333,7 +391,11 @@ class RouterTracer:
                     return
             self.layers_seen_this_step.add(layer_key)
 
-        if self.dump_router_weights and layer_key not in self._router_state:
+        if (
+            self.dump_router_weights
+            and capture_auxiliary_data
+            and layer_key not in self._router_state
+        ):
             weight = getattr(module, "weight", None)
             expert_bias = getattr(module, "expert_bias", None)
             score_fn = getattr(getattr(module, "config", None), "moe_router_score_function", None)
@@ -367,7 +429,7 @@ class RouterTracer:
 
         record = self._make_index_record(top_indices_cpu, self.step_id, block, mtp_idx, layer)
 
-        if self.capture_hidden_states:
+        if self.capture_hidden_states and capture_auxiliary_data:
             hs = self._extract_hidden_state(inputs, num_tokens)
             if hs is not None:
                 hs_cpu = hs.detach().to("cpu", dtype=torch.bfloat16).contiguous()
@@ -380,7 +442,7 @@ class RouterTracer:
                 record["hs_shape"] = list(hs_cpu.shape)
                 self._hs_offset += len(hs_bytes)
 
-        if self.capture_logits:
+        if self.capture_logits and capture_auxiliary_data:
             hs_for_gating = self._extract_hidden_state(inputs, num_tokens)
             gating_fn = getattr(module, "gating", None)
             if hs_for_gating is not None and callable(gating_fn):
@@ -392,14 +454,18 @@ class RouterTracer:
                 except Exception:
                     logits = None
                 if torch.is_tensor(logits) and logits.shape[0] == num_tokens:
-                    logits_cpu = logits.detach().to("cpu", dtype=torch.bfloat16).contiguous()
-                    logits_bytes = logits_cpu.view(torch.int16).numpy().tobytes()
+                    logits_cpu = logits.detach().to("cpu", dtype=self.logits_dtype).contiguous()
+                    if self.logits_dtype == torch.bfloat16:
+                        logits_bytes = logits_cpu.view(torch.int16).numpy().tobytes()
+                    else:
+                        logits_bytes = logits_cpu.numpy().tobytes()
                     if self._logits_file is None:
                         self._logits_file = open(self.logits_path, "ab")
                     self._logits_file.write(logits_bytes)
                     record["logit_offset"] = self._logits_offset
                     record["logit_bytes"] = len(logits_bytes)
                     record["logit_shape"] = list(logits_cpu.shape)
+                    record["logit_dtype"] = str(self.logits_dtype).removeprefix("torch.")
                     self._logits_offset += len(logits_bytes)
 
         self.records.append(record)
