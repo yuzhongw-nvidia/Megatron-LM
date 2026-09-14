@@ -23,6 +23,7 @@ from megatron.core.fp8_utils import get_fp8_context, is_first_last_bf16_layer
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.models.hybrid.hybrid_boundary_trace import record_hybrid_boundary
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -791,6 +792,7 @@ class AttnResHybridLayer(MegatronModule):
     ):
         super().__init__(config)
         self.inner_layer = layer
+        self.is_mtp_layer = is_mtp_layer
         self.layer_number = layer.layer_number
         self.attn_res = AttentionResidual(config, self.layer_number)
         # Hybrid entries are single sublayers: attn_res_block_layers counts
@@ -838,11 +840,17 @@ class AttnResHybridLayer(MegatronModule):
             f"sources, got {len(attn_res_sources)}; block-boundary bookkeeping is broken"
         )
 
+        decoder_layer = self.layer_number - 1
+        if not self.is_mtp_layer:
+            record_hybrid_boundary(decoder_layer, "incoming", hidden_states)
+
         # At block-start entries the incoming hidden state was just appended to
         # the depth sources by the caller, so there is no partial sum yet.
         partial = None if self.attn_res_is_block_start else hidden_states
         values = list(attn_res_sources) if partial is None else [*attn_res_sources, partial]
         aggregated = self.attn_res(values)
+        if not self.is_mtp_layer:
+            record_hybrid_boundary(decoder_layer, "aggregated", aggregated)
 
         if isinstance(self.inner_layer, TransformerLayer):
             output = self.inner_layer(
@@ -873,6 +881,8 @@ class AttnResHybridLayer(MegatronModule):
         # it back recovers exactly dropout(f(norm(h)) + bias).
         delta = output - aggregated
         new_partial = delta if partial is None else partial + delta
+        if not self.is_mtp_layer:
+            record_hybrid_boundary(decoder_layer, "new_partial", new_partial)
         nvtx_range_pop(msg="attn_res.hybrid_delta")
         return new_partial
 
