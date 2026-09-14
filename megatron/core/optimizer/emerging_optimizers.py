@@ -393,8 +393,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         """Orthogonalize every Q, gate, K, and V head independently.
 
         Split sizes may describe complete heads in the local tensor or the global fused
-        QKV tensor. For a global layout, reconstruct TP dimension 0 before splitting so
-        heads crossing rank boundaries remain complete.
+        QKV tensor. Duplicated mode reconstructs TP dimension 0 even when every local
+        head is complete, keeping the batched Newton-Schulz input TP-degree invariant.
+        Other modes reconstruct only when heads cross rank boundaries.
         """
         self._warn_distributed_qkv_fallback()
         local_split_shapes = getattr(p, "qkv_split_shapes", None)
@@ -404,7 +405,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             and local_split_shapes is not None
             and sum(local_split_shapes) == grad.shape[0]
         )
-        if use_local_layout:
+        globalize_duplicated_heads = (
+            use_local_layout
+            and self.tp_mode == "duplicated"
+            and getattr(p, "partition_dim", None) == 0
+            and tp_group is not None
+            and get_pg_size(tp_group) > 1
+        )
+        if use_local_layout and not globalize_duplicated_heads:
             qkv_split_shapes = local_split_shapes
         else:
             qkv_split_shapes = getattr(p, "qkv_split_shapes_global", None)

@@ -890,6 +890,75 @@ class TestMuonOptimizerMultiRankTP:
         assert qkv_weight.qkv_split_shapes is None
         assert qkv_weight.qkv_split_shapes_global is None
 
+    @pytest.mark.parametrize(
+        ("mode", "uses_global_head_batch"),
+        (("duplicated", True), ("blockwise", False), ("distributed", False)),
+    )
+    def test_muon_optimizer_complete_per_head_qkv_tp_mode_routing(
+        self, mode, uses_global_head_batch
+    ):
+        """Only duplicated mode rebuilds complete local heads into one global batch."""
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tp_group = pg_collection.tp
+        if tp_group.size() != 2:
+            pytest.skip("requires 2-way tensor parallel")
+
+        tp_rank = tp_group.rank()
+        local_split_shapes = [2, 2]
+        global_split_shapes = local_split_shapes * tp_group.size()
+        local_rows = sum(local_split_shapes)
+        columns = 3
+        global_grad = torch.arange(
+            sum(global_split_shapes) * columns, dtype=torch.float32, device="cuda"
+        ).view(sum(global_split_shapes), columns)
+        local_start = tp_rank * local_rows
+        local_grad = global_grad[local_start : local_start + local_rows].clone()
+
+        param = torch.nn.Parameter(torch.zeros_like(local_grad))
+        param.partition_dim = 0
+        param.is_qkv = True
+        param.qkv_split_shapes = local_split_shapes
+        param.qkv_split_shapes_global = global_split_shapes
+        param.qkv_split_heads_are_complete = True
+        optimizer = TensorParallelMuon(
+            params=[param],
+            split_qkv=True,
+            split_qkv_per_head=True,
+            is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
+            qkv_split_shapes=global_split_shapes,
+            pg_collection=pg_collection,
+            tp_mode=mode,
+        )
+
+        called_batches = []
+
+        def add_global_head_index(head_batch, tp_group=None, partition_dim=None):
+            called_batches.append((head_batch.clone(), tp_group, partition_dim))
+            head_index = torch.arange(
+                head_batch.shape[0], dtype=head_batch.dtype, device=head_batch.device
+            ).view(-1, 1, 1)
+            return head_batch + 1000 * head_index
+
+        optimizer.scaled_orthogonalize_fn = add_global_head_index
+        actual = optimizer.orthogonalize(param, local_grad)
+
+        source = global_grad if uses_global_head_batch else local_grad
+        split_shapes = global_split_shapes if uses_global_head_batch else local_split_shapes
+        expected_batch = source.view(len(split_shapes), split_shapes[0], columns)
+        head_index = torch.arange(
+            expected_batch.shape[0], dtype=expected_batch.dtype, device=expected_batch.device
+        ).view(-1, 1, 1)
+        expected = (expected_batch + 1000 * head_index).view_as(source)
+        if uses_global_head_batch:
+            expected = expected[local_start : local_start + local_rows]
+
+        assert len(called_batches) == 1
+        called_batch, called_tp_group, called_partition_dim = called_batches[0]
+        torch.testing.assert_close(called_batch, expected_batch, rtol=0, atol=0)
+        assert called_tp_group is None
+        assert called_partition_dim is None
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_muon_optimizer_per_head_split_gathers_fragmented_heads(self):
         """Per-head splitting reconstructs heads that cross TP rank boundaries."""
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
