@@ -19,7 +19,11 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import (
+    MoETransformerLayer,
+    TransformerLayer,
+    TransformerLayerSubmodules,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -62,7 +66,7 @@ class TestHybridAttentionResidualPrecision:
     def teardown_method(self):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("kind", ["attention", "mlp", "mamba"])
+    @pytest.mark.parametrize("kind", ["attention", "mlp", "moe", "mamba"])
     @pytest.mark.parametrize("position", ["block_start", "inside_block", "mtp"])
     @pytest.mark.parametrize("fused", [False, True])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -105,9 +109,8 @@ class TestHybridAttentionResidualPrecision:
                 if kind == "attention"
                 else TransformerLayerSubmodules(mlp=branch_spec, mlp_bda=get_bias_dropout_add)
             )
-            inner = TransformerLayer(
-                config, submodules, layer_number=layer_number, pg_collection=groups
-            )
+            layer_type = MoETransformerLayer if kind == "moe" else TransformerLayer
+            inner = layer_type(config, submodules, layer_number=layer_number, pg_collection=groups)
             branch = inner.self_attention if kind == "attention" else inner.mlp
         layer = AttnResHybridLayer(config, inner, is_mtp_layer=position == "mtp").cuda()
         source = torch.ones(8, 1, config.hidden_size, dtype=dtype, device="cuda")

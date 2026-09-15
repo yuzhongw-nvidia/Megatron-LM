@@ -3399,6 +3399,8 @@ class MoETransformerLayer(TransformerLayer):
         padding_mask=None,
         input_ids=None,
         packed_seq_params=None,
+        *,
+        residual_override: Tensor | None = None,
     ):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
@@ -3406,6 +3408,9 @@ class MoETransformerLayer(TransformerLayer):
         If `use_partial_cudagraphs` is True, this method stitches together the
         router, expert_compute, and postprocess calls.
         """
+
+        if residual_override is not None and self.use_partial_cudagraphs:
+            raise ValueError("AttnRes residual overrides do not support partial CUDA graphs.")
 
         if inference_context is not None:
             assert not self.use_partial_cudagraphs, (
@@ -3487,4 +3492,5 @@ class MoETransformerLayer(TransformerLayer):
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 packed_seq_params=packed_seq_params,
+                residual_override=residual_override,
             )

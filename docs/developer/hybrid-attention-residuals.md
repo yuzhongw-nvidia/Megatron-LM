@@ -14,6 +14,8 @@ entries therefore accept an explicit residual override. The TransformerLayer
 path validates that exactly one attention or MLP sublayer is active, and retains
 the normal normalization, selective recomputation, bias/dropout fusion, and
 offloading paths. Mamba entries use the same residual ownership convention.
+The MoE specialization forwards the explicit residual through its eager MLP
+path; AttnRes retains its existing rejection of partial CUDA graphs.
 Parameter names and checkpoint layouts are unchanged.
 
 The mathematical reference is Block AttnRes in
@@ -21,5 +23,5 @@ The mathematical reference is Block AttnRes in
 `tests/unit_tests/ssm/test_hybrid_attention_residual_precision.py` checks the
 wrapper against independent PyTorch aggregation and accumulation equations,
 using small branch values at Kimi-K3's hidden size. It covers FP32/BF16,
-attention/MLP/Mamba entries, fused/unfused residual addition, and block/MTP
+attention/MLP/MoE/Mamba entries, fused/unfused residual addition, and block/MTP
 positions, including source and parameter gradients.
