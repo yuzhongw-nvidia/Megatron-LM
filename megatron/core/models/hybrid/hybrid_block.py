@@ -775,15 +775,13 @@ class AttnResHybridLayer(MegatronModule):
 
         partial = None if block-start else hidden_states
         h = AttentionResidual(sources [+ partial])
-        output = inner_layer(h, ...)   # inner adds its local residual to h
-        delta = output - h             # exact sublayer contribution
-        new_partial = delta (+ partial)
+        residual = zeros_like(h) if partial is None else partial
+        new_partial = inner_layer(h, residual_override=residual, ...)
 
-    The delta reconstruction is exact because every hybrid entry computes
-    ``output = input + dropout(f(norm(input)) + bias)``, and both fused
-    residual norms and fp32 residual connections are rejected by the AttnRes
-    config validation. This mirrors HyperConnectionHybridLayer's generic inner
-    call — including the checkpoint-key nesting under ``inner_layer.``.
+    The inner entry adds its branch directly to the partial block. Recovering
+    the branch by subtracting ``h`` from an ordinary residual output loses
+    information in low precision, in both the forward and backward passes.
+    The wrapper retains the checkpoint-key nesting under ``inner_layer.``.
     """
 
     def __init__(
@@ -843,6 +841,7 @@ class AttnResHybridLayer(MegatronModule):
         partial = None if self.attn_res_is_block_start else hidden_states
         values = list(attn_res_sources) if partial is None else [*attn_res_sources, partial]
         aggregated = self.attn_res(values)
+        residual = torch.zeros_like(aggregated) if partial is None else partial
 
         if isinstance(self.inner_layer, TransformerLayer):
             output = self.inner_layer(
@@ -855,6 +854,7 @@ class AttnResHybridLayer(MegatronModule):
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 _called_from_hybrid_attn_res_wrapper=True,
+                _attn_res_residual=residual,
             )
         else:
             # Non-transformer entries (e.g. MambaLayer) accept only the common
@@ -864,17 +864,12 @@ class AttnResHybridLayer(MegatronModule):
                 attention_mask=attention_mask,
                 inference_context=None,
                 packed_seq_params=packed_seq_params,
+                residual_override=residual,
             )
         if isinstance(output, tuple):
             output = output[0]
 
-        nvtx_range_push(msg="attn_res.hybrid_delta")
-        # The inner entry added its local residual to `aggregated`; subtracting
-        # it back recovers exactly dropout(f(norm(h)) + bias).
-        delta = output - aggregated
-        new_partial = delta if partial is None else partial + delta
-        nvtx_range_pop(msg="attn_res.hybrid_delta")
-        return new_partial
+        return output
 
 
 class HybridStack(MegatronModule):
