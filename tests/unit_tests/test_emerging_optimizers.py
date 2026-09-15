@@ -2384,3 +2384,58 @@ def test_lion_optimizer_multi_layer_net():
             params_updated += 1
 
     assert params_updated > 0, "At least some parameters should be updated after optimizer step"
+
+
+@pytest.mark.parametrize("shape", [(128, 64), (64, 128)])
+@pytest.mark.parametrize("partition_dim", [0, 1])
+@pytest.mark.parametrize("precision", ["medium", "highest"])
+def test_muon_strided_tp_update_matches_global_matrix(shape, partition_dim, precision):
+    """Real NS sees the same global matrix for contiguous and interleaved TP layouts."""
+    from emerging_optimizers import utils as eopt_utils
+    from emerging_optimizers.orthogonalized_optimizers import get_muon_scale_factor
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        tp = groups.tp
+        generator = torch.Generator(device="cuda").manual_seed(7190)
+        full_grad = torch.randn(*shape, generator=generator, device="cuda")
+        sections = full_grad.chunk(2, dim=partition_dim)
+        local_grad = torch.cat(
+            [section.chunk(tp.size(), dim=partition_dim)[tp.rank()] for section in sections],
+            dim=partition_dim,
+        )
+        param = torch.nn.Parameter(torch.zeros_like(local_grad))
+        param.partition_dim = partition_dim
+        param.partition_stride = 2
+        optimizer = TensorParallelMuon(
+            [param],
+            split_qkv=False,
+            tp_mode="duplicated",
+            fp32_matmul_prec=precision,
+            num_ns_steps=5,
+            pg_collection=groups,
+        )
+        with eopt_utils.fp32_matmul_precision(precision):
+            actual = optimizer.orthogonalize(param, local_grad)
+            # The independent reference bypasses MCore's TP reconstruction and
+            # evaluates the unsharded global matrix through the upstream NS API.
+            expected_full = newton_schulz_tp(
+                full_grad,
+                steps=5,
+                coefficient_type="quintic",
+                tp_group=None,
+                partition_dim=None,
+                tp_mode="duplicated",
+            ) * get_muon_scale_factor(*shape, mode="spectral")
+        expected = torch.cat(
+            [
+                section.chunk(tp.size(), dim=partition_dim)[tp.rank()]
+                for section in expected_full.chunk(2, dim=partition_dim)
+            ],
+            dim=partition_dim,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()

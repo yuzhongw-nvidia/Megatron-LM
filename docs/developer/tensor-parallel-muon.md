@@ -39,3 +39,23 @@ implementation keeps Newton-Schulz arithmetic in FP32 for this setting, while
 `medium` casts its normalized input to BF16. This changes arithmetic precision;
 it does not change the logical TP matrix or per-head splitting domain. Training
 trajectory parity still requires an end-to-end comparison.
+
+## Interleaved TP matrix layouts
+
+A gated MLP's first projection uses `partition_stride=2`: each TP rank owns its
+local gate rows followed by its local up rows. The checkpoint/global matrix
+stores all gate rows before all up rows. Concatenating rank-local gradients in
+rank order therefore permutes the global matrix's rows.
+
+Duplicated Muon reconstructs strided parameters in global order before calling
+Newton-Schulz, then restores the local strided update. This applies to both
+partition axes. It preserves the mathematical update and avoids a TP-dependent
+GEMM reduction order; in BF16 NS, equivalent row permutations can otherwise
+produce measurably different updates even from exactly the same gradient.
+QKV layouts retain their existing projection/per-head handling. Blockwise and
+distributed modes retain their existing behavior.
+
+`test_muon_strided_tp_update_matches_global_matrix` compares real TP2 updates
+against the upstream NS API on the full global matrix for tall/wide shapes,
+both partition axes, and `medium`/`highest` arithmetic. It requires exact equality
+after restoring the corresponding local shard.

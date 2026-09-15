@@ -453,6 +453,34 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         )
         return self._restore_local_qkv_grad(gathered_grad, tp_slice)
 
+    def _orthogonalize_strided_param(self, p, grad, tp_group, partition_dim):
+        """Run duplicated NS in global order, then restore an interleaved TP shard."""
+        stride = p.partition_stride
+        if grad.size(partition_dim) % stride != 0:
+            raise ValueError(
+                f"Muon strided TP dimension {grad.size(partition_dim)} must be divisible "
+                f"by partition_stride={stride}"
+            )
+        tp_size = get_pg_size(tp_group)
+        tp_rank = get_pg_rank(tp_group)
+        shards = [torch.empty_like(grad) for _ in range(tp_size)]
+        torch.distributed.all_gather(shards, grad.contiguous(), group=tp_group)
+        # Each shard stores [gate_local, up_local] for SwiGLU (stride=2).
+        # A plain rank-order concat permutes rows of the global matrix. NS is
+        # equivariant to that permutation in exact arithmetic, but low-precision
+        # GEMM reductions differ. Reconstruct the checkpoint's global order first.
+        sections = [shard.chunk(stride, dim=partition_dim) for shard in shards]
+        full_grad = torch.cat(
+            [sections[rank][section] for section in range(stride) for rank in range(tp_size)],
+            dim=partition_dim,
+        )
+        full_update = self.scaled_orthogonalize_fn(full_grad, tp_group=None, partition_dim=None)
+        update_shards = full_update.chunk(stride * tp_size, dim=partition_dim)
+        return torch.cat(
+            [update_shards[section * tp_size + tp_rank] for section in range(stride)],
+            dim=partition_dim,
+        ).contiguous()
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
@@ -501,6 +529,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                     projection_grad, tp_group, partition_dim
                 ),
             )
+        elif (
+            self.tp_mode == "duplicated"
+            and partition_dim is not None
+            and getattr(p, "partition_stride", 1) > 1
+            and get_pg_size(tp_group) > 1
+        ):
+            grad = self._orthogonalize_strided_param(p, grad, tp_group, partition_dim)
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
