@@ -17,6 +17,22 @@ and explicit expert-communication projections keep their existing behavior.
 fused backward, which casts the completed input-gradient sum back to BF16
 before the original normalization backward.
 
+## Native vocabulary projection
+
+Hybrid models use `tensor_parallel.ColumnParallelLinear` for both the LM and
+MTP output heads even when the transformer layers use TE. This native layer
+must honor the same option: its input gradient sums over vocabulary shards.
+It uses a BF16-by-BF16 TE GEMM with FP32 output, followed by FP32 all-reduce or
+reduce-scatter and a final BF16 cast. Forward logits and weight-gradient
+accumulation, including fused/deferred accumulation, keep their existing paths.
+
+Frozen column weights are supported too. With sequence parallelism, the
+all-gather and backward reduce-scatter stay inside the custom autograd
+function so autograd cannot cast a local partial before communication.
+Projections with explicit expert communication or disabled gradient reduction
+retain their original behavior. Native row-parallel layers are outside this
+option's current scope; transformer row projections use TE.
+
 ## Supported execution
 
 - Ordinary BF16 training with Transformer Engine.
