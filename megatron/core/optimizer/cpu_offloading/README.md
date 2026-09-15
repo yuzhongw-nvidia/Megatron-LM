@@ -77,6 +77,23 @@ MCore's model-to-main, main-to-model, and MXFP8 param-buffer copy entry points r
 CPU-bound selected master asynchronously, order the current compute stream after that H2D, and then
 validate residency. This makes external reload and param-staging entry points self-healing.
 
+### Parameter synchronization ownership
+
+With compact LayerWise FP8 parameter gather, the pre-forward lifecycle restores
+Muon masters and completes their bucket gathers before starting master offload.
+A sibling `DistributedOptimizer` may then re-stage its own MXFP8 parameter buffer
+because that buffer shares storage with zeroed gradients. That staging must reset
+only DistOpt-owned dispatch state: clearing a completed LayerWise dispatch flag
+would make the next forward hook gather again from a CPU master whose asynchronous
+D2H copy may still be in flight.
+
+Explicit synchronization for evaluation or checkpointing restores offloaded
+masters through `prepare_model_params_for_param_sync()` before dispatch. FP8
+staging rejects a CPU-resident master instead of reading an unfinished copy.
+The mixed Muon/DistOpt regression compares losses, outputs, gradients, FP32 masters,
+and dequantized MXFP8 parameters against a non-offloaded run in both expert-DP
+regimes, with a bounded chunk and a full state window.
+
 Setting `optimizer_state_offload_fraction` to zero is a full disable even when the feature flag is
 present: no manager, transfer stream, training hook, or checkpoint-format restriction is installed.
 Checkpoint format and async-save restrictions are also skipped when optimizer state is explicitly
