@@ -9,7 +9,9 @@ partial to FP32 inside the collective cannot recover the lost information.
 FP32 GEMM output for these partials and keeps that dtype through all-reduce or
 reduce-scatter. The result is cast to BF16 after communication completes.
 Input/weight GEMM dtypes and weight-gradient accumulation are unchanged.
-The option is disabled by default and leaves TP1 arithmetic unchanged.
+The option is disabled by default. TE paths leave TP1 arithmetic unchanged;
+the native vocabulary projection uses the bounded accumulation described below
+at TP1 as well.
 
 `TELinear` passes this option only when TE owns the TP communication; replicated
 and explicit expert-communication projections keep their existing behavior.
@@ -22,9 +24,25 @@ before the original normalization backward.
 Hybrid models use `tensor_parallel.ColumnParallelLinear` for both the LM and
 MTP output heads even when the transformer layers use TE. This native layer
 must honor the same option: its input gradient sums over vocabulary shards.
-It uses a BF16-by-BF16 TE GEMM with FP32 output, followed by FP32 all-reduce or
+It uses BF16-by-BF16 TE GEMMs with FP32 outputs, followed by FP32 all-reduce or
 reduce-scatter and a final BF16 cast. Forward logits and weight-gradient
 accumulation, including fused/deferred accumulation, keep their existing paths.
+
+An FP32 GEMM output alone does not resolve accumulation error along a very
+large contraction dimension. In a fixed-input 163840-word projection, full
+and TP2-sharded GEMMs still differed before BF16 rounding. Native column input
+gradients therefore split the vocabulary contraction into tiles of at most
+4096 elements, and add those FP32 GEMM outputs in FP32 before communication.
+The final tile can be shorter. Operands remain BF16. This bounds the length of
+each GEMM accumulation without changing logits, weight gradients or collective
+shapes. Small contractions need only one GEMM.
+
+The same algorithm runs at TP1 when the option is enabled: keeping TP1's long
+contraction would retain its larger accumulation error. Numerical comparisons
+must rerun both variants from the same checkpoint. Fixed-size tiles reduce
+error but do not guarantee bitwise equality across arbitrary TP partitions.
+The tradeoff is extra GEMM launches, contiguous operand slices and FP32 output
+additions; this opt-in correctness path does not promise unchanged throughput.
 
 Frozen column weights are supported too. With sequence parallelism, the
 all-gather and backward reduce-scatter stay inside the custom autograd
