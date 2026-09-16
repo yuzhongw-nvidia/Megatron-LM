@@ -159,6 +159,11 @@ class KimiDeltaAttention(_GDNBase):
                     is_expert=False,
                     name=(name + ".f_a_proj") if name is not None else None,
                 )
+                # The complete-sequence projection below produces the complete replicated
+                # weight gradient on every TP rank. Do not sum it again during SP finalize.
+                self.f_a_proj.sequence_parallel = False
+                for parameter in self.f_a_proj.parameters():
+                    setattr(parameter, "sequence_parallel", False)
                 self.f_b_proj = build_module(
                     submodules.f_b_proj,
                     self.config.kda_f_lora_rank,
@@ -250,6 +255,19 @@ class KimiDeltaAttention(_GDNBase):
 
         # Pass raw g to FLA and let the KDA kernel apply A_log and dt_bias.
         self.use_gate_in_kernel = True
+
+    def _project_f_latent(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Evaluate the replicated decay down projection on the complete sequence."""
+        if self.config.sequence_parallel:
+            hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+                hidden_states, tensor_parallel_output_grad=False, group=self.pg_collection.tp
+            )
+        latent, _ = self.f_a_proj(hidden_states)
+        if self.config.sequence_parallel:
+            latent = tensor_parallel.scatter_to_sequence_parallel_region(
+                latent, group=self.pg_collection.tp
+            )
+        return latent
 
     def _setup_variant_attrs(self) -> None:
         """Set KDA dimensions, projection checkpoint metadata, and kernel callable."""
@@ -621,7 +639,7 @@ class KimiDeltaAttention(_GDNBase):
             if self.config.kda_f_lora_rank is None:
                 raw_g, _ = self.f_proj(hidden_states)
             else:
-                f_latent, _ = self.f_a_proj(hidden_states)
+                f_latent = self._project_f_latent(hidden_states)
                 raw_g, _ = self.f_b_proj(f_latent)
             raw_g, _ = a2a_cp_to_hp(
                 raw_g,
@@ -652,9 +670,7 @@ class KimiDeltaAttention(_GDNBase):
             # below, whose backward all-gathers the complete beta gradient; therefore this
             # gather's backward only splits instead of reduce-scattering duplicate gradients.
             beta_input = tensor_parallel.gather_from_sequence_parallel_region(
-                beta_input,
-                tensor_parallel_output_grad=False,
-                group=self.pg_collection.tp,
+                beta_input, tensor_parallel_output_grad=False, group=self.pg_collection.tp
             )
         beta, _ = self.beta_proj(beta_input)
         beta = tensor_parallel.scatter_to_tensor_model_parallel_region(
