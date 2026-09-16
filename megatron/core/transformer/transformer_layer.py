@@ -952,6 +952,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                     rotary_pos_emb=kwargs.get("rotary_pos_emb"),
                     sequence_len_offset=kwargs.get("sequence_len_offset"),
                     packed_seq_params=kwargs.get("packed_seq_params"),
+                    strict_runtime_validation=kwargs.get("strict_runtime_validation"),
                 )
             )
             with self.bias_dropout_add_exec_handler():

@@ -1003,7 +1003,7 @@ class FusedPreKDAFunction(torch.autograd.Function):
         return (d_qkv, d_raw_g, d_gate, d_beta, d_weight, None, None, None, None, None, None)
 
 
-def fused_streamed_pre_kda(
+def _validate_fused_streamed_pre_kda_inputs(
     qkv: Tensor,
     raw_g: Tensor,
     gate: Tensor,
@@ -1013,18 +1013,12 @@ def fused_streamed_pre_kda(
     *,
     num_heads: int,
     head_dim: int,
-    use_qk_l2norm: bool = True,
-    cu_seqlens: Optional[Tensor] = None,
-    seq_idx: Optional[Tensor] = None,
-    cp_group=None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Run streamed fused preprocessing for explicit KDA projection tensors.
-
-    ``qkv``, ``raw_g``, and ``gate`` may be independent projection outputs or
-    views into KDA's legacy fused projection. Returning one gradient per input
-    lets autograd merge the view gradients for the legacy checkpoint layout
-    without coupling the fused kernel to either projection scheme.
-    """
+    use_qk_l2norm: bool,
+    cu_seqlens: Optional[Tensor],
+    seq_idx: Optional[Tensor],
+    cp_size: int,
+) -> None:
+    """Validate the public contract for streamed fused KDA preprocessing."""
 
     if causal_conv1d_bwd_function is None:
         raise ImportError(
@@ -1043,6 +1037,7 @@ def fused_streamed_pre_kda(
         assert (
             tensor.device == qkv.device
         ), f"KDA {name} must be on {qkv.device}; got {tensor.device}."
+
     channels = num_heads * head_dim
     assert qkv.shape[-1] == 3 * channels, (
         f"KDA qkv width must be 3 * num_heads * head_dim ({3 * channels}); " f"got {qkv.shape[-1]}."
@@ -1062,11 +1057,7 @@ def fused_streamed_pre_kda(
     )
     assert conv1d_bias is None, "Conv bias is not supported by fused_streamed_pre_kda."
     assert use_qk_l2norm, "use_qk_l2norm=False is not supported by fused_streamed_pre_kda."
-    needs_backward = torch.is_grad_enabled() and any(
-        tensor.requires_grad for tensor in (qkv, raw_g, gate, beta, conv1d_weight)
-    )
 
-    cp_size = cp_group.size() if cp_group is not None else 1
     if cp_size > 1:
         if qkv.shape[1] != 1:
             raise ValueError(
@@ -1084,6 +1075,7 @@ def fused_streamed_pre_kda(
                 "fused_streamed_pre_kda derives packed seq_idx internally when "
                 "chunkwise CP is active."
             )
+
     if cu_seqlens is not None:
         assert cu_seqlens.is_cuda, (
             "Packed fused_streamed_pre_kda requires CUDA cu_seqlens; " f"got {cu_seqlens.device}."
@@ -1099,11 +1091,59 @@ def fused_streamed_pre_kda(
             "Packed THD fused_streamed_pre_kda expects batch dimension 1; "
             f"got qkv shape {tuple(qkv.shape)}."
         )
+    else:
+        assert seq_idx is None, "seq_idx requires cu_seqlens for packed THD mode."
+
+
+def fused_streamed_pre_kda(
+    qkv: Tensor,
+    raw_g: Tensor,
+    gate: Tensor,
+    beta: Tensor,
+    conv1d_weight: Tensor,
+    conv1d_bias: Optional[Tensor],
+    *,
+    num_heads: int,
+    head_dim: int,
+    use_qk_l2norm: bool = True,
+    cu_seqlens: Optional[Tensor] = None,
+    seq_idx: Optional[Tensor] = None,
+    cp_group=None,
+    strict_runtime_validation: bool = True,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Run streamed fused preprocessing for explicit KDA projection tensors.
+
+    ``qkv``, ``raw_g``, and ``gate`` may be independent projection outputs or
+    views into KDA's legacy fused projection. Returning one gradient per input
+    lets autograd merge the view gradients for the legacy checkpoint layout
+    without coupling the fused kernel to either projection scheme.
+    """
+
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if strict_runtime_validation:
+        _validate_fused_streamed_pre_kda_inputs(
+            qkv,
+            raw_g,
+            gate,
+            beta,
+            conv1d_weight,
+            conv1d_bias,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            use_qk_l2norm=use_qk_l2norm,
+            cu_seqlens=cu_seqlens,
+            seq_idx=seq_idx,
+            cp_size=cp_size,
+        )
+
+    needs_backward = torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (qkv, raw_g, gate, beta, conv1d_weight)
+    )
+
+    if cu_seqlens is not None:
         cu_seqlens = cu_seqlens.contiguous()
         if cp_size == 1 and needs_backward:
             seq_idx = _resolve_packed_seq_idx(cu_seqlens, seq_idx, qkv.shape[0])
-    else:
-        assert seq_idx is None, "seq_idx requires cu_seqlens for packed THD mode."
 
     if not needs_backward:
         query, key, value, gate_out, beta_out, raw_g_out, _, _, _, _ = _triton_pre_kda_forward(

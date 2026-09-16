@@ -1007,6 +1007,7 @@ class AttnResHybridLayer(MegatronModule):
         input_ids: Optional[Tensor] = None,
         *,
         attn_res_sources: Optional[Tuple[Tensor, ...]] = None,
+        strict_runtime_validation: Optional[bool] = None,
     ) -> Tensor:
         """Aggregate depth sources, run the inner entry, and update the partial sum."""
         if attn_res_sources is None:
@@ -1040,16 +1041,22 @@ class AttnResHybridLayer(MegatronModule):
                 input_ids=input_ids,
                 _called_from_hybrid_attn_res_wrapper=True,
                 _return_layer_delta=True,
+                strict_runtime_validation=strict_runtime_validation,
             )
         else:
             # Non-transformer entries (e.g. MambaLayer) accept only the common
             # arguments — same contract as HyperConnectionHybridLayer's inner call.
-            output = self.inner_layer(
+            inner_kwargs = dict(
                 hidden_states=aggregated,
                 attention_mask=attention_mask,
                 inference_context=None,
                 packed_seq_params=packed_seq_params,
             )
+            if strict_runtime_validation is not None and getattr(
+                self.inner_layer, "supports_strict_runtime_validation", False
+            ):
+                inner_kwargs["strict_runtime_validation"] = strict_runtime_validation
+            output = self.inner_layer(**inner_kwargs)
         if isinstance(output, tuple):
             output = output[0]
 
@@ -1651,6 +1658,7 @@ class HybridStack(MegatronModule):
                                 padding_mask=padding_mask,
                                 input_ids=input_ids,
                                 attn_res_sources=layer_attn_res_sources,
+                                strict_runtime_validation=strict_runtime_validation,
                             )
                         elif isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                             layer_kwargs = dict(
