@@ -2262,7 +2262,8 @@ def core_transformer_config_from_args(args, config_class=None):
     if use_situ_glu:
         kw_args['activation_func'] = situlu
         kw_args['gated_linear_unit'] = True
-        kw_args['use_te_activation_func'] = True
+        # Match argument_utils: selecting SiTU-GLU must not override the
+        # requested native/Transformer Engine activation backend.
         kw_args['bias_activation_fusion'] = False
     elif args.swiglu:
         kw_args['activation_func'] = F.silu
@@ -2857,6 +2858,9 @@ def _add_network_size_args(parser):
         "mamba_training_ssm_states_dtype",
         # Parsed manually as a JSON object below.
         "moe_megakernel_backend_config",
+        # defined manually in _add_network_size_args; the config field is filled
+        # by the hasattr-gated copy in core_transformer_config_from_args
+        "hybrid_layer_pattern",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
