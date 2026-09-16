@@ -9,15 +9,30 @@ partial to FP32 inside the collective cannot recover the lost information.
 FP32 GEMM output for these partials and keeps that dtype through all-reduce or
 reduce-scatter. The result is cast to BF16 after communication completes.
 Input/weight GEMM dtypes and weight-gradient accumulation are unchanged.
-The option is disabled by default. TE paths leave TP1 arithmetic unchanged;
-the native vocabulary projection uses the bounded accumulation described below
-at TP1 as well.
+The option is disabled by default. Both TE and native paths use bounded
+contractions at TP1 too, as described below. Both variants must be rerun from
+the same checkpoint when this option or its accumulation implementation changes.
 
 `TELinear` passes this option only when TE owns the TP communication; replicated
 and explicit expert-communication projections keep their existing behavior.
 `TELayerNormColumnParallelLinear` passes the same option to TE's independent
 fused backward, which casts the completed input-gradient sum back to BF16
 before the original normalization backward.
+
+## Bounded TE contractions
+
+Returning FP32 from a long BF16 GEMM does not eliminate internal contraction
+error. Fixed-input KDA and dense MLP projections still show TP-dependent errors
+before the final BF16 cast. TE row forward and column input gradients therefore
+use contraction tiles of at most 512 BF16 elements and add their FP32 outputs
+before the FP32 collective. Fused LayerNormLinear uses the same helper for its
+independent column dgrad. A shorter final tile is supported.
+
+The option applies this algorithm at TP1 as well. It preserves the BF16 operand
+and activation boundaries, FP32 communication, column forward, row dgrad, and
+weight-gradient paths. The cost is additional GEMM launches, contiguous slices
+and FP32 additions. This opt-in correctness path reduces accumulation error;
+it does not promise bitwise equality across arbitrary TP partition layouts.
 
 ## Native vocabulary projection
 
