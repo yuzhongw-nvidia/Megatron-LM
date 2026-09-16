@@ -110,3 +110,26 @@ FP8/FP4, TP communication overlap, symmetric all-reduce, or fused residual
 RMSNorm. A TE build exposing `normalization_in_fp32` on `LayerNormLinear` is
 required for fused projections. TE validates FP32 norm parameters separately
 from linear parameters; the ordinary parameter dtype checks remain active.
+
+## Router parameter-gradient accumulation
+
+FP32/FP64 router computation previously cast every local parameter-gradient
+partial back to the BF16 parameter dtype before DDP accumulation. Sequence
+parallelism changes that rounding boundary by dividing the token reduction
+between TP ranks. An FP32 DDP buffer cannot recover precision already lost
+in the returned autograd gradient.
+
+The router now honors `gradient_accumulation_fusion`: when a full FP32
+`main_grad` buffer is available, high-precision weight and bias gradients are
+added directly to that buffer. The existing DDP `grad_added_to_main_grad`
+contract prevents double accumulation; a zero dummy gradient preserves the
+autograd hook used by overlapping gradient reduction, including
+`zero_out_wgrad`. A mismatched buffer shape raises an error.
+
+Forward routing, parameter dtype, input gradients and checkpoint keys are
+unchanged. FP32 gradient buffers, and FP32 or FP64 router arithmetic, are
+required for this precision improvement. Standalone parameters without
+`main_grad`, disabled gradient accumulation fusion, and lower-precision
+buffers retain their ordinary autograd path. This removes local BF16
+parameter-gradient rounding; it does not promise bitwise equality between
+arbitrary token-reduction partitions or complete training trajectories.

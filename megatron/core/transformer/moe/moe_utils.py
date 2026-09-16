@@ -1463,6 +1463,31 @@ def apply_biased_logits(logits, std, layer_number=None):
     return RandomSTEShared.apply(logits, std, layer_number)
 
 
+def _router_gating_parameter_gradient(parameter, gradient, gradient_accumulation_fusion):
+    """Preserve high-precision router partials when an FP32 main-grad buffer exists."""
+    if not parameter.requires_grad:
+        return None
+    main_grad = getattr(parameter, "main_grad", None)
+    if (
+        gradient_accumulation_fusion
+        and main_grad is not None
+        and main_grad.dtype == torch.float32
+        and gradient.dtype in (torch.float32, torch.float64)
+    ):
+        if main_grad.shape != parameter.shape:
+            raise RuntimeError(
+                "Router gradient accumulation requires a full parameter-shaped buffer"
+            )
+        main_grad.add_(gradient)
+        if hasattr(parameter, "grad_added_to_main_grad"):
+            parameter.grad_added_to_main_grad = True
+            # MCore DDP needs a dummy autograd edge to schedule its backward hook.
+            # A zero dummy is also safe when zero_out_wgrad asks DDP to add it.
+            return torch.zeros_like(parameter)
+        return None
+    return gradient.to(parameter.dtype)
+
+
 class RouterGatingLinearFunction(torch.autograd.Function):
     """
     Autograd function for router gating linear.
@@ -1475,6 +1500,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
         router_dtype: torch.dtype,
+        gradient_accumulation_fusion: bool,
     ) -> torch.Tensor:
         """
         Forward pass of the RouterGatingLinearFunction function.
@@ -1484,14 +1510,16 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             weight (torch.Tensor): The weight tensor.
             bias (torch.Tensor): The bias tensor. Could be None.
             router_dtype (torch.dtype): The router dtype.
+            gradient_accumulation_fusion (bool): Preserve FP32 parameter-gradient partials
+                in existing FP32 main_grad buffers.
 
         Returns:
             torch.Tensor: The output tensor.
         """
         ctx.save_for_backward(inp, weight, bias)
         ctx.router_dtype = router_dtype
+        ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
         ctx.input_dtype = inp.dtype
-        ctx.weight_dtype = weight.dtype
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
@@ -1517,7 +1545,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx, grad_output: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], None, None]:
         """
         Backward pass of the RouterGatingLinearFunction function.
 
@@ -1542,18 +1570,31 @@ class RouterGatingLinearFunction(torch.autograd.Function):
                 inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
             )
             grad_input = grad_input[0].to(ctx.input_dtype)
-            grad_weight = grad_weight[0].to(ctx.weight_dtype)
+            grad_weight = grad_weight[0]
         else:
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
-            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype))
 
-        grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
+        grad_weight = _router_gating_parameter_gradient(
+            weight, grad_weight, ctx.gradient_accumulation_fusion
+        )
+        grad_bias = (
+            _router_gating_parameter_gradient(
+                bias, grad_output.sum(dim=0), ctx.gradient_accumulation_fusion
+            )
+            if bias is not None
+            else None
+        )
         grad_input = grad_input.view(*inp_shape)
-        return grad_input, grad_weight, grad_bias, None
+        return grad_input, grad_weight, grad_bias, None, None
 
 
 def router_gating_linear(
-    inp: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], router_dtype: torch.dtype
+    inp: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    router_dtype: torch.dtype,
+    gradient_accumulation_fusion: bool = False,
 ) -> torch.Tensor:
     """
     Customized linear layer for router gating.
@@ -1565,11 +1606,16 @@ def router_gating_linear(
         weight (torch.Tensor): The weight tensor.
         bias (torch.Tensor): The bias tensor. Could be None.
         router_dtype (torch.dtype): The router dtype.
+        gradient_accumulation_fusion (bool): Accumulate high-precision parameter gradients
+            directly into FP32 main_grad buffers when available. Forward and input gradients
+            are unchanged; standalone parameters retain ordinary autograd accumulation.
 
     Returns:
         torch.Tensor: The output tensor.
     """
-    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+    return RouterGatingLinearFunction.apply(
+        inp, weight, bias, router_dtype, gradient_accumulation_fusion
+    )
 
 
 def get_align_size_for_quantization(config: TransformerConfig) -> int:
