@@ -728,6 +728,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         strict_runtime_validation: Optional[bool] = None,
         *,
         inference_params: Optional[Any] = None,
+        residual_override: Optional[Tensor] = None,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -832,7 +833,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                    attention_output_with_bias, residual, self.hidden_dropout
+                    attention_output_with_bias,
+                    residual if residual_override is None else residual_override,
+                    self.hidden_dropout,
                 )
         nvtx_range_pop(suffix="self_attn_bda")
 
@@ -901,6 +904,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         called_from_hybrid_attn_res_wrapper = kwargs.pop(
             "_called_from_hybrid_attn_res_wrapper", False
         )
+        attn_res_residual = kwargs.pop("_attn_res_residual", None)
         if self.config.enable_attention_residuals and not called_from_hybrid_attn_res_wrapper:
             raise RuntimeError(
                 "TransformerLayer.forward() must not be called directly when "
@@ -908,6 +912,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "automatically by the GPT layer specs); AttnResHybridLayer drives the "
                 "wrapped layer through this path automatically for hybrid stacks."
             )
+        mlp_residual_kwargs = {}
+        if attn_res_residual is not None:
+            has_attention = not isinstance(self.self_attention, IdentityOp)
+            has_mlp = not isinstance(self.mlp, IdentityOp)
+            if (
+                not called_from_hybrid_attn_res_wrapper
+                or not isinstance(self.cross_attention, IdentityOp)
+                or has_attention == has_mlp
+            ):
+                raise ValueError(
+                    "An AttnRes residual override requires a single attention or MLP "
+                    "sublayer driven by AttnResHybridLayer."
+                )
+            # The aggregated input feeds the sublayer; only its residual-add
+            # receives the partial block. Never form and subtract input + branch.
+            if has_attention:
+                kwargs["residual_override"] = attn_res_residual
+            else:
+                mlp_residual_kwargs["residual_override"] = attn_res_residual
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -915,6 +938,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             padding_mask=kwargs.get("padding_mask", None),
             input_ids=kwargs.get("input_ids", None),
             packed_seq_params=kwargs.get("packed_seq_params", None),
+            **mlp_residual_kwargs,
         )
         return output, context
 
@@ -1107,6 +1131,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         padding_mask: Tensor | None = None,
         input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        residual_override: Optional[Tensor] = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -1132,6 +1158,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             input_ids=input_ids,
             packed_seq_params=packed_seq_params,
         )
+        if residual_override is not None:
+            residual = residual_override
 
         if (
             self.is_moe_layer
@@ -3371,6 +3399,8 @@ class MoETransformerLayer(TransformerLayer):
         padding_mask=None,
         input_ids=None,
         packed_seq_params=None,
+        *,
+        residual_override: Tensor | None = None,
     ):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
@@ -3378,6 +3408,9 @@ class MoETransformerLayer(TransformerLayer):
         If `use_partial_cudagraphs` is True, this method stitches together the
         router, expert_compute, and postprocess calls.
         """
+
+        if residual_override is not None and self.use_partial_cudagraphs:
+            raise ValueError("AttnRes residual overrides do not support partial CUDA graphs.")
 
         if inference_context is not None:
             assert not self.use_partial_cudagraphs, (
@@ -3459,4 +3492,5 @@ class MoETransformerLayer(TransformerLayer):
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 packed_seq_params=packed_seq_params,
+                residual_override=residual_override,
             )

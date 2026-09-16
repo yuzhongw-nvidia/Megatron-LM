@@ -136,15 +136,16 @@ class TestAttnResHybridMTPNativeParity:
     """Hybrid MTP source/partial semantics against an independent torch reference."""
 
     class _ResidualLinear(torch.nn.Module):
-        """Minimal hybrid entry with the same ``output = input + f(input)`` contract."""
+        """Minimal hybrid entry with an explicit residual-add input."""
 
         def __init__(self, hidden_size, layer_number):
             super().__init__()
             self.layer_number = layer_number
             self.linear = torch.nn.Linear(hidden_size, hidden_size)
 
-        def forward(self, hidden_states, **_kwargs):
-            return hidden_states + self.linear(hidden_states)
+        def forward(self, hidden_states, residual_override=None, **_kwargs):
+            residual = hidden_states if residual_override is None else residual_override
+            return residual + self.linear(hidden_states)
 
     @pytest.mark.parametrize("n_sources", [2, 5, 9])
     def test_two_entry_depth_matches_native_forward_and_backward(self, n_sources):

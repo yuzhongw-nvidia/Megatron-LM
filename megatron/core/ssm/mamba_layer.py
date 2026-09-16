@@ -123,6 +123,7 @@ class MambaLayer(GraphableMegatronModule):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        residual_override: Optional[Tensor] = None,
     ):
         """
         Perform a forward pass through the Mamba layer.
@@ -144,7 +145,9 @@ class MambaLayer(GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        residual = hidden_states
+        # Hybrid AttnRes supplies its partial block as the residual while the
+        # depth-aggregated hidden state remains the input to the mixer.
+        residual = hidden_states if residual_override is None else residual_override
         if self.config.fp32_residual_connection:
             residual = residual.float()
 

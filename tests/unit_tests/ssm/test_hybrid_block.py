@@ -1158,8 +1158,8 @@ class TestAttnResHybridBlock:
 
         Zero pseudo-queries make every aggregation the exact mean of the depth
         sources, which partition the baseline residual sum; all consumers are
-        (scale-invariant up to eps) norms, and the wrapper's delta
-        reconstruction is exact — so with a tiny eps the outputs must agree.
+        (scale-invariant up to eps) norms, and the wrapper accumulates the raw
+        sublayer branches directly. With a tiny eps the outputs must agree.
         """
         layer_type_list = validate_segment_layers(layer_pattern)
 
