@@ -45,7 +45,13 @@ from tests.unit_tests.test_utilities import Utils
 
 if HAVE_EMERGING_OPTIMIZERS:
     from emerging_optimizers.scalar_optimizers import Lion
-    from emerging_optimizers.soap import SOAP
+
+    try:
+        from emerging_optimizers.soap import SOAP
+    except ModuleNotFoundError as error:
+        if error.name != 'emerging_optimizers.soap':
+            raise
+        from emerging_optimizers.legacy_soap import SOAP
 else:
     SOAP = None
     Lion = None
@@ -1276,6 +1282,8 @@ def test_muon_optimizer_uniform_per_head_splits_use_batched_ns():
 )
 def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
     """The pinned Emerging-Optimizers 3D Newton-Schulz path matches 2D head calls."""
+    from emerging_optimizers import utils as eopt_utils
+
     torch.manual_seed(42)
     grad = torch.randn(8, 16, dtype=torch.float32, device='cuda')
     param = torch.nn.Parameter(torch.zeros_like(grad))
@@ -1292,11 +1300,8 @@ def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
         pg_collection=None,
     )
 
-    # orthogonalize() does not apply fp32_matmul_prec (step() does), and TF32 lets the
-    # batched and 2D GEMM kernels round differently, so pin full FP32 precision here.
-    prev_precision = torch.get_float32_matmul_precision()
-    torch.set_float32_matmul_precision("highest")
-    try:
+    # OrthogonalizedOptimizer.step() applies this context around orthogonalize().
+    with eopt_utils.fp32_matmul_precision(optimizer.fp32_matmul_prec):
         actual = optimizer.orthogonalize(param, grad)
         expected = torch.cat(
             [
@@ -1304,8 +1309,6 @@ def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
                 for head in torch.split(grad, [2] * 4)
             ]
         )
-    finally:
-        torch.set_float32_matmul_precision(prev_precision)
     torch.testing.assert_close(actual, expected)
 
 
