@@ -6,7 +6,7 @@ import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Tuple, Union
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
@@ -21,6 +21,12 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.attention_residual import (
+    AttentionResidual,
+    attn_res_final_num_sources,
+    attn_res_num_sources,
+    is_attn_res_block_start,
+)
 from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup, make_weakref
 from megatron.core.transformer.enums import (
     AttnMaskType,
@@ -878,6 +884,23 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "wrapped TransformerLayer through this path automatically for hybrid "
                 "stacks."
             )
+        called_from_hybrid_attn_res_wrapper = kwargs.pop(
+            "_called_from_hybrid_attn_res_wrapper", False
+        )
+        return_layer_delta = kwargs.pop("_return_layer_delta", False)
+        if self.config.enable_attention_residuals and not called_from_hybrid_attn_res_wrapper:
+            raise RuntimeError(
+                "TransformerLayer.forward() must not be called directly when "
+                "enable_attention_residuals=True. Use AttnResTransformerLayer (selected "
+                "automatically by the GPT layer specs); AttnResHybridLayer drives the "
+                "wrapped layer through this path automatically for hybrid stacks."
+            )
+        if return_layer_delta:
+            if not called_from_hybrid_attn_res_wrapper:
+                raise RuntimeError(
+                    "Layer deltas are only supported for the hybrid AttnRes wrapper."
+                )
+            return self._forward_hybrid_attn_res_delta(*args, **kwargs)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -887,6 +910,49 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             packed_seq_params=kwargs.get("packed_seq_params", None),
         )
         return output, context
+
+    def _forward_hybrid_attn_res_delta(self, hidden_states: Tensor, **kwargs):
+        """Return a split hybrid entry's contribution without rounding a local residual.
+
+        This is dispatched from ``forward``, not called by the wrapper directly:
+        normal module hooks (in particular parameter all-gather hooks) must run.
+        Adding a scalar zero through the entry's BDA preserves its bias/dropout
+        implementation without the lossy BF16 ``(input + branch) - input`` round trip.
+        """
+        has_attention = not isinstance(self.self_attention, IdentityOp)
+        has_mlp = not isinstance(self.mlp, IdentityOp)
+        if has_attention == has_mlp or not isinstance(self.cross_attention, IdentityOp):
+            raise ValueError(
+                "Hybrid AttnRes requires exactly one attention or MLP branch per entry."
+            )
+        if kwargs.get("inference_context") is not None:
+            raise NotImplementedError("Attention residuals do not support inference yet.")
+
+        if has_attention:
+            output_with_bias, norm_manager, norm_input = (
+                self._forward_self_attention_output_with_bias(
+                    hidden_states,
+                    attention_mask=kwargs.get("attention_mask"),
+                    rotary_pos_emb=kwargs.get("rotary_pos_emb"),
+                    sequence_len_offset=kwargs.get("sequence_len_offset"),
+                    packed_seq_params=kwargs.get("packed_seq_params"),
+                )
+            )
+            with self.bias_dropout_add_exec_handler():
+                delta = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                    output_with_bias, output_with_bias[0].new_zeros(()), self.hidden_dropout
+                )
+            delta = norm_manager.group_offload(delta, forced_released_tensors=[norm_input])
+            return delta, kwargs.get("context")
+
+        output_with_bias, residual = self._forward_mlp_output_with_bias(
+            hidden_states,
+            padding_mask=kwargs.get("padding_mask"),
+            input_ids=kwargs.get("input_ids"),
+            packed_seq_params=kwargs.get("packed_seq_params"),
+        )
+        delta = self._forward_post_mlp(output_with_bias, residual, _return_layer_delta=True)
+        return delta, kwargs.get("context")
 
     def _forward_pre_mlp_layernorm(
         self, hidden_states: Tensor, mhc_recompute_manager: Optional['MHCCheckpointManager'] = None
@@ -1122,7 +1188,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             return self._forward_post_mlp(mlp_output_with_bias, residual)
 
     def _forward_post_mlp(
-        self, mlp_output_with_bias: tuple[Tensor, Tensor | None], residual: Tensor
+        self,
+        mlp_output_with_bias: tuple[Tensor, Tensor | None],
+        residual: Tensor,
+        *,
+        _return_layer_delta: bool = False,
     ) -> Tensor:
         """
         Perform operations after the MLP computation.
@@ -1130,6 +1200,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Args:
             mlp_output_with_bias (Tensor): Output tensor of the MLP layer with bias.
             residual (Tensor): Residual tensor.
+            _return_layer_delta (bool): Internal split-hybrid mode: omit the residual
+                addition while retaining norm ownership and recompute hooks.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -1157,7 +1229,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         else:
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                    mlp_output_with_bias, residual, self.hidden_dropout
+                    mlp_output_with_bias,
+                    residual.new_zeros(()) if _return_layer_delta else residual,
+                    self.hidden_dropout,
                 )
         nvtx_range_pop(suffix="mlp_bda")
         # Delay the offload of the mlp norm until after the mlp_bda has been computed
@@ -3010,6 +3084,212 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 mhc_recompute_manager=getattr(self, '_mhc_recompute_manager', None),
             )
         return output, context
+
+
+class AttnResTransformerLayer(TransformerLayer):
+    """A transformer layer with Attention Residuals (AttnRes, arXiv:2603.15031).
+
+    Extends TransformerLayer by replacing the residual capture of both sublayers
+    with a per-token softmax attention over depth sources. The hidden state
+    carried between layers is the intra-block partial sum; the depth-source
+    list is owned by the enclosing TransformerBlock (or MTP layer) and passed
+    per call as the ``attn_res_sources`` keyword (a tuple whose arity is a
+    static per-layer constant).
+
+    For each sublayer::
+
+        h = AttentionResidual(sources [+ partial])   # softmax over depth, fp32
+        out = sublayer(norm(h))
+        partial = partial + dropout(out)             # BDA; plain dropout at block starts
+
+    Cross-attention is not supported. Training-only for now: inference contexts
+    are rejected at the top of ``forward``.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: TransformerLayerSubmodules,
+        layer_number: int = 1,
+        hidden_dropout: Optional[float] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        vp_stage: Optional[int] = None,
+        pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
+        name: str | None = None,
+    ):
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            hidden_dropout=hidden_dropout,
+            pg_collection=pg_collection,
+            vp_stage=vp_stage,
+            pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
+            name=name,
+        )
+
+        assert isinstance(
+            self.cross_attention, IdentityOp
+        ), "AttnResTransformerLayer does not support cross-attention."
+
+        block_layers = self.config.attn_res_block_layers
+        if is_mtp_layer:
+            # MTP layers attend over the completed trunk history (all sources
+            # plus the trailing partial block) and never open a new block; their
+            # own input (eh_proj output) is the fresh partial sum.
+            self.attn_res_is_block_start = False
+            self.attn_res_num_sources = attn_res_final_num_sources(
+                self.config.num_layers, block_layers
+            )
+        else:
+            self.attn_res_is_block_start = is_attn_res_block_start(self.layer_number, block_layers)
+            self.attn_res_num_sources = attn_res_num_sources(self.layer_number, block_layers)
+
+        self.self_attention_attn_res = AttentionResidual(self.config, self.layer_number)
+        self.mlp_attn_res = AttentionResidual(self.config, self.layer_number)
+
+    def forward(self, *args, **kwargs):
+        """Forward pass threading the depth-source tuple into both sublayers."""
+        kwargs.pop("dynamic_inference_decode_only", None)
+        attn_res_sources = kwargs.pop("attn_res_sources", None)
+        if attn_res_sources is None:
+            raise RuntimeError(
+                "AttnResTransformerLayer requires the attn_res_sources keyword; it is "
+                "provided by TransformerBlock / MultiTokenPredictionLayer. An execution "
+                "path that does not thread it (e.g. full recompute, the fine-grained "
+                "EP-overlap schedule, or inference) cannot run attention residuals."
+            )
+        if (
+            kwargs.get("inference_context") is not None
+            or kwargs.get("inference_params") is not None
+        ):
+            raise NotImplementedError("Attention residuals do not support inference yet.")
+        assert len(attn_res_sources) == self.attn_res_num_sources, (
+            f"layer {self.layer_number}: expected {self.attn_res_num_sources} depth "
+            f"sources, got {len(attn_res_sources)}; block-boundary bookkeeping is broken"
+        )
+
+        hidden_states, context = self._forward_attention(
+            *args, attn_res_sources=attn_res_sources, **kwargs
+        )
+        output = self._forward_mlp(
+            hidden_states,
+            kwargs.get("inference_context", None),
+            padding_mask=kwargs.get("padding_mask", None),
+            input_ids=kwargs.get("input_ids", None),
+            packed_seq_params=kwargs.get("packed_seq_params", None),
+            attn_res_sources=attn_res_sources,
+        )
+        return output, context
+
+    def _forward_attention(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        rotary_pos_cos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
+        *,
+        attn_res_sources: Tuple[Tensor, ...] = (),
+        inference_params: Optional[Any] = None,
+    ):
+        """Attention sublayer with AttnRes residual handling.
+
+        At block-start layers the incoming hidden state was just appended to the
+        depth sources by the caller, so there is no partial sum: the sublayer
+        output starts a new one (plain bias + dropout, no residual add).
+        """
+        # At non-block-start layers the incoming hidden state IS the partial sum.
+        partial = None if self.attn_res_is_block_start else hidden_states
+        values = list(attn_res_sources) if partial is None else [*attn_res_sources, partial]
+
+        nvtx_range_push(suffix="self_attention_attn_res")
+        aggregated = self.self_attention_attn_res(values)
+        nvtx_range_pop(suffix="self_attention_attn_res")
+
+        attention_output_with_bias, attn_norm_manager, _ = (
+            self._forward_self_attention_output_with_bias(
+                aggregated,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                inference_context=None,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
+        )
+
+        nvtx_range_push(suffix="self_attn_bda")
+        with self.bias_dropout_add_exec_handler():
+            if partial is None:
+                # First sublayer of a depth block: no residual add. Keep the
+                # partial sum in the residual-stream dtype so the payload cat /
+                # downstream BDAs never get silently promoted.
+                attention_output, attention_bias_out = attention_output_with_bias
+                if attention_bias_out is not None:
+                    attention_output = attention_output + attention_bias_out
+                hidden_states = torch.nn.functional.dropout(
+                    attention_output, p=self.hidden_dropout, training=self.training
+                ).to(values[0].dtype)
+            else:
+                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                    attention_output_with_bias, partial, self.hidden_dropout
+                )
+        nvtx_range_pop(suffix="self_attn_bda")
+
+        hidden_states = attn_norm_manager.group_offload(
+            hidden_states, forced_released_tensors=[aggregated]
+        )
+
+        return hidden_states, context
+
+    def _forward_mlp(
+        self,
+        hidden_states: Tensor,
+        inference_context: Optional[BaseInferenceContext] = None,
+        padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        attn_res_sources: Tuple[Tensor, ...] = (),
+    ):
+        """MLP sublayer with AttnRes residual handling.
+
+        The incoming hidden state is always the (non-empty) partial sum here:
+        block boundaries only fall on attention sublayers.
+        """
+        partial = hidden_states
+        values = [*attn_res_sources, partial]
+
+        nvtx_range_push(suffix="mlp_attn_res")
+        aggregated = self.mlp_attn_res(values)
+        nvtx_range_pop(suffix="mlp_attn_res")
+
+        # The helper captures its own residual from the aggregated input; it is
+        # discarded — the BDA residual is the partial sum.
+        mlp_output_with_bias, _ = self._forward_mlp_output_with_bias(
+            aggregated,
+            inference_context=inference_context,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
+        )
+
+        return self._forward_post_mlp(mlp_output_with_bias, partial)
 
 
 class MoETransformerLayer(TransformerLayer):
