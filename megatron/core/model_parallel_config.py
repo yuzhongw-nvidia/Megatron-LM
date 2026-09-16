@@ -264,7 +264,8 @@ class ModelParallelConfig:
 
     tp_reduce_in_fp32: bool = False
     """Keep TE row-forward and TE/native column-input-gradient partials in FP32 until
-    the TP sum completes, then cast back to BF16. Requires TE's matching opt-in interface;
+    the TP sum completes, then cast back to BF16. TE and native paths also use bounded
+    FP32 contraction tiles at TP1. Requires TE's matching opt-in interface;
     quantization and communication overlap are not supported by this path.
     """
 

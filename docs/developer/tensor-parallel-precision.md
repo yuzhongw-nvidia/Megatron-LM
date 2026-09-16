@@ -9,7 +9,9 @@ partial to FP32 inside the collective cannot recover the lost information.
 FP32 GEMM output for these partials and keeps that dtype through all-reduce or
 reduce-scatter. The result is cast to BF16 after communication completes.
 Input/weight GEMM dtypes and weight-gradient accumulation are unchanged.
-The option is disabled by default and leaves TP1 arithmetic unchanged.
+The option is disabled by default. Both TE and native paths use bounded
+contractions at TP1 too, as described below. Both variants must be rerun from
+the same checkpoint when this option or its accumulation implementation changes.
 
 `TELinear` passes this option only when TE owns the TP communication; replicated
 and explicit expert-communication projections keep their existing behavior.
@@ -17,14 +19,45 @@ and explicit expert-communication projections keep their existing behavior.
 fused backward, which casts the completed input-gradient sum back to BF16
 before the original normalization backward.
 
+## Bounded TE contractions
+
+Returning FP32 from a long BF16 GEMM does not eliminate internal contraction
+error. Fixed-input KDA and dense MLP projections still show TP-dependent errors
+before the final BF16 cast. TE row forward and column input gradients therefore
+use contraction tiles of at most 512 BF16 elements and add their FP32 outputs
+before the FP32 collective. Fused LayerNormLinear uses the same helper for its
+independent column dgrad. A shorter final tile is supported.
+
+The option applies this algorithm at TP1 as well. It preserves the BF16 operand
+and activation boundaries, FP32 communication, column forward, row dgrad, and
+weight-gradient paths. The cost is additional GEMM launches, contiguous slices
+and FP32 additions. This opt-in correctness path reduces accumulation error;
+it does not promise bitwise equality across arbitrary TP partition layouts.
+
 ## Native vocabulary projection
 
 Hybrid models use `tensor_parallel.ColumnParallelLinear` for both the LM and
 MTP output heads even when the transformer layers use TE. This native layer
 must honor the same option: its input gradient sums over vocabulary shards.
-It uses a BF16-by-BF16 TE GEMM with FP32 output, followed by FP32 all-reduce or
+It uses BF16-by-BF16 TE GEMMs with FP32 outputs, followed by FP32 all-reduce or
 reduce-scatter and a final BF16 cast. Forward logits and weight-gradient
 accumulation, including fused/deferred accumulation, keep their existing paths.
+
+An FP32 GEMM output alone does not resolve accumulation error along a very
+large contraction dimension. In a fixed-input 163840-word projection, full
+and TP2-sharded GEMMs still differed before BF16 rounding. Native column input
+gradients therefore split the vocabulary contraction into tiles of at most
+4096 elements, and add those FP32 GEMM outputs in FP32 before communication.
+The final tile can be shorter. Operands remain BF16. This bounds the length of
+each GEMM accumulation without changing logits, weight gradients or collective
+shapes. Small contractions need only one GEMM.
+
+The same algorithm runs at TP1 when the option is enabled: keeping TP1's long
+contraction would retain its larger accumulation error. Numerical comparisons
+must rerun both variants from the same checkpoint. Fixed-size tiles reduce
+error but do not guarantee bitwise equality across arbitrary TP partitions.
+The tradeoff is extra GEMM launches, contiguous operand slices and FP32 output
+additions; this opt-in correctness path does not promise unchanged throughput.
 
 Frozen column weights are supported too. With sequence parallelism, the
 all-gather and backward reduce-scatter stay inside the custom autograd

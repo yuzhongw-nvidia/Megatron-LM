@@ -359,7 +359,13 @@ class VocabParallelEmbedding(torch.nn.Module):
 
 
 def _linear_dgrad_in_fp32(grad_output, weight):
-    """Keep BF16 GEMM operands and emit the unrounded TP partial sum in FP32."""
+    """Accumulate bounded BF16 contractions in FP32 before the TP sum.
+
+    An FP32 output alone does not bound a long GEMM's accumulation error.
+    Vocabulary projections can contract hundreds of thousands of terms; use
+    the same maximum K tile at TP1 and TP>1 to limit that error before BF16
+    rounding. The small-contraction path remains a single GEMM.
+    """
     if grad_output.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         raise ValueError("tp_reduce_in_fp32 requires ordinary BF16 inputs and weights")
     # Deferred import avoids the TE extension -> tensor_parallel.layers cycle.
@@ -368,9 +374,20 @@ def _linear_dgrad_in_fp32(grad_output, weight):
     if te_general_gemm is None:
         raise RuntimeError("tp_reduce_in_fp32 requires Transformer Engine general_gemm")
     grad_output_2d = grad_output.reshape(-1, grad_output.size(-1)).contiguous()
-    grad_input, *_ = te_general_gemm(
-        weight, grad_output_2d, out_dtype=torch.float32, layout="NN", grad=True
+    block_size = 4096
+    grad_input = torch.zeros(
+        grad_output_2d.size(0), weight.size(1), device=grad_output.device, dtype=torch.float32
     )
+    for start in range(0, weight.size(0), block_size):
+        stop = min(start + block_size, weight.size(0))
+        partial, *_ = te_general_gemm(
+            weight[start:stop].contiguous(),
+            grad_output_2d[:, start:stop].contiguous(),
+            out_dtype=torch.float32,
+            layout="NN",
+            grad=True,
+        )
+        grad_input.add_(partial)
     return grad_input.view(*grad_output.shape[:-1], weight.size(1))
 
 
@@ -472,7 +489,7 @@ def linear_with_frozen_weight(
 
     tp_reduce_in_fp32 (bool optional): Keep BF16 GEMM input-gradient partials
         in FP32 through TP communication, then cast the result to BF16.
-        Disabled by default; TP1 arithmetic is unchanged.
+        Disabled by default. Also bounds the local contraction length at TP1.
 
     allreduce_dgrad (bool, required): Do the allreduce of input gradients.
         Here, async and sync allreduce are the same. If sequence_parallel is
@@ -503,8 +520,8 @@ def linear_with_frozen_weight(
     )
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
-    fp32_reduce = (
-        tp_reduce_in_fp32 and tp_group.size() > 1 and (allreduce_dgrad or sequence_parallel)
+    fp32_reduce = tp_reduce_in_fp32 and (
+        tp_group.size() == 1 or allreduce_dgrad or sequence_parallel
     )
     if fp32_reduce and sequence_parallel:
         assert not allreduce_dgrad
@@ -559,8 +576,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         ctx.wgrad_deferral_limit = wgrad_deferral_limit
         ctx.grad_output_buffer = grad_output_buffer
         ctx.tp_group = tp_group
-        ctx.tp_reduce_in_fp32 = (
-            tp_reduce_in_fp32 and tp_group.size() > 1 and (allreduce_dgrad or sequence_parallel)
+        ctx.tp_reduce_in_fp32 = tp_reduce_in_fp32 and (
+            tp_group.size() == 1 or allreduce_dgrad or sequence_parallel
         )
 
         if sequence_parallel:
@@ -806,7 +823,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
 
         tp_reduce_in_fp32 (bool optional): Keep BF16 GEMM input-gradient partials
             in FP32 through TP communication, then cast the result to BF16.
-            Disabled by default; TP1 arithmetic is unchanged.
+            Disabled by default. Also bounds the local contraction length at TP1.
 
         allreduce_dgrad (bool required): Do the allreduce of input gradients.
             The allreduce is done asynchronously with the computation of weight
