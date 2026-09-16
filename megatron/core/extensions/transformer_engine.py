@@ -367,6 +367,18 @@ def _get_should_context_be_quantized_params(
         )
 
 
+def _get_tp_reduce_precision_kwargs(config: TransformerConfig, module_class):
+    """Require the explicit TE API when FP32 tensor-parallel sums are requested."""
+    if not config.tp_reduce_in_fp32:
+        return {}
+    if "tp_reduce_in_fp32" not in inspect.signature(module_class.__init__).parameters:
+        raise RuntimeError(
+            "tp_reduce_in_fp32 requires a Transformer Engine build exposing "
+            "the tp_reduce_in_fp32 Linear/LayerNormLinear argument"
+        )
+    return {"tp_reduce_in_fp32": True}
+
+
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {"params_dtype": config.params_dtype}
 
@@ -903,6 +915,9 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group_for_te = None
 
+        if te_parallel_mode is not None:
+            extra_kwargs.update(_get_tp_reduce_precision_kwargs(config, te.pytorch.Linear))
+
         self.te_quant_params: Optional[TEQuantizationParams] = None
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
@@ -1202,6 +1217,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
         extra_kwargs = _get_extra_te_kwargs(config)
+        extra_kwargs.update(_get_tp_reduce_precision_kwargs(config, te.pytorch.LayerNormLinear))
         self.tp_size = get_pg_size(tp_group)
         self.tp_rank = get_pg_rank(tp_group)
 

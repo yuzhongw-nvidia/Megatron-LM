@@ -358,6 +358,22 @@ class VocabParallelEmbedding(torch.nn.Module):
         }
 
 
+def _linear_dgrad_in_fp32(grad_output, weight):
+    """Keep BF16 GEMM operands and emit the unrounded TP partial sum in FP32."""
+    if grad_output.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        raise ValueError("tp_reduce_in_fp32 requires ordinary BF16 inputs and weights")
+    # Deferred import avoids the TE extension -> tensor_parallel.layers cycle.
+    from megatron.core.extensions.transformer_engine import te_general_gemm
+
+    if te_general_gemm is None:
+        raise RuntimeError("tp_reduce_in_fp32 requires Transformer Engine general_gemm")
+    grad_output_2d = grad_output.reshape(-1, grad_output.size(-1)).contiguous()
+    grad_input, *_ = te_general_gemm(
+        weight, grad_output_2d, out_dtype=torch.float32, layout="NN", grad=True
+    )
+    return grad_input.view(*grad_output.shape[:-1], weight.size(1))
+
+
 class LinearWithFrozenWeight(torch.autograd.Function):
     """Linear operator that does not calculate gradient for weight.
     This op and LinearWithGradAccumulationAndAsyncCommunication performs
@@ -369,12 +385,25 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
     @staticmethod
     @custom_fwd
-    def forward(ctx, input, weight, bias, allreduce_dgrad, tp_group):
+    def forward(
+        ctx, input, weight, bias, allreduce_dgrad, tp_group, tp_reduce_in_fp32, sequence_parallel
+    ):
         """Forward with frozen weight."""
         ctx.save_for_backward(weight)
         ctx.allreduce_dgrad = allreduce_dgrad
         ctx.tp_group = tp_group
-        output = torch.matmul(input, weight.t())
+        ctx.tp_reduce_in_fp32 = tp_reduce_in_fp32
+        ctx.sequence_parallel = sequence_parallel
+        ctx.input_shape = input.shape
+        ctx.input_dtype = input.dtype
+        if sequence_parallel:
+            dim_size = list(input.shape)
+            dim_size[0] *= tp_group.size()
+            total_input = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
+            dist_all_gather_func(total_input, input, group=tp_group)
+        else:
+            total_input = input
+        output = torch.matmul(total_input, weight.t())
         if bias is not None:
             output = output + bias
         return output
@@ -384,7 +413,9 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
-        if grad_output.dim() > 2:
+        if ctx.tp_reduce_in_fp32:
+            grad_input = _linear_dgrad_in_fp32(grad_output, weight)
+        elif grad_output.dim() > 2:
             # Work around PyTorch matmul not folding some size-1 leading dims to mm.
             # Remove this once https://github.com/pytorch/pytorch/issues/186148 is fixed.
             grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
@@ -397,7 +428,16 @@ class LinearWithFrozenWeight(torch.autograd.Function):
             # All-reduce. Note: here async and sync are effectively the same.
             torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
 
-        return grad_input, None, None, None, None
+        if ctx.sequence_parallel:
+            sub_grad_input = torch.empty(
+                ctx.input_shape, dtype=grad_input.dtype, device=grad_input.device
+            )
+            dist_reduce_scatter_func(sub_grad_input, grad_input, group=ctx.tp_group)
+            grad_input = sub_grad_input
+        if ctx.tp_reduce_in_fp32:
+            grad_input = grad_input.to(ctx.input_dtype)
+
+        return grad_input, None, None, None, None, None, None
 
 
 def linear_with_frozen_weight(
@@ -410,6 +450,7 @@ def linear_with_frozen_weight(
     tp_group: Optional[torch.distributed.ProcessGroup],
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: None = None,
+    tp_reduce_in_fp32: bool = False,
 ) -> torch.Tensor:
     """Linear layer execution with weight.requires_grad == False.
 
@@ -428,6 +469,10 @@ def linear_with_frozen_weight(
 
     gradient_accumulation_fusion (bool required): dummy argument, used to
     keep the API unified between all forward implementation functions.
+
+    tp_reduce_in_fp32 (bool optional): Keep BF16 GEMM input-gradient partials
+        in FP32 through TP communication, then cast the result to BF16.
+        Disabled by default; TP1 arithmetic is unchanged.
 
     allreduce_dgrad (bool, required): Do the allreduce of input gradients.
         Here, async and sync allreduce are the same. If sequence_parallel is
@@ -458,6 +503,14 @@ def linear_with_frozen_weight(
     )
 
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+    fp32_reduce = (
+        tp_reduce_in_fp32 and tp_group.size() > 1 and (allreduce_dgrad or sequence_parallel)
+    )
+    if fp32_reduce and sequence_parallel:
+        assert not allreduce_dgrad
+        # Keep the collective inside the Function: returning a BF16 gradient
+        # through an external all-gather would round before its reduce-scatter.
+        return LinearWithFrozenWeight.apply(input, weight, bias, False, tp_group, True, True)
 
     if sequence_parallel:
         input = gather_from_sequence_parallel_region(
@@ -466,7 +519,7 @@ def linear_with_frozen_weight(
     else:
         input = input
 
-    args = [input, weight, bias, allreduce_dgrad, tp_group]
+    args = [input, weight, bias, allreduce_dgrad, tp_group, fp32_reduce, False]
 
     return LinearWithFrozenWeight.apply(*args)
 
@@ -487,6 +540,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         grad_output_buffer,
         wgrad_deferral_limit,
         tp_group,
+        tp_reduce_in_fp32,
     ):
         """Forward."""
         if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
@@ -505,6 +559,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         ctx.wgrad_deferral_limit = wgrad_deferral_limit
         ctx.grad_output_buffer = grad_output_buffer
         ctx.tp_group = tp_group
+        ctx.tp_reduce_in_fp32 = (
+            tp_reduce_in_fp32 and tp_group.size() > 1 and (allreduce_dgrad or sequence_parallel)
+        )
 
         if sequence_parallel:
             dim_size = list(input.size())
@@ -559,7 +616,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 total_input = all_gather_buffer
             else:
                 total_input = input
-        grad_input = grad_output.matmul(weight)
+        if ctx.tp_reduce_in_fp32:
+            grad_input = _linear_dgrad_in_fp32(grad_output, weight)
+        else:
+            grad_input = grad_output.matmul(weight)
 
         if ctx.sequence_parallel and wgrad_compute:
             # pylint: disable=possibly-used-before-assignment
@@ -580,7 +640,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             assert not ctx.allreduce_dgrad
             dim_size = list(input.size())
             sub_grad_input = torch.empty(
-                dim_size, dtype=input.dtype, device=torch.cuda.current_device(), requires_grad=False
+                dim_size,
+                dtype=grad_input.dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=False,
             )
             # reduce_scatter
             handle = dist_reduce_scatter_func(
@@ -665,12 +728,27 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             handle.wait()
             # Need to return None's as gradient has to flow for all the input arguments
             # provided during forward
-            return (sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None)
+            if ctx.tp_reduce_in_fp32:
+                sub_grad_input = sub_grad_input.to(input.dtype)
+            return (
+                sub_grad_input,
+                grad_weight,
+                grad_bias,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
 
         if ctx.allreduce_dgrad:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
+        if ctx.tp_reduce_in_fp32:
+            grad_input = grad_input.to(input.dtype)
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None
 
 
 def linear_with_grad_accumulation_and_async_allreduce(
@@ -683,6 +761,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_reduce_in_fp32: bool = False,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -725,6 +804,10 @@ def linear_with_grad_accumulation_and_async_allreduce(
             " Note that the extension requires CUDA>=11. Otherwise, you
             must turn off gradient accumulation fusion."
 
+        tp_reduce_in_fp32 (bool optional): Keep BF16 GEMM input-gradient partials
+            in FP32 through TP communication, then cast the result to BF16.
+            Disabled by default; TP1 arithmetic is unchanged.
+
         allreduce_dgrad (bool required): Do the allreduce of input gradients.
             The allreduce is done asynchronously with the computation of weight
             gradients. If sequence_parallel is True, this must be
@@ -759,6 +842,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
         grad_output_buffer,
         wgrad_deferral_limit,
         tp_group,
+        tp_reduce_in_fp32,
     ]
 
     if not linear_with_grad_accumulation_and_async_allreduce.warned:
@@ -1085,6 +1169,11 @@ class ColumnParallelLinear(torch.nn.Module):
                 else None
             ),
             tp_group=self.tp_group,
+            tp_reduce_in_fp32=(
+                self.config.tp_reduce_in_fp32
+                and not self.explicit_expert_comm
+                and not self.disable_grad_reduce
+            ),
         )
 
         gather_output = self.gather_output

@@ -1784,6 +1784,18 @@ class TransformerConfig(ModelParallelConfig):
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
             )
 
+        if self.tp_reduce_in_fp32:
+            if not self.bf16 or self.fp8 or self.fp4:
+                raise ValueError("tp_reduce_in_fp32 requires ordinary BF16 training")
+            if self.transformer_impl != "transformer_engine":
+                raise ValueError("tp_reduce_in_fp32 requires transformer_impl='transformer_engine'")
+            if self.tp_comm_overlap or self.symmetric_ar_type is not None:
+                raise ValueError("tp_reduce_in_fp32 does not support TP communication overlap")
+            if self.num_moe_experts is not None and self.expert_tensor_parallel_size != 1:
+                raise ValueError(
+                    "tp_reduce_in_fp32 currently requires expert_tensor_parallel_size=1"
+                )
+
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
