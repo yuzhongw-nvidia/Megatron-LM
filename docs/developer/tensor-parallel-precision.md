@@ -48,3 +48,32 @@ rewriting or process-global function patching is used by this implementation.
 This reduces one source of TP-dependent rounding; it does not promise bitwise
 training equality. KDA's complete-sequence decay projection has a separate
 contract described in `kda-tensor-parallel-projections.md`.
+
+## FP32 normalization parameters and gradients
+
+`TransformerConfig.normalization_in_fp32` (CLI `--normalization-in-fp32`)
+addresses a separate rounding boundary: TE returns norm parameter gradients in
+the parameter dtype. A BF16 norm rounds each local sequence/head-shard partial
+before MCore accumulates gradients or reduces sequence-parallel parameters.
+FP32 DDP gradient buffers cannot recover that lost precision.
+
+When enabled, `TENorm` allocates gamma/beta in FP32 and evaluates normalization
+in FP32, then casts the output to the input activation dtype. Native AMP is
+disabled inside this norm only. Fused `TELayerNormColumnParallelLinear` and
+`TERMSNormDuplicatedLinear` request the corresponding explicit TE API: norm
+arithmetic and gamma/beta gradients remain FP32, while the linear activation
+boundary and linear weights retain their BF16 paths. The completed linear
+input gradient is BF16 before conversion to FP32 for norm backward.
+
+Norm parameters use `mark_keep_in_fp32` so `Float16Module` preserves their
+dtype. Parameter names, checkpoint keys, and sequence-parallel metadata remain
+unchanged. Existing BF16 checkpoint values load into FP32 norm parameters.
+This option is disabled by default. Enabling it changes norm arithmetic and
+parameter updates at TP1 too, so numerical comparisons must rerun both TP1 and
+TP2 from the same checkpoint. It does not promise bitwise training equality.
+
+Supported norms are LayerNorm and RMSNorm in ordinary BF16 TE training, without
+FP8/FP4, TP communication overlap, symmetric all-reduce, or fused residual
+RMSNorm. A TE build exposing `normalization_in_fp32` on `LayerNormLinear` is
+required for fused projections. TE validates FP32 norm parameters separately
+from linear parameters; the ordinary parameter dtype checks remain active.

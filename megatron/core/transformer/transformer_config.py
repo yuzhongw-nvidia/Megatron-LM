@@ -248,6 +248,13 @@ class TransformerConfig(ModelParallelConfig):
     normalization: Literal['LayerNorm', 'RMSNorm'] = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
+    normalization_in_fp32: bool = False
+    """Keep TE norm parameters and normalization arithmetic in FP32 during BF16 training.
+    Cast norm outputs back to the activation dtype before subsequent projections. Norm
+    parameter gradients remain FP32 before accumulation and sequence-parallel reduction.
+    Disabled by default; enabling this also changes TP1 arithmetic and parameter precision.
+    """
+
     qk_layernorm: bool = False
     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
@@ -1783,6 +1790,18 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
             )
+
+        if self.normalization_in_fp32:
+            if not self.bf16 or self.fp8 or self.fp4:
+                raise ValueError("normalization_in_fp32 requires ordinary BF16 training")
+            if self.transformer_impl != "transformer_engine":
+                raise ValueError(
+                    "normalization_in_fp32 requires transformer_impl='transformer_engine'"
+                )
+            if self.tp_comm_overlap or self.symmetric_ar_type is not None:
+                raise ValueError("normalization_in_fp32 does not support TP communication overlap")
+            if self.fused_residual_rmsnorm:
+                raise ValueError("normalization_in_fp32 does not support fused_residual_rmsnorm")
 
         if self.tp_reduce_in_fp32:
             if not self.bf16 or self.fp8 or self.fp4:

@@ -52,6 +52,7 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -379,6 +380,25 @@ def _get_tp_reduce_precision_kwargs(config: TransformerConfig, module_class):
     return {"tp_reduce_in_fp32": True}
 
 
+def _get_norm_precision_kwargs(config: TransformerConfig, module_class):
+    """Require a fused TE norm that preserves FP32 parameters and parameter gradients."""
+    if not config.normalization_in_fp32:
+        return {}
+    if "normalization_in_fp32" not in inspect.signature(module_class.__init__).parameters:
+        raise RuntimeError(
+            "normalization_in_fp32 requires a Transformer Engine build exposing "
+            "the normalization_in_fp32 LayerNormLinear argument"
+        )
+    return {"normalization_in_fp32": True}
+
+
+def _mark_fused_norm_parameters_in_fp32(module, config: TransformerConfig):
+    if config.normalization_in_fp32:
+        for param in (module.layer_norm_weight, module.layer_norm_bias):
+            if param is not None:
+                mark_keep_in_fp32(param)
+
+
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {"params_dtype": config.params_dtype}
 
@@ -699,6 +719,28 @@ else:
     TEFusedResidualRMSNorm = None  # type: ignore[assignment, misc]
 
 
+class _FP32NormMixin:
+    """Preserve TE checkpoint keys while keeping norm parameters and gradients in FP32."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        for param in self.parameters():
+            if param.dtype != torch.float32:
+                raise TypeError("normalization_in_fp32 requires FP32 norm parameters")
+        # TE standalone norms otherwise follow native AMP's activation dtype.
+        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+            output = super().forward(hidden_states.float())
+        return output.to(hidden_states.dtype)
+
+
+if HAVE_TE:
+
+    class _FP32LayerNorm(_FP32NormMixin, te.pytorch.LayerNorm):
+        """FP32 LayerNorm with the input activation dtype at its output boundary."""
+
+    class _FP32RMSNorm(_FP32NormMixin, te.pytorch.RMSNorm):
+        """FP32 RMSNorm with the input activation dtype at its output boundary."""
+
+
 class TENorm:
     """A conditional wrapper to initialize an instance of
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input.
@@ -747,13 +789,21 @@ class TENorm:
         else:
             raise Exception("Only LayerNorm and RMSNorm are currently supported")
 
+        extra_kwargs = _get_extra_te_kwargs(config)
+        if config.normalization_in_fp32:
+            norm_module = _FP32LayerNorm if config.normalization == "LayerNorm" else _FP32RMSNorm
+            extra_kwargs["params_dtype"] = torch.float32
+
         instance = norm_module(
             normalized_shape=hidden_size,
             eps=eps,
             sequence_parallel=config.sequence_parallel,
             zero_centered_gamma=config.layernorm_zero_centered_gamma,
-            **_get_extra_te_kwargs(config),
+            **extra_kwargs,
         )
+        if config.normalization_in_fp32:
+            for param in instance.parameters():
+                mark_keep_in_fp32(param)
 
         return cast(LayerNormInterface, instance)
 
@@ -1059,6 +1109,7 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
         self.rng_tracker_name = get_data_parallel_rng_tracker_name()
 
         extra_kwargs = _get_extra_te_kwargs(config)
+        extra_kwargs.update(_get_norm_precision_kwargs(config, te.pytorch.LayerNormLinear))
         if self.config.delay_wgrad_compute:
             if is_te_min_version("2.3.0"):
                 extra_kwargs["delay_wgrad_compute"] = True
@@ -1098,6 +1149,8 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
                 **extra_kwargs,
             )
+
+        _mark_fused_norm_parameters_in_fp32(self, config)
 
         # TODO: With GTP, restore the optional bias after pre-sharded TE construction. GTP
         # shards only the linear weight, so bias must remain replicated at [output_size].
@@ -1218,6 +1271,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
         extra_kwargs = _get_extra_te_kwargs(config)
         extra_kwargs.update(_get_tp_reduce_precision_kwargs(config, te.pytorch.LayerNormLinear))
+        extra_kwargs.update(_get_norm_precision_kwargs(config, te.pytorch.LayerNormLinear))
         self.tp_size = get_pg_size(tp_group)
         self.tp_rank = get_pg_rank(tp_group)
 
@@ -1309,6 +1363,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
                 **extra_kwargs,
             )
+
+        _mark_fused_norm_parameters_in_fp32(self, config)
 
         # Set proper partition_stride
         setattr(self.weight, 'partition_stride', stride)
