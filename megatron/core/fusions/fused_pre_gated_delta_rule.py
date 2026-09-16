@@ -76,6 +76,18 @@ def _g_beta_autotune_configs():
     ]
 
 
+def _autotune_seq_len_bucket(seq_len: int) -> int:
+    """Power-of-two bucket of ``seq_len`` used as the Triton autotune cache key.
+
+    Packed THD micro-batches carry a different token count every step, so keying
+    the autotuner on the exact ``seq_len`` re-benchmarks every config for every
+    new length (tens of sweeps per step). The kernels only use ``seq_len`` for
+    bounds masking, so a coarse bucket keeps the tuning shape-aware while the
+    number of distinct keys stays logarithmic in the sequence length.
+    """
+    return triton.next_power_of_2(max(int(seq_len), 1))
+
+
 @triton.jit
 def _softplus_with_torch_threshold(x):
     """Match torch.nn.functional.softplus default threshold without exp overflow."""
@@ -86,7 +98,15 @@ def _softplus_with_torch_threshold(x):
 
 @triton.autotune(
     configs=_conv_autotune_configs(),
-    key=["seq_len", "HEAD_DIM", "K_W", "APPLY_L2", "REPEAT", "NUM_GROUPS", "HAS_LEFT_BOUNDARY"],
+    key=[
+        "seq_len_bucket",
+        "HEAD_DIM",
+        "K_W",
+        "APPLY_L2",
+        "REPEAT",
+        "NUM_GROUPS",
+        "HAS_LEFT_BOUNDARY",
+    ],
 )
 @triton.jit
 def _conv_silu_project_kernel(
@@ -97,6 +117,7 @@ def _conv_silu_project_kernel(
     silu_save_ptr,
     left_boundary_ptr,
     seq_len,
+    seq_len_bucket,
     num_in_heads,
     in_channel_offset,
     in_group_stride,
@@ -272,7 +293,15 @@ def _thd_seq_bounds(cu_seqlens_ptr, token_offsets, total_tokens, num_packed_seqs
 
 @triton.autotune(
     configs=_conv_autotune_configs(),
-    key=["seq_len", "HEAD_DIM", "K_W", "APPLY_L2", "REPEAT", "NUM_GROUPS", "HAS_LEFT_BOUNDARY"],
+    key=[
+        "seq_len_bucket",
+        "HEAD_DIM",
+        "K_W",
+        "APPLY_L2",
+        "REPEAT",
+        "NUM_GROUPS",
+        "HAS_LEFT_BOUNDARY",
+    ],
 )
 @triton.jit
 def _conv_silu_project_thd_kernel(
@@ -284,6 +313,7 @@ def _conv_silu_project_thd_kernel(
     left_boundary_ptr,
     cu_seqlens_ptr,
     seq_len,
+    seq_len_bucket,
     global_token_offset,
     global_seq_len,
     num_packed_seqs,
@@ -429,7 +459,7 @@ def _conv_silu_project_thd_kernel(
         tl.store(write_ptr, out_typed, mask=s_mask[:, None])
 
 
-@triton.autotune(configs=_g_beta_autotune_configs(), key=["seq_len", "num_v_heads"])
+@triton.autotune(configs=_g_beta_autotune_configs(), key=["seq_len_bucket", "num_v_heads"])
 @triton.jit
 def _compute_g_and_beta_kernel(
     qkvzba_ptr,
@@ -438,6 +468,7 @@ def _compute_g_and_beta_kernel(
     g_out_ptr,
     beta_out_ptr,
     seq_len,
+    seq_len_bucket,
     num_v_heads,
     beta_channel_offset,
     alpha_channel_offset,
@@ -519,7 +550,7 @@ def _compute_g_and_beta_kernel(
         triton.Config({"BLOCK_S": 128}, num_warps=8, num_stages=3),
         triton.Config({"BLOCK_S": 256}, num_warps=8, num_stages=2),
     ],
-    key=["seq_len", "HEAD_DIM", "REPEAT"],
+    key=["seq_len_bucket", "HEAD_DIM", "REPEAT"],
 )
 @triton.jit
 def _qk_l2norm_repeat_backward_kernel(
@@ -528,6 +559,7 @@ def _qk_l2norm_repeat_backward_kernel(
     silu_bf16_ptr,
     d_silu_bf16_ptr,
     seq_len,
+    seq_len_bucket,
     num_qk_heads,
     qk_channels,
     eps,
@@ -983,7 +1015,7 @@ def _conv_silu_boundary_backward_kernel(
 
 @triton.autotune(
     configs=_g_beta_autotune_configs(),
-    key=["seq_len", "num_v_heads"],
+    key=["seq_len_bucket", "num_v_heads"],
     # Each autotune trial atomic-adds partial sums into these accumulators.
     # Without reset_to_zero the trials would stack on top of one another and
     # produce values that are ``num_trials`` × the correct result.
@@ -1000,6 +1032,7 @@ def _g_beta_backward_kernel(
     d_A_log_ptr,
     d_dt_bias_ptr,
     seq_len,
+    seq_len_bucket,
     num_v_heads,
     beta_channel_offset,
     alpha_channel_offset,
@@ -1268,6 +1301,7 @@ def _triton_qk_l2norm_repeat_backward(
             silu_bf16,
             d_silu_bf16,
             seq_len,
+            _autotune_seq_len_bucket(seq_len),
             num_key_heads,
             qk_channels,
             eps,
@@ -1502,6 +1536,7 @@ def _triton_g_beta_backward(
             d_A_log,
             d_dt_bias,
             seq_len,
+            _autotune_seq_len_bucket(seq_len),
             num_value_heads,
             beta_channel_offset,
             alpha_channel_offset,
@@ -1945,6 +1980,7 @@ def _triton_pre_gated_delta_rule_forward(
                 g,
                 beta,
                 seq_len,
+                _autotune_seq_len_bucket(seq_len),
                 num_value_heads,
                 beta_channel_offset,
                 alpha_channel_offset,
@@ -1978,6 +2014,7 @@ def _triton_pre_gated_delta_rule_forward(
                 left_boundary,
                 cu_seqlens,
                 seq_len,
+                _autotune_seq_len_bucket(seq_len),
                 global_token_offset,
                 global_seq_len,
                 num_packed_seqs,
@@ -2021,6 +2058,7 @@ def _triton_pre_gated_delta_rule_forward(
                 silu_qk_save,
                 left_boundary,
                 seq_len,
+                _autotune_seq_len_bucket(seq_len),
                 num_key_heads,
                 0,  # QK starts at channel 0; group 1 starts at +qk_channels.
                 qk_channels,
@@ -2066,6 +2104,7 @@ def _triton_pre_gated_delta_rule_forward(
                 left_boundary,
                 cu_seqlens,
                 seq_len,
+                _autotune_seq_len_bucket(seq_len),
                 global_token_offset,
                 global_seq_len,
                 num_packed_seqs,
@@ -2109,6 +2148,7 @@ def _triton_pre_gated_delta_rule_forward(
                 qkvzba,  # silu_save unused (SAVE_SILU=False)
                 left_boundary,
                 seq_len,
+                _autotune_seq_len_bucket(seq_len),
                 num_value_heads,
                 v_channel_offset,
                 0,  # in_group_stride unused for NUM_GROUPS=1

@@ -22,6 +22,7 @@ from megatron.core.fusions.fused_pre_gated_delta_rule import (
     _L2NORM_EPS,
     _QK_STREAM_SLOT,
     _V_STREAM_SLOT,
+    _autotune_seq_len_bucket,
     _conv_autotune_configs,
     _conv_silu_project_kernel,
     _conv_silu_project_thd_kernel,
@@ -41,7 +42,7 @@ from megatron.core.fusions.fused_pre_gated_delta_rule import (
 )
 
 
-@triton.autotune(configs=_conv_autotune_configs(), key=["seq_len", "HEAD_DIM"])
+@triton.autotune(configs=_conv_autotune_configs(), key=["seq_len_bucket", "HEAD_DIM"])
 @triton.jit
 def _prepare_kda_tail_kernel(
     raw_g_ptr,
@@ -51,6 +52,7 @@ def _prepare_kda_tail_kernel(
     gate_out_ptr,
     beta_out_ptr,
     seq_len,
+    seq_len_bucket,
     num_heads,
     raw_g_s_stride,
     raw_g_b_stride,
@@ -136,7 +138,7 @@ def _prepare_kda_tail_kernel(
     )
 
 
-@triton.autotune(configs=_conv_autotune_configs(), key=["seq_len", "HEAD_DIM"])
+@triton.autotune(configs=_conv_autotune_configs(), key=["seq_len_bucket", "HEAD_DIM"])
 @triton.jit
 def _prepare_kda_tail_backward_kernel(
     beta_ptr,
@@ -147,6 +149,7 @@ def _prepare_kda_tail_backward_kernel(
     d_gate_ptr,
     d_beta_ptr,
     seq_len,
+    seq_len_bucket,
     num_heads,
     beta_s_stride,
     beta_b_stride,
@@ -356,6 +359,7 @@ def _launch_conv_silu_project(
     common_args = (qkv, weight_2d, qkv, out, silu_save, left_boundary)
     common_tail_args = (
         seq_len,
+        _autotune_seq_len_bucket(seq_len),
         num_heads,
         in_channel_offset,
         in_group_stride,
@@ -395,11 +399,11 @@ def _launch_conv_silu_project(
         _conv_silu_project_thd_kernel[grid](
             *common_args,
             cu_seqlens,
-            *common_tail_args[:1],
+            *common_tail_args[:2],
             global_token_offset,
             global_seq_len,
             num_packed_seqs,
-            *common_tail_args[1:],
+            *common_tail_args[2:],
             **constexpr_args,
         )
 
@@ -430,6 +434,7 @@ def _triton_prepare_kda_tail(
             gate_out,
             beta_out,
             seq_len,
+            _autotune_seq_len_bucket(seq_len),
             num_heads,
             raw_g.stride(0),
             raw_g.stride(1),
@@ -485,6 +490,7 @@ def _triton_prepare_kda_tail_backward(
             d_gate,
             d_beta,
             seq_len,
+            _autotune_seq_len_bucket(seq_len),
             num_heads,
             beta.stride(0),
             beta.stride(1),
