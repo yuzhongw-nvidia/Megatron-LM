@@ -789,3 +789,27 @@ def test_packing_scheduler_dataloader_yields_microbatches(run_config):
     finally:
         destroy_global_vars()
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("sbhd", [False, True])
+def test_getitem_exact_max_plus_one_replaces_last_token_with_eod(sbhd):
+    """A max_len+1 sample without EOD must replace its tail, not append past the limit.
+
+    Re-derived on main's list-based VarlenDataset.__getitem__ (origin commit
+    8eb7dcfad): step 3 now truncates on ``>= max_len + 1`` so an exact
+    ``sequence_length + 1`` document without a trailing EOD overwrites its last
+    kept token instead of appending past the budget. main's SBHD validation
+    path returns a loss_mask (not dev's padding_mask), so the SBHD-only
+    original_seq_len/padded_seq_len asserts are guarded to the THD path.
+    """
+    tok = _FakeTokenizer(eod=0, pad=7)
+    ds = _make_varlen(["abcdefghi"], _make_config(tok, seq_length=8, sbhd=sbhd))
+
+    out = ds[0]
+
+    assert out["tokens"].numel() == 8
+    assert out["labels"].numel() == 8
+    assert out["labels"][-1].item() == tok.eod
+    if not sbhd:
+        assert out["original_seq_len"].item() == 8
+        assert out["padded_seq_len"].item() == 8
