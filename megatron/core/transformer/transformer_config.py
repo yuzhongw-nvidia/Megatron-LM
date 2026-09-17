@@ -1633,8 +1633,8 @@ class TransformerConfig(ModelParallelConfig):
         yet (CUDA graphs, full recompute, EP-overlap fine-grained schedule,
         non-attention activation offloading, zero-layer virtual chunks) or
         would silently bypass the AttnRes residual interception (fused residual
-        norms, fp32 residual connection) or the static pipeline payload-width
-        reasoning (variable sequence lengths with PP/VPP).
+        norms, fp32 residual connection) or the interleaved schedule's uniform
+        payload-width reasoning (variable sequence lengths with VPP).
         """
         if not self.enable_attention_residuals:
             if self.attn_res_block_layers is not None:
@@ -1664,15 +1664,21 @@ class TransformerConfig(ModelParallelConfig):
         has_variable_sequences = (
             self.variable_seq_lengths or self.sequence_packing_scheduler is not None
         )
-        if has_variable_sequences and (
-            self.pipeline_model_parallel_size > 1
-            or self.virtual_pipeline_model_parallel_size is not None
-        ):
+        if has_variable_sequences and self.virtual_pipeline_model_parallel_size is not None:
             # The packing scheduler sets variable_seq_lengths later in
             # __post_init__, so check the scheduler itself here as well.
-            # Dynamic shape exchange bypasses the static payload-width reasoning
-            # (and the interleaved schedule's uniform padded width).
-            unsupported.append("variable_seq_lengths (incl. sequence packing) together with PP/VPP")
+            # Non-interleaved pipeline parallelism is fine with per-microbatch
+            # shapes: the boundary payload is one plain [s * slices, b, h]
+            # tensor whose shape p2p_communication exchanges dynamically, and
+            # unpacking only needs the static slice count derived from the
+            # layer layout. The interleaved schedule instead pads every
+            # boundary to a single uniform width computed from seq_length and
+            # keys its rank-local source cache by microbatch, neither of which
+            # has been reasoned through for variable shapes.
+            unsupported.append(
+                "variable_seq_lengths (incl. sequence packing) together with the "
+                "interleaved (VPP) schedule"
+            )
         if self.virtual_pipeline_model_parallel_size is not None and (
             self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
         ):
