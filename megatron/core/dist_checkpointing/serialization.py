@@ -39,6 +39,7 @@ from .strategies.torch import (
 from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
 from .validation import (
     StrictHandling,
+    adjust_non_strict_load_factories,
     determine_global_metadata,
     parse_strict_flag,
     save_integrity_manifest,
@@ -158,6 +159,10 @@ def load(
         global_metadata,
         ckpt_sharded_metadata,
     )
+    if unexpected_keys:
+        # Non-strict handling removed tensors the checkpoint does not have; a factory
+        # whose whole expansion was removed must not be merged afterwards.
+        sh_ten_factories = adjust_non_strict_load_factories(sh_ten_factories, sharded_state_dict)
 
     ckpt_args = common_state_dict.get("args")
     async_strategy = (

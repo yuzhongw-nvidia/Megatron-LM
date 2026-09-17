@@ -389,6 +389,84 @@ class TestSerialization:
 
         Utils.destroy_model_parallel()
 
+    def test_non_strict_load_drops_factories_absent_from_checkpoint(self, tmp_path_dist_ckpt):
+        """A factory whose tensors are all unexpected keys must not break the merge.
+
+        Mirrors loading a checkpoint saved without MTP layers into a model that has
+        them: the MTP swiglu factory expands to tensors the checkpoint lacks, the
+        non-strict handling drops those tensors, and the factory has to go with them.
+        """
+        Utils.initialize_model_parallel(1, 1)
+
+        def _build_fn(key, tensor, replica_id, flattened_range):
+            assert flattened_range is None
+            return {
+                'part1': ShardedTensor.from_rank_offsets(
+                    key + 'part1', tensor, replica_id=replica_id
+                ),
+                'part2': ShardedTensor.from_rank_offsets(
+                    key + 'part2', tensor, replica_id=replica_id
+                ),
+            }
+
+        def _merge_fn(sub_state_dict):
+            return sub_state_dict['part1'] + sub_state_dict['part2']
+
+        def get_sharded_state_dict(with_extra_factory: bool, base=0):
+            sd = {
+                'A': ShardedTensor.from_rank_offsets(
+                    'A', torch.arange(2) + base, replica_id=Utils.rank
+                ),
+                'D': ShardedTensorFactory(
+                    'D', torch.arange(5) + base, _build_fn, _merge_fn, replica_id=Utils.rank
+                ),
+            }
+            if with_extra_factory:
+                # Present in the model, absent from the checkpoint (e.g. an MTP layer).
+                sd['E'] = ShardedTensorFactory(
+                    'E', torch.arange(3) + base, _build_fn, _merge_fn, replica_id=Utils.rank
+                )
+            return sd
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_non_strict_load_drops_factories_absent_from_checkpoint',
+            sync=True,
+        ) as ckpt_dir:
+            save(get_sharded_state_dict(with_extra_factory=False), ckpt_dir)
+
+            for strict in (
+                StrictHandling.LOG_UNEXPECTED,
+                StrictHandling.LOG_ALL,
+                StrictHandling.IGNORE_ALL,
+            ):
+                loaded_state_dict = load(
+                    get_sharded_state_dict(with_extra_factory=True, base=10),
+                    ckpt_dir,
+                    strict=strict,
+                )
+                assert 'E' not in loaded_state_dict, strict
+                assert torch.equal(loaded_state_dict['A'], torch.arange(2))
+                assert torch.equal(loaded_state_dict['D'], torch.arange(5) * 2)
+
+            loaded_state_dict, missing_keys, unexpected_keys = load(
+                get_sharded_state_dict(with_extra_factory=True, base=10),
+                ckpt_dir,
+                strict=StrictHandling.RETURN_ALL,
+            )
+            assert 'E' not in loaded_state_dict
+            assert unexpected_keys == {'Epart1', 'Epart2'}
+            assert not missing_keys
+
+            with pytest.raises(CheckpointingException) as exc_info:
+                load(
+                    get_sharded_state_dict(with_extra_factory=True, base=10),
+                    ckpt_dir,
+                    strict=StrictHandling.RAISE_UNEXPECTED,
+                )
+            assert 'Epart1' in str(exc_info.value)
+
+        Utils.destroy_model_parallel()
+
     def test_load_error_msg(self, tmp_path_dist_ckpt):
         ckpt_dir_name = 'test_load_error_msg'
         Utils.initialize_model_parallel(1, 1)
