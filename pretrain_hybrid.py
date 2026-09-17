@@ -64,7 +64,10 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+from megatron.training.training import (
+    update_seqlen_stats_from_cu_seqlens,
+    update_seqlen_stats_from_padding_mask,
+)
 from megatron.training.utils import (
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
@@ -86,6 +89,56 @@ except ImportError as error:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+
+
+def _uses_sbhd_padding_mask(args) -> bool:
+    """Whether the dataset right-pads every sample and emits a ``padding_mask``.
+
+    ``--use-varlen-dataset --varlen-sbhd-validation`` pads each document to
+    ``seq_length`` instead of packing. Without a padding mask the MoE routers
+    treat the padded tail as real tokens (routing, expert bias / Quantile
+    Balancing histograms, z-loss), which is exactly what the packed THD path
+    excludes, so the SBHD reference and THD drift apart under
+    statistics-driven load balancing. VarlenDataset already emits the mask in
+    this mode; this predicate gates the plumbing that delivers it.
+    """
+    return bool(args.use_varlen_dataset and args.varlen_sbhd_validation and not args.sft)
+
+
+def _sbhd_padding_mask_on_this_rank(batch, tp_rank, vp_stage):
+    """Return the CP-unsliced ``[micro_batch_size, seq_length]`` SBHD padding mask.
+
+    TP rank 0 takes the dataset's ``padding_mask`` (``True`` = padding); the
+    other TP ranks receive it by broadcast, mirroring the other batch tensors.
+    The real per-sample lengths are also fed to the FLOPs accounting, once per
+    pipeline rank and micro-batch (first virtual stage), so the reported
+    TFLOP/s count useful work only, like the packed THD path.
+    """
+    args = get_args()
+    device = torch.cuda.current_device()
+    shape = (args.micro_batch_size, args.seq_length)
+    if tp_rank == 0:
+        padding_mask = batch.get('padding_mask') if batch is not None else None
+        assert padding_mask is not None, (
+            "--varlen-sbhd-validation expects the dataset to emit a 'padding_mask' "
+            "entry (VarlenDataset does; mock varlen data does not support this mode)."
+        )
+        padding_mask = padding_mask.to(device=device, dtype=torch.bool)
+        assert tuple(padding_mask.shape) == shape, (
+            f"padding_mask shape {tuple(padding_mask.shape)} does not match "
+            f"[micro_batch_size, seq_length] = {shape}"
+        )
+    else:
+        padding_mask = torch.empty(shape, dtype=torch.bool, device=device)
+    if mpu.get_tensor_model_parallel_world_size() > 1:
+        torch.distributed.broadcast(
+            padding_mask,
+            mpu.get_tensor_model_parallel_src_rank(),
+            group=mpu.get_tensor_model_parallel_group(),
+        )
+    if vp_stage is None or vp_stage == 0:
+        update_seqlen_stats_from_padding_mask(padding_mask)
+    return padding_mask
 
 
 def get_batch(data_iterator, vp_stage=None):
@@ -153,12 +206,29 @@ def get_batch(data_iterator, vp_stage=None):
             packed_seq_params,
         )
 
+    has_sbhd_padding_mask = _uses_sbhd_padding_mask(args)
+
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not mtp_on_this_rank
         and not has_cu_seqlens
     ):
-        return [None for _ in batch_keys] + [None, None]
+        if not has_sbhd_padding_mask:
+            return [None for _ in batch_keys] + [None, None]
+        # Intermediate pipeline stages of a padded SBHD validation run still
+        # need the padding mask for their MoE routers. The dataset is built on
+        # every stage in this mode (see is_dataset_built_on_rank), so read the
+        # sample here and keep only the mask, sliced for this CP rank.
+        padding_mask = _sbhd_padding_mask_on_this_rank(
+            next(data_iterator) if tp_rank == 0 else None, tp_rank, vp_stage
+        )
+        mask_batch = get_batch_on_this_cp_rank(
+            {'padding_mask': padding_mask, 'cu_seqlens': None},
+            is_hybrid_cp=is_dynamic_cp,
+            cp_group=get_context_parallel_group(),
+            hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
+        )
+        return [None for _ in batch_keys] + [mask_batch['padding_mask'], None]
 
     batch = {}
     if tp_rank == 0:
@@ -189,6 +259,12 @@ def get_batch(data_iterator, vp_stage=None):
 
     batch = flatten_batch_for_packed_sequences(batch)
 
+    if has_sbhd_padding_mask:
+        # Padded SBHD validation: carry the dataset's padding mask alongside the
+        # batch so it is CP-sliced with the other tensors and reaches the MoE
+        # routers (and MTP) exactly like the packed THD path's mask.
+        batch['padding_mask'] = _sbhd_padding_mask_on_this_rank(batch, tp_rank, vp_stage)
+
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert has_cu_seqlens
         return (
@@ -216,7 +292,7 @@ def get_batch(data_iterator, vp_stage=None):
 
     # Return values in a fixed order so callers can unpack them even when
     # dataset wrappers add provenance fields like "dataset_id".
-    return [batch[key] for key in batch_keys] + [None, None]
+    return [batch[key] for key in batch_keys] + [batch.get('padding_mask'), None]
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -360,12 +436,19 @@ def forward_step(data_iterator, model: HybridModel):
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
-def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
+def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False, build_on_all_stages=False):
+    """Whether this rank (and virtual stage) needs its own dataset / data iterator.
+
+    Packed sequences and padded SBHD validation (``build_on_all_stages``) need
+    the batch on every pipeline stage: the former for packing metadata, the
+    latter so intermediate stages can hand the padding mask to their MoE
+    routers.
+    """
     args = get_args()
     config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence or build_on_all_stages:
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
@@ -446,7 +529,12 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         dataset_type,
         train_val_test_num_samples,
-        partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence),
+        partial(
+            is_dataset_built_on_rank,
+            vp_stage=vp_stage,
+            is_packed_sequence=is_packed_sequence,
+            build_on_all_stages=_uses_sbhd_padding_mask(args),
+        ),
         config,
     ).build()
 
