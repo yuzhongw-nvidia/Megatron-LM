@@ -583,14 +583,29 @@ class TestAttnResConfigValidation:
 
         TransformerConfig(**self._base_kwargs(variable_seq_lengths=True))
 
-    def test_variable_seq_lengths_with_pipeline_parallelism_rejected(self):
+    def test_variable_seq_lengths_supported_with_non_interleaved_pipeline_parallelism(self):
+        """The boundary payload is one tensor whose shape p2p exchanges dynamically."""
         from megatron.core.transformer.transformer_config import TransformerConfig
 
-        with pytest.raises(ValueError, match="variable_seq_lengths"):
+        config = TransformerConfig(
+            **self._base_kwargs(
+                variable_seq_lengths=True,
+                pipeline_model_parallel_size=2,
+                pipeline_dtype=torch.float32,
+            )
+        )
+        assert config.variable_seq_lengths
+
+    def test_variable_seq_lengths_with_interleaved_pipeline_rejected(self):
+        """The interleaved schedule pads every boundary to one seq_length-derived width."""
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="variable_seq_lengths.*interleaved"):
             TransformerConfig(
                 **self._base_kwargs(
                     variable_seq_lengths=True,
                     pipeline_model_parallel_size=2,
+                    virtual_pipeline_model_parallel_size=2,
                     pipeline_dtype=torch.float32,
                 )
             )
@@ -602,15 +617,29 @@ class TestAttnResConfigValidation:
         config = TransformerConfig(**self._base_kwargs(sequence_packing_scheduler="dp_balanced"))
         assert config.variable_seq_lengths
 
-    def test_sequence_packing_with_pipeline_parallelism_rejected(self):
+    def test_sequence_packing_supported_with_non_interleaved_pipeline_parallelism(self):
+        """Packed THD with PP > 1 (e.g. Kimi-K3 64K on PP4) rides the dynamic-shape p2p path."""
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        config = TransformerConfig(
+            **self._base_kwargs(
+                sequence_packing_scheduler="dp_balanced",
+                pipeline_model_parallel_size=2,
+                pipeline_dtype=torch.float32,
+            )
+        )
+        assert config.variable_seq_lengths
+
+    def test_sequence_packing_with_interleaved_pipeline_rejected(self):
         """Reject by scheduler name before its late variable-sequence assignment."""
         from megatron.core.transformer.transformer_config import TransformerConfig
 
-        with pytest.raises(ValueError, match="variable_seq_lengths"):
+        with pytest.raises(ValueError, match="variable_seq_lengths.*interleaved"):
             TransformerConfig(
                 **self._base_kwargs(
                     sequence_packing_scheduler="dp_balanced",
                     pipeline_model_parallel_size=2,
+                    virtual_pipeline_model_parallel_size=2,
                     pipeline_dtype=torch.float32,
                 )
             )
