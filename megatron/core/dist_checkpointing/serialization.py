@@ -159,10 +159,10 @@ def load(
         global_metadata,
         ckpt_sharded_metadata,
     )
-    if unexpected_keys:
-        # Non-strict handling removed tensors the checkpoint does not have; a factory
-        # whose whole expansion was removed must not be merged afterwards.
-        sh_ten_factories = adjust_non_strict_load_factories(sh_ten_factories, sharded_state_dict)
+    # Non-strict handling may have removed tensors the checkpoint does not have; a factory
+    # whose whole expansion was removed must not be merged afterwards. Not gated on
+    # `unexpected_keys`: IGNORE_ALL clears that set after pruning the state dict.
+    sh_ten_factories = adjust_non_strict_load_factories(sh_ten_factories, sharded_state_dict)
 
     ckpt_args = common_state_dict.get("args")
     async_strategy = (
