@@ -6,6 +6,8 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
 - `ENV_VARS`: Environment variables expected by the runtime.
 - `ARGS`: Megatron-LM training arguments.
 
+Kimi-K3 container build and launch instructions are in the [Kimi-K3 guide](kimi_k3/README.md).
+
 ## Recipe Index
 
 <table>
@@ -21,6 +23,24 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td>Kimi-K3</td>
+      <td><a href="kimi_k3/gb300/mxfp8_SL4K_256GPU_TP1PP4EP64_muon.yaml">GB300 MXFP8</a></td>
+      <td>256</td>
+      <td>1/4/64/1/1</td>
+      <td>1/4096/4096</td>
+      <td>Review draft; KDA/MLA; AttnRes; MTP1; per-head Muon; HybridEP; chunked optimizer-state offload</td>
+      <td>Not measured</td>
+    </tr>
+    <tr>
+      <td>Kimi-K3 9L proxy</td>
+      <td><a href="kimi_k3_proxy_9layer/gb200/mxfp8_SL4K_64GPU_TP1PP1EP64_muon.yaml">GB200 MXFP8</a></td>
+      <td>64</td>
+      <td>1/1/64/1/1</td>
+      <td>1/4096/4096</td>
+      <td>Review draft; KDA/MLA; AttnRes; MTP1; per-head Muon; HybridEP; chunked optimizer-state offload</td>
+      <td>Not measured</td>
+    </tr>
     <tr>
       <td>DeepSeek-V4-Pro</td>
       <td><a href="deepseek_v4_pro/gb300/mxfp8_SL4K_256GPU_TP1PP4EP64.yaml">GB300 MXFP8</a></td>
