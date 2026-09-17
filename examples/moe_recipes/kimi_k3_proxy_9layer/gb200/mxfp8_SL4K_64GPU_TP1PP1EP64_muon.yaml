@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Kimi-K3 9-layer proxy: 9 decoder blocks, 64 GB200 GPUs.
-# Review draft: container build and runtime validation are pending.
+# ARM64 container build passed 2026-09-17; runtime validation is pending.
 # Entry point: pretrain_hybrid.py. Build and launch guide: ../../kimi_k3/README.md
 # Build from the repository root on an ARM64 builder:
 #   yq -r '.DEPENDENCIES.dockerfile' examples/moe_recipes/kimi_k3_proxy_9layer/gb200/mxfp8_SL4K_64GPU_TP1PP1EP64_muon.yaml > Dockerfile.kimi-k3
@@ -25,10 +25,15 @@ DEPENDENCIES:
     ARG NVTE_CUDA_ARCHS="100a;103a"
 
     RUN apt-get update && apt-get install -y --no-install-recommends \
-            build-essential git curl ca-certificates gettext libfabric-dev && \
+            build-essential git curl ca-certificates gettext libfabric-dev python3-venv && \
         rm -rf /var/lib/apt/lists/* /opt/megatron-lm
 
-    # Use the NGC PyTorch installation; source extensions compile against it.
+    # Inherit NGC PyTorch/CUDA while keeping pip additions separate from
+    # OS-managed packages such as python3-yaml.
+    RUN python -m venv --system-site-packages /opt/venv
+    ENV VIRTUAL_ENV=/opt/venv
+    ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
     RUN unset PIP_CONSTRAINT && python -m pip install --no-cache-dir \
             packaging ninja==1.11.1.1 cmake 'pybind11[global]>=2.13,<3' \
             sentencepiece tiktoken einops wandb tqdm datasets tensorboard \
@@ -42,8 +47,11 @@ DEPENDENCIES:
             --no-build-isolation \
             "nvidia-cudnn-frontend[cutedsl] @ git+https://github.com/NVIDIA/cudnn-frontend.git@${CUDNN_FRONTEND_COMMIT}"
 
+    # These recipes use HybridEP. The optional TE NCCL EP extension uses
+    # a NCCL device API that does not match the NGC 26.04 base.
     RUN unset PIP_CONSTRAINT && \
-        NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" NVTE_BUILD_THREADS_PER_JOB=8 NVTE_FRAMEWORK=pytorch \
+        NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" NVTE_BUILD_THREADS_PER_JOB=8 \
+        NVTE_FRAMEWORK=pytorch NVTE_WITH_NCCL_EP=0 \
         python -m pip install --no-build-isolation --no-cache-dir \
             "git+https://github.com/NVIDIA/TransformerEngine.git@${TE_COMMIT}"
 
@@ -59,8 +67,10 @@ DEPENDENCIES:
         HYBRID_EP_MULTINODE=0 TORCH_CUDA_ARCH_LIST="10.0" \
         python -m pip install --no-build-isolation --no-cache-dir .
 
+    # NGC's triton-kernels declares pytest as a dependency.
     # Preserve dependency consistency as a build requirement.
-    RUN python -m pip check && rm -rf /root/.cache/pip
+    RUN unset PIP_CONSTRAINT && python -m pip install --no-cache-dir pytest && \
+        python -m pip check && rm -rf /root/.cache/pip
     WORKDIR /workspace/Megatron-LM
 ENV_VARS:
   TORCH_NCCL_AVOID_RECORD_STREAMS: '0'

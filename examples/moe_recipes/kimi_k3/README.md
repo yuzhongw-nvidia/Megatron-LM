@@ -5,8 +5,9 @@ proxy, including their model parameters, runtime arguments and container
 build instructions. Use the MCore checkout containing these recipes and
 `pretrain_hybrid.py` as the training entry point.
 
-**Status: review drafts. Container builds and runtime validation are pending;
-throughput and memory measurements are not available for these recipes.**
+**Status: the ARM64 container build and its `pip check` passed on 2026-09-17.
+Software-stack and model runtime validation are pending; throughput and memory
+measurements are not available for these recipes.**
 
 ## Configurations
 
@@ -68,15 +69,23 @@ The public build uses the following fixed components:
 | Apache TVM FFI | `0.1.11` |
 
 TE targets both SM100a and SM103a. The NGC PyTorch installation supplies
-PyTorch and CUDA; the extensions build against that installation. The
-Dockerfile installs the recipe dependencies directly, and `pip check` is a
-build requirement. Run with the image's Python environment so those versions
-remain in effect.
+PyTorch and CUDA; the extensions build against that installation. A
+`/opt/venv` environment inherits those system packages and installs the recipe
+dependencies locally. This lets pip upgrade Python dependencies without
+uninstalling Debian-managed packages such as `python3-yaml`. The venv is first
+on `PATH`, and `pip check` remains a build requirement. The build also installs
+`pytest`, a declared dependency of NGC's `triton-kernels`. Run with the image's
+default Python environment.
 
 This is a new public build definition assembled from the recorded Kimi-K3
 dependency revisions and the public reference Dockerfiles. The original
-benchmark image's complete Dockerfile was not recorded, so this definition
-requires its own build and runtime validation.
+benchmark image's complete Dockerfile was not recorded. This definition has
+passed a native ARM64 build, including dependency consistency checks; its
+software-stack and model runtime validation remain pending.
+
+TE is built with `NVTE_WITH_NCCL_EP=0`: its optional NCCL EP extension uses
+a NCCL device API that does not match the NGC 26.04 base. These recipes select
+HybridEP as the MoE dispatcher backend.
 
 The HybridEP build follows the public DeepSeek-V4 recipe and targets one
 NVLink domain per EP group. Place each group of 64 EP ranks within one
@@ -119,7 +128,7 @@ for key, value in recipe["ARGS"].items():
         values = value if isinstance(value, list) else [value]
         args.extend(os.path.expandvars(str(item)) for item in values)
 launcher = (
-    'exec torchrun --nnodes="${NNODES:?}" '
+    'exec python -m torch.distributed.run --nnodes="${NNODES:?}" '
     '--nproc-per-node="${GPUS_PER_NODE:-4}" --node-rank="${NODE_RANK:?}" '
     '--master-addr="${MASTER_ADDR:?}" --master-port="${MASTER_PORT:-29500}" '
     'pretrain_hybrid.py '
@@ -127,6 +136,9 @@ launcher = (
 print(launcher + shlex.join(args) + ' "$@"')
 PYTHON
 ```
+
+The launcher uses `python -m torch.distributed.run` to keep the worker
+processes in the image's default Python environment.
 
 Launch `bash run-kimi-k3.sh` once per node through your scheduler, with the
 checkout and output directory mounted at the same paths on every node.
