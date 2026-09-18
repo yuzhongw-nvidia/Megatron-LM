@@ -6,8 +6,10 @@ build instructions. Use the MCore checkout containing these recipes and
 `pretrain_hybrid.py` as the training entry point.
 
 **Status: the ARM64 container build and its `pip check` passed on 2026-09-17.
-Software-stack and model runtime validation are pending; throughput and memory
-measurements are not available for these recipes.**
+A single-node GB300 software-stack probe of that image passed on 2026-09-18
+except for the missing causal-conv1d package, which the Dockerfile now installs.
+The rebuilt image and the model runtime validation are pending; throughput and
+memory measurements are not available for these recipes.**
 
 ## Configurations
 
@@ -64,9 +66,16 @@ The public build uses the following fixed components:
 | Transformers | `5.16.1` |
 | NVIDIA Resiliency Extension | `0.6.0` |
 | Emerging-Optimizers | `a44d1f83a4950b445f2a77ca71177c5f033d45d5` |
+| causal-conv1d | `4f6ae4e26ae5fe8af9372f8d312ab25cc4595223` (1.6.2.post1) |
 | HybridEP | `1b8f467965bb818bf2f6511e06993f5607e1721f` |
 | CUTLASS DSL | `4.5.2` (CUDA 13) |
 | Apache TVM FFI | `0.1.11` |
+
+Both recipes enable `gdn_pre_gated_delta_rule_fusion`, which calls the C++
+depthwise-convolution backward of causal-conv1d. Without that package the KDA
+layer raises an `ImportError` in its first forward pass. No prebuilt
+causal-conv1d wheel matches the NGC 26.04 base, so the Dockerfile builds the
+pinned revision from source; nvcc 13 includes the SM100 and SM103 cubins.
 
 TE targets both SM100a and SM103a. The NGC PyTorch installation supplies
 PyTorch and CUDA; the extensions build against that installation. A
@@ -80,8 +89,17 @@ default Python environment.
 This is a new public build definition assembled from the recorded Kimi-K3
 dependency revisions and the public reference Dockerfiles. The original
 benchmark image's complete Dockerfile was not recorded. This definition has
-passed a native ARM64 build, including dependency consistency checks; its
-software-stack and model runtime validation remain pending.
+passed a native ARM64 build, including dependency consistency checks.
+
+A software-stack probe on one GB300 node (four GPUs) checked the 2026-09-17
+image: the default Python is the `/opt/venv` environment, `pip check` passes
+at runtime, every component above is installed at the listed revision, the
+whole stack imports, TE MXFP8 and Flash Linear Attention kernels run on the
+device, and the Megatron Core unit tests for KDA, quantile balancing, HybridEP,
+latent MoE, AttnRes/MTP, SiTU-GLU and MXFP8 parameter gather with Muon ran on
+it. The fused pre-GDN tests were skipped because causal-conv1d was missing;
+the Dockerfile now installs it. The rebuilt image and the model runtime
+validation remain pending.
 
 TE is built with `NVTE_WITH_NCCL_EP=0`: its optional NCCL EP extension uses
 a NCCL device API that does not match the NGC 26.04 base. These recipes select
@@ -92,6 +110,8 @@ NVLink domain per EP group. Place each group of 64 EP ranks within one
 GB200/GB300 NVLink domain. The full recipe needs four such groups, one per
 pipeline stage. EP groups spanning separate NVLink domains require a
 multinode-enabled communication build and a corresponding placement review.
+This HybridEP revision provides no dense top-k routing metadata, so Megatron
+Core uses the bool routing map with it.
 
 ## Prepare the launch
 

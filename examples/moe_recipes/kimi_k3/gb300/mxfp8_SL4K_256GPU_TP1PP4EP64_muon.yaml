@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Kimi-K3 full text backbone: 93 decoder blocks, 256 GB300 GPUs.
-# ARM64 container build passed 2026-09-17; runtime validation is pending.
+# ARM64 container build passed 2026-09-17. The 2026-09-18 revision adds
+# causal-conv1d after a single-node probe; see ../README.md for the status.
 # Entry point: pretrain_hybrid.py. Build and launch guide: ../README.md
 # Build from the repository root on an ARM64 builder:
 #   yq -r '.DEPENDENCIES.dockerfile' examples/moe_recipes/kimi_k3/gb300/mxfp8_SL4K_256GPU_TP1PP4EP64_muon.yaml > Dockerfile.kimi-k3
@@ -19,6 +20,9 @@ DEPENDENCIES:
     ARG TE_COMMIT=0a2ebe942b9f6a66aa0292502966e73114a7b912
     ARG CUDNN_FRONTEND_COMMIT=5ba9432e652e0b4df3aaca85cf3f95fe6bb7375a
     ARG EMERGING_OPTIMIZERS_COMMIT=a44d1f83a4950b445f2a77ca71177c5f033d45d5
+    # causal-conv1d 1.6.2.post1. gdn_pre_gated_delta_rule_fusion uses its C++
+    # depthwise-convolution backward; the KDA layer raises ImportError without it.
+    ARG CAUSAL_CONV1D_COMMIT=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223
     # Match the public DeepSeek-V4 recipe's HybridEP build. Place each EP64
     # group within one NVLink domain; this is not a cross-domain RDMA build.
     ARG HYBRID_EP_COMMIT=1b8f467965bb818bf2f6511e06993f5607e1721f
@@ -60,6 +64,13 @@ DEPENDENCIES:
     RUN unset PIP_CONSTRAINT && python -m pip install --no-cache-dir \
             --no-build-isolation \
             "git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@${EMERGING_OPTIMIZERS_COMMIT}"
+
+    # No prebuilt causal-conv1d wheel matches this base, so build from source.
+    # nvcc 13 adds the sm_100 and sm_103 cubins to the default architecture list.
+    RUN unset PIP_CONSTRAINT && \
+        CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+        python -m pip install --no-build-isolation --no-cache-dir \
+            "git+https://github.com/Dao-AILab/causal-conv1d.git@${CAUSAL_CONV1D_COMMIT}"
 
     RUN git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git /opt/DeepEP && \
         cd /opt/DeepEP && git checkout "${HYBRID_EP_COMMIT}" && \
