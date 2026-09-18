@@ -3,6 +3,7 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import collections
 import inspect
 from typing import Callable, Optional
 
@@ -525,6 +526,26 @@ except ImportError:
 
 _hybrid_ep_buffer = None
 
+# HybridEP hands the dispatched-token count back in a 4-byte CPU pinned tensor (handle[3]) and
+# its permute/unpermute kernels dereference that *host* pointer on the device, in the forward
+# and again in both backward passes. PyTorch's pinned-memory allocator is not stream-ordered:
+# the moment the last Python reference to the handle is dropped (right after the backward is
+# enqueued), the block becomes reusable by the next small pinned allocation, for example the
+# data loader's staging buffers on the TP-rank-0 processes, so a kernel still queued behind the
+# host can read a count written by an unrelated tensor and index far outside the shared NVLink
+# buffer (CUDA illegal memory access at the next synchronization). Retain the pinned tensors of
+# the most recent handles; every later dispatch synchronizes the stream in blocking mode, so by
+# the time an entry is evicted all kernels that could read it have completed.
+_HYBRIDEP_RETIRED_PINNED_TENSORS = collections.deque(maxlen=1024)
+
+
+def _retain_hybridep_pinned_tensors(handle) -> None:
+    """Keep the pinned CPU tensors of a HybridEP handle alive past the handle's Python lifetime."""
+    for item in handle:
+        if torch.is_tensor(item) and item.device.type == "cpu" and item.is_pinned():
+            _HYBRIDEP_RETIRED_PINNED_TENSORS.append(item)
+
+
 # HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
 HYBRIDEP_TOKEN_ALIGNMENT = 64
 
@@ -695,6 +716,7 @@ class HybridEPDispatch(torch.autograd.Function):
             **dispatch_kwargs,
         )
 
+        _retain_hybridep_pinned_tensors(handle)
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.fused = fused
