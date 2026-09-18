@@ -23,6 +23,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedBase,
     ShardedObject,
     ShardedStateDict,
+    ShardedTensorFactory,
     is_main_replica,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature
@@ -238,6 +239,60 @@ def adjust_non_strict_load(
 
     _, sharded_state_dict = extract_matching_values(sharded_state_dict, is_unexpected_key)
     return sharded_state_dict
+
+
+def adjust_non_strict_load_factories(
+    sh_ten_factories: ShardedStateDict, sharded_state_dict: ShardedStateDict
+) -> ShardedStateDict:
+    """Drop ShardedTensorFactories whose expansions were removed as unexpected keys.
+
+    `load_preprocess` expands every factory in place (`apply_factories`) and keeps the
+    factories themselves in `sh_ten_factories` for `apply_factory_merges`. When a
+    non-strict load then removes the ShardedTensors that the checkpoint does not contain
+    (`adjust_non_strict_load`), a factory whose whole expansion vanished (for example the
+    swiglu-split MLP weights of an MTP layer when the checkpoint was saved without MTP)
+    has nothing left to merge, and keeping it would make `apply_factory_merges` look for
+    tensors that were never loaded. Such factories are dropped here; the position of the
+    factory in `sharded_state_dict` tells whether anything of it survived.
+
+    A partially surviving expansion is kept: merging half a factory tensor is not
+    recoverable, so it should keep failing loudly in `apply_factory_merges`. Factories
+    stored inside lists are kept as well, because the pruned list may have been
+    re-indexed and cannot be matched positionally.
+
+    Args:
+        sh_ten_factories (ShardedStateDict): factories extracted by `load_preprocess`
+            (lists represented as dicts keyed by index).
+        sharded_state_dict (ShardedStateDict): the expanded sharded state dict after
+            `adjust_non_strict_load`.
+
+    Returns:
+        ShardedStateDict: `sh_ten_factories` without the factories that have no
+            loaded data.
+    """
+
+    def _prune(factories, sd):
+        if not isinstance(factories, dict):
+            return factories
+        kept = {}
+        for k, v in factories.items():
+            if isinstance(v, ShardedTensorFactory):
+                if isinstance(sd, dict) and k not in sd:
+                    logger.debug(
+                        "Dropping factory %s: the checkpoint has none of its tensors", v.key
+                    )
+                    continue
+                kept[k] = v
+            elif isinstance(v, dict):
+                sub_sd = sd.get(k) if isinstance(sd, dict) else None
+                sub_kept = _prune(v, sub_sd)
+                if sub_kept or not v:
+                    kept[k] = sub_kept
+            else:
+                kept[k] = v
+        return kept
+
+    return _prune(sh_ten_factories, sharded_state_dict)
 
 
 def _determine_missing_and_unexpected_keys(
