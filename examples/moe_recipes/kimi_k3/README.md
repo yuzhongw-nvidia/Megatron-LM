@@ -8,8 +8,10 @@ build instructions. Use the MCore checkout containing these recipes and
 **Status: the ARM64 container build and its `pip check` passed on 2026-09-17.
 A single-node GB300 software-stack probe of that image passed on 2026-09-18
 except for the missing causal-conv1d package, which the Dockerfile now installs.
-The rebuilt image and the model runtime validation are pending; throughput and
-memory measurements are not available for these recipes.**
+With causal-conv1d added, the software-stack probe passed in full and a
+29-decoder-block single-node proxy of this architecture trained for 50
+iterations on the image. The full 256-GPU recipe has not been run; throughput
+and memory measurements are not available for these recipes.**
 
 ## Configurations
 
@@ -98,8 +100,16 @@ whole stack imports, TE MXFP8 and Flash Linear Attention kernels run on the
 device, and the Megatron Core unit tests for KDA, quantile balancing, HybridEP,
 latent MoE, AttnRes/MTP, SiTU-GLU and MXFP8 parameter gather with Muon ran on
 it. The fused pre-GDN tests were skipped because causal-conv1d was missing;
-the Dockerfile now installs it. The rebuilt image and the model runtime
-validation remain pending.
+the Dockerfile now installs it.
+
+With causal-conv1d installed on top of that image, the same probe passed in
+full: the fused pre-GDN/KDA tests ran, and the only remaining failures were an
+unrelated upstream test typo. A 29-decoder-block single-node proxy of this
+architecture (KDA, MLA, latent MoE with HybridEP, MTP, compiled AttnRes, fused
+pre-GDN, MXFP8 parameter gather, per-head Muon, chunked optimizer-state
+offload) then trained for 50 iterations on one GB300 node with mock data: no
+errors, no NaN or skipped iterations, a decreasing loss and constant memory.
+The full 256-GPU recipe has not been run in this image.
 
 TE is built with `NVTE_WITH_NCCL_EP=0`: its optional NCCL EP extension uses
 a NCCL device API that does not match the NGC 26.04 base. These recipes select
