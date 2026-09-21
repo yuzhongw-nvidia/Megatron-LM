@@ -71,8 +71,11 @@ medians.
 
 No iteration was skipped and no NaN occurred in either run. The measurement
 container carried the component revisions listed under "Build the container"
-except for HybridEP, where it used revision d28bd67 instead of the pinned
-1b8f4679. At 262144 tokens both runs are attention-bound: the MLA attention
+except for HybridEP, where it used revision d28bd67; the Dockerfile has since
+moved the pin to 10d4dd7, because revisions before 17cfb81 fail intermittently
+with an illegal memory access once the per-rank token count per dispatch grows
+(observed at 524288 packed tokens with CP16, i.e. 32768 tokens per rank; see
+DeepEP issue 756). At 262144 tokens both runs are attention-bound: the MLA attention
 kernels and the context-parallel ring traffic that feeds them take the
 largest share of GPU time, followed by the MXFP8 GEMMs and the HybridEP
 dispatch/combine. The gap between the proxy's 661 and the full model's 498
@@ -104,7 +107,7 @@ The public build uses the following fixed components:
 | NVIDIA Resiliency Extension | `0.6.0` |
 | Emerging-Optimizers | `a44d1f83a4950b445f2a77ca71177c5f033d45d5` |
 | causal-conv1d | `4f6ae4e26ae5fe8af9372f8d312ab25cc4595223` (1.6.2.post1) |
-| HybridEP | `1b8f467965bb818bf2f6511e06993f5607e1721f` |
+| HybridEP | `10d4dd7377d5bce900fbb4b80cce863764892b95` (hybrid-ep branch) |
 | CUTLASS DSL | `4.5.2` (CUDA 13) |
 | Apache TVM FFI | `0.1.11` |
 

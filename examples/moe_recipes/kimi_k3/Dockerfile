@@ -12,9 +12,13 @@ ARG EMERGING_OPTIMIZERS_COMMIT=a44d1f83a4950b445f2a77ca71177c5f033d45d5
 # causal-conv1d 1.6.2.post1. gdn_pre_gated_delta_rule_fusion uses its C++
 # depthwise-convolution backward; the KDA layer raises ImportError without it.
 ARG CAUSAL_CONV1D_COMMIT=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223
-# Match the public DeepSeek-V4 recipe's HybridEP build. Place each EP64
-# group within one NVLink domain; this is not a cross-domain RDMA build.
-ARG HYBRID_EP_COMMIT=1b8f467965bb818bf2f6511e06993f5607e1721f
+# HybridEP from the DeepEP hybrid-ep branch. Revisions before 17cfb81 (#625)
+# read a per-call pinned host token count from the permute/unpermute kernels
+# in blocking mode and fail intermittently with an illegal memory access on
+# long packed sequences (DeepEP issue 756); 10d4dd7 (2026-09-11) no longer
+# does and ran the 512K packed-THD recipe cleanly. Place each EP64 group
+# within one NVLink domain; this is not a cross-domain RDMA build.
+ARG HYBRID_EP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ARG NVTE_CUDA_ARCHS="100a;103a"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
