@@ -28,9 +28,19 @@ def get_packed_seq_params_cp_partition_cu_seqlens(
 
 
 def finalize_packed_seq_params(
-    packed_seq_params: Optional["PackedSeqParams"],
+    packed_seq_params: Optional["PackedSeqParams"], *, sequence_parallel: bool = False
 ) -> Optional["PackedSeqParams"]:
-    """Resolve CP metadata and prebuild the THD layout routes for a microbatch."""
+    """Resolve CP metadata and prebuild the THD layout routes for a microbatch.
+
+    Args:
+        packed_seq_params: Metadata for this microbatch, or None for unpacked input.
+        sequence_parallel: Whether the model shards the sequence over tensor parallelism.
+            Only then are the CP-local THD tensors sequence-parallel shards whose layout
+            conversion exchanges them over the TP x CP group, so the fused TP x CP route
+            is prebuilt only when set. Without it (or when this flag is not passed) the
+            route is built lazily from the cached host ``cu_seqlens`` if a module ever
+            needs it, without an extra device-to-host copy.
+    """
     if packed_seq_params is None:
         return None
 
@@ -55,10 +65,11 @@ def finalize_packed_seq_params(
     # dynamic sub-group of the TP x CP group. Pass the resolved runtime group explicitly:
     # the singleton contract above leaves ``packed_seq_params.cp_group`` unset when CP
     # is off for this microbatch.
+    tp_group = tp_cp_group = None
+    if sequence_parallel:
+        tp_group = get_tensor_model_parallel_group(check_initialized=False)
+        tp_cp_group = get_tensor_and_context_parallel_group(check_initialized=False)
     prebuild_thd_cp_partition_routes(
-        packed_seq_params,
-        cp_group,
-        tp_group=get_tensor_model_parallel_group(check_initialized=False),
-        tp_cp_group=get_tensor_and_context_parallel_group(check_initialized=False),
+        packed_seq_params, cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
     )
     return packed_seq_params
