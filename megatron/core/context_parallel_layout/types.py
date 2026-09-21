@@ -20,7 +20,10 @@ class ThdCpRoute:
     the CP-only route of a CP rank's packed sequence and the fused TP x CP route of
     one sequence-parallel shard: split sizes are ordered by the rank order of the
     communication group the route was built for (the CP group or the TP x CP group),
-    and the caller supplies that group at conversion time.
+    and the caller supplies that group at conversion time. A microbatch carries the
+    CP-only route on its ``PackedSeqParams`` and, under sequence parallelism with
+    fusable groups, the fused route next to it (see
+    ``prebuild_thd_cp_partition_routes``).
     """
 
     zigzag_index: Optional[torch.Tensor]

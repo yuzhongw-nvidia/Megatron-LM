@@ -1123,6 +1123,11 @@ def test_prebuild_thd_cp_partition_routes_also_builds_fused_tp_cp_route(monkeypa
     assert isinstance(route, ThdCpRoute)
     expected = build_thd_tp_cp_partition_route(cu_q, 2, 1, 2, 0, mapping)
     _assert_thd_routes_equal(route, expected)
+    # The CP-only route of the CP-local tensors (e.g. the sequence-gathered core
+    # attention output) is built next to it, from the same host copy of cu_seqlens.
+    _assert_thd_routes_equal(
+        packed_seq_params.cp_partition_route, build_thd_cp_partition_route(cu_q, 2, 1)
+    )
     assert packed_seq_params.thd_cp_host_cu_seqlens_q == [0, 16, 40]
 
     # The lookup returns the prebuilt route for both directions without rebuilding.
@@ -1163,6 +1168,70 @@ def test_prebuild_thd_cp_partition_routes_also_builds_fused_tp_cp_route(monkeypa
             )
             is None
         )
+
+
+def test_prebuild_thd_cp_partition_routes_builds_only_cp_route_for_unfusable_groups(monkeypatch):
+    """SP with groups that cannot be fused keeps the composed fallback, which needs the
+    CP-only route."""
+    monkeypatch.setattr(
+        context_parallel_layout_routes,
+        "resolve_tp_cp_group_rank_by_logical_rank",
+        lambda cp, tp, tp_cp: None,
+    )
+    cu_q = torch.tensor([0, 16, 40], dtype=torch.int32)
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd", cu_seqlens_q=cu_q, cu_seqlens_q_padded=None, cp_partition_route=None
+    )
+    prebuild_thd_cp_partition_routes(
+        packed_seq_params,
+        _FakeGroup(size=2, rank=1),
+        tp_group=_FakeGroup(size=2, rank=0),
+        tp_cp_group=_FakeGroup(size=8, rank=2),
+    )
+    _assert_thd_routes_equal(
+        packed_seq_params.cp_partition_route, build_thd_cp_partition_route(cu_q, 2, 1)
+    )
+    assert getattr(packed_seq_params, "tp_cp_partition_route", None) is None
+
+
+def test_prebuild_thd_cp_partition_routes_keeps_both_route_kinds_for_sequence_parallel(monkeypatch):
+    """A sequence-parallel microbatch needs both routes: the fused one for its input
+    shards and the CP-only one for CP-local tensors such as the sequence-gathered core
+    attention output that Attention restores before the output projection."""
+    cp_group = _FakeGroup(size=2, rank=0)
+    tp_group = _FakeGroup(size=2, rank=1)
+    tp_cp_group = _FakeGroup(size=4, rank=1)
+    monkeypatch.setattr(
+        context_parallel_layout_routes,
+        "resolve_tp_cp_group_rank_by_logical_rank",
+        lambda cp, tp, tp_cp: (0, 1, 2, 3),
+    )
+    cu_q = torch.tensor([0, 16, 40], dtype=torch.int32)
+
+    # A CP-only prebuild followed by a sequence-parallel prebuild on the same object
+    # keeps the CP-only route and adds the fused one.
+    reused = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu_q, cu_seqlens_kv=cu_q)
+    prebuild_thd_cp_partition_routes(reused, cp_group)
+    assert reused.cp_partition_route is not None
+    assert reused.tp_cp_partition_route is None
+    prebuild_thd_cp_partition_routes(reused, cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group)
+    _assert_thd_routes_equal(reused.cp_partition_route, build_thd_cp_partition_route(cu_q, 2, 0))
+    _assert_thd_routes_equal(
+        reused.tp_cp_partition_route,
+        build_thd_tp_cp_partition_route(cu_q, 2, 0, 2, 1, (0, 1, 2, 3)),
+    )
+
+    # A sequence-parallel prebuild builds both at once, and the CP-only lookup hands the
+    # prebuilt route back without the compatibility fallback (which reads the CP group
+    # from the metadata, as finalize_packed_seq_params leaves it).
+    fused = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=cu_q, cu_seqlens_kv=cu_q, cp_group=cp_group
+    )
+    prebuild_thd_cp_partition_routes(fused, cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group)
+    assert fused.tp_cp_partition_route is not None
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert get_thd_cp_partition_route(fused, "zigzag", "contiguous") is fused.cp_partition_route
 
 
 def test_prebuild_thd_cp_partition_routes_skips_fused_route_without_tp(monkeypatch):
@@ -1220,6 +1289,8 @@ def test_get_thd_tp_cp_partition_route_builds_from_host_boundaries_or_warns(monk
         )
     _assert_thd_routes_equal(route, expected)
     assert with_host.tp_cp_partition_route is route
+    # The lazy build goes through the prebuild, which also builds the CP-only route.
+    assert isinstance(with_host.cp_partition_route, ThdCpRoute)
     # The cached route is handed back as is for both directions.
     assert (
         get_thd_tp_cp_partition_route(
@@ -1405,6 +1476,7 @@ def test_sequence_parallel_thd_conversion_matches_unfused_reference(
             packed_seq_params, cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
         )
         assert isinstance(packed_seq_params.tp_cp_partition_route, ThdCpRoute)
+        assert isinstance(packed_seq_params.cp_partition_route, ThdCpRoute)
         converter = CpPartitionModeConverter(
             packed_seq_params=packed_seq_params,
             source_partition_mode=source_layout,
@@ -1472,12 +1544,14 @@ def test_finalize_packed_seq_params_prebuilds_fused_route_only_for_sequence_para
 
     assert result is packed_seq_params
     assert packed_seq_params.cp_group is cp_group
-    assert isinstance(packed_seq_params.cp_partition_route, ThdCpRoute)
     assert packed_seq_params.thd_cp_host_cu_seqlens_q == [0, 16, 40]
     # Static CP never stores a TP x CP group on the metadata; modules keep their own.
     assert packed_seq_params.tp_cp_group is None
+    # The CP-only route is built either way.
+    assert isinstance(packed_seq_params.cp_partition_route, ThdCpRoute)
     if sequence_parallel:
-        # ... but the prebuild itself uses the static TP x CP group.
+        # ... but the prebuild itself uses the static TP x CP group, and builds the
+        # fused route for the sequence-parallel shards next to the CP-only one.
         assert resolved == [(cp_group, tp_group, tp_cp_group)]
         assert isinstance(packed_seq_params.tp_cp_partition_route, ThdCpRoute)
         _assert_thd_routes_equal(
@@ -1485,7 +1559,7 @@ def test_finalize_packed_seq_params_prebuilds_fused_route_only_for_sequence_para
             build_thd_tp_cp_partition_route(cu_seqlens, 2, 1, 2, 0, (0, 2, 1, 3)),
         )
     else:
-        # TP without sequence parallelism has no SP shards to convert; nothing to prebuild.
+        # TP without sequence parallelism converts CP-local sequences only.
         assert resolved == []
         assert packed_seq_params.tp_cp_partition_route is None
 
@@ -1557,12 +1631,15 @@ def test_finalize_packed_seq_params_resolves_dynamic_tp_cp_group(monkeypatch):
     _assert_thd_routes_equal(
         route, build_thd_tp_cp_partition_route(cu_seqlens, 2, 1, 2, 0, (0, 1, 2, 3))
     )
+    assert isinstance(dynamic_packed_seq_params.cp_partition_route, ThdCpRoute)
 
     static_packed_seq_params = PackedSeqParams(
         qkv_format="thd", cu_seqlens_q=cu_seqlens, cu_seqlens_kv=cu_seqlens
     )
     finalize_packed_seq_params(static_packed_seq_params)
     assert static_packed_seq_params.cp_group is static_cp_group
+    assert static_packed_seq_params.cp_partition_route is not None
+    assert static_packed_seq_params.tp_cp_partition_route is None
     # Static CP leaves the field unset so modules fall back to their own TP x CP group.
     assert static_packed_seq_params.tp_cp_group is None
     assert resolve_tp_cp_group(static_tp_cp_group, static_packed_seq_params) is static_tp_cp_group
@@ -1687,6 +1764,7 @@ def test_sequence_parallel_thd_conversion_fuses_dynamic_cp_sub_groups(source_lay
         assert packed_seq_params.tp_cp_group is tp_cp_group
         assert resolve_tp_cp_group(static_tp_cp_group, packed_seq_params) is tp_cp_group
         assert isinstance(packed_seq_params.tp_cp_partition_route, ThdCpRoute)
+        assert isinstance(packed_seq_params.cp_partition_route, ThdCpRoute)
         converter = CpPartitionModeConverter(
             packed_seq_params=packed_seq_params,
             source_partition_mode=source_layout,
