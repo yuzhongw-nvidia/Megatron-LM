@@ -2701,6 +2701,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         """Run TE attention after the runtime CP binding has been installed."""
         if packed_seq_params is not None:
             self.kept_packed_seq_params.discard("cp_group")
+            self.kept_packed_seq_params.discard("tp_cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
 
         # Default to constructor-provided num_splits unless explicitly overridden
