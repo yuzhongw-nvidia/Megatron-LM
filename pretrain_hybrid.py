@@ -187,7 +187,7 @@ def get_batch(data_iterator, vp_stage=None):
             dynamic_cp=is_dynamic_cp,
             config=config,
         )
-        finalize_packed_seq_params(packed_seq_params)
+        finalize_packed_seq_params(packed_seq_params, sequence_parallel=args.sequence_parallel)
         return (
             attention_mask,
             None,
@@ -414,7 +414,7 @@ def forward_step(data_iterator, model: HybridModel):
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
         )
-        finalize_packed_seq_params(packed_seq_params)
+        finalize_packed_seq_params(packed_seq_params, sequence_parallel=args.sequence_parallel)
 
     timers('batch-generator').stop()
 

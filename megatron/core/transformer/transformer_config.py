@@ -1915,14 +1915,8 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.context_parallel_size > 1:
             if self.cp_partition_mode == "contiguous":
-                if (
-                    self.multi_latent_attention
-                    and self.experimental_attention_variant != "dsv4_hybrid"
-                ):
-                    raise ValueError(
-                        "cp_partition_mode='contiguous' is not supported with "
-                        "multi_latent_attention outside dsv4_hybrid."
-                    )
+                # MultiLatentAttention converts its input to the zigzag layout internally,
+                # like Attention, so it no longer restricts cp_partition_mode.
                 if self.experimental_attention_variant != "dsv4_hybrid" and not (
                     is_gated_delta_net_variant(self.experimental_attention_variant)
                 ):
