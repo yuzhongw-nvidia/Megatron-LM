@@ -25,6 +25,7 @@ from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
@@ -393,8 +394,27 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self._setup_mtp_cuda_graphs()
 
         # Output
+        # With --cross-entropy-fusion-impl linear the output projection and the vocab-parallel
+        # cross entropy run as one chunked kernel that never materializes the [s, b, vocab/tp]
+        # logits (bf16 logits plus fp32 copies for the max/exp passes: 3 x 10 GiB + 5 GiB per rank
+        # at 1M tokens with a 163840 vocabulary). LinearCrossEntropyModule is a ColumnParallelLinear
+        # with that extra path; process_mtp_loss uses it for the MTP heads as well.
+        self.fuse_linear_cross_entropy = (
+            self.config.cross_entropy_loss_fusion
+            and self.config.cross_entropy_fusion_impl == "linear"
+        )
+        if self.fuse_linear_cross_entropy:
+            assert not self.config.use_mup, (
+                "cross_entropy_fusion_impl='linear' does not apply the MuP output multiplier to "
+                "the logits; use the native implementation with MuP."
+            )
         if post_process or self.mtp_process:
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            output_layer_cls = (
+                LinearCrossEntropyModule
+                if self.fuse_linear_cross_entropy
+                else tensor_parallel.ColumnParallelLinear
+            )
+            self.output_layer = output_layer_cls(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
@@ -774,6 +794,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 # then back to [S', B, H] for the output layer.
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
+
+        if self.fuse_linear_cross_entropy and labels is not None and not in_inference_mode:
+            # Fused output projection + cross entropy: returns the per-token loss [b, s] without
+            # ever holding the full logits.
+            return self.output_layer(
+                hidden_states,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                output_cross_entropy_loss=True,
+                labels=labels,
+            )
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
