@@ -1925,6 +1925,11 @@ class SelfAttention(Attention):
             pg_collection=self.pg_collection,
             name=(name + ".linear_qkv") if name is not None else None,
         )
+        if not self.config.head_wise_attn_gate:
+            # head_wise_attn_gate appends one gate scalar row per head, which the
+            # grouped QKV layout cannot describe; leave the weight unannotated so
+            # Muon QKV splitting keeps treating it as a whole matrix.
+            self.linear_qkv.weight.qkv_layout = QKVLayout.from_transformer_config(self.config)
 
         # Resolve which norm class to use for Q and K.
         # Config selects the default norm class; spec overrides if set.
