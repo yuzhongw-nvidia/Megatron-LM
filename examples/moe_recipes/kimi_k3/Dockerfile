@@ -6,6 +6,10 @@ FROM nvcr.io/nvidia/pytorch:26.04-py3
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Keep runtime and headers on the same NCCL release; preserve NGC CUDA/PyTorch.
+ARG NCCL_DEB_VERSION=2.32.3-1+cuda13.4
+ENV NCCL_VERSION=2.32.3
+
 ARG TE_COMMIT=0a2ebe942b9f6a66aa0292502966e73114a7b912
 ARG CUDNN_FRONTEND_COMMIT=5ba9432e652e0b4df3aaca85cf3f95fe6bb7375a
 ARG EMERGING_OPTIMIZERS_COMMIT=a44d1f83a4950b445f2a77ca71177c5f033d45d5
@@ -22,8 +26,14 @@ ARG HYBRID_EP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
 ARG NVTE_CUDA_ARCHS="100a;103a"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential git curl ca-certificates gettext libfabric-dev python3-venv && \
+        build-essential git curl ca-certificates gettext libfabric-dev python3-venv \
+        "libnccl2=${NCCL_DEB_VERSION}" "libnccl-dev=${NCCL_DEB_VERSION}" && \
+    ldconfig && \
+    sed -i "s/^NCCL_VERSION=.*/NCCL_VERSION=${NCCL_VERSION}/" /etc/environment && \
     rm -rf /var/lib/apt/lists/* /opt/megatron-lm
+
+# Fail the build if the linker still resolves an older NCCL runtime.
+RUN python -c 'import ctypes; lib = ctypes.CDLL("libnccl.so.2"); version = ctypes.c_int(); assert lib.ncclGetVersion(ctypes.byref(version)) == 0; assert version.value == 23203, version.value'
 
 # Inherit NGC PyTorch/CUDA while keeping pip additions separate from
 # OS-managed packages such as python3-yaml.
@@ -44,8 +54,8 @@ RUN unset PIP_CONSTRAINT && python -m pip install --no-cache-dir \
         --no-build-isolation \
         "nvidia-cudnn-frontend[cutedsl] @ git+https://github.com/NVIDIA/cudnn-frontend.git@${CUDNN_FRONTEND_COMMIT}"
 
-# These recipes use HybridEP. The optional TE NCCL EP extension uses
-# a NCCL device API that does not match the NGC 26.04 base.
+# These recipes use HybridEP. Keep the unused TE NCCL EP extension disabled
+# when upgrading the NCCL runtime.
 RUN unset PIP_CONSTRAINT && \
     NVTE_CUDA_ARCHS="${NVTE_CUDA_ARCHS}" NVTE_BUILD_THREADS_PER_JOB=8 \
     NVTE_FRAMEWORK=pytorch NVTE_WITH_NCCL_EP=0 \
