@@ -75,11 +75,22 @@ RUN unset PIP_CONSTRAINT && \
     python -m pip install --no-build-isolation --no-cache-dir \
         "git+https://github.com/Dao-AILab/causal-conv1d.git@${CAUSAL_CONV1D_COMMIT}"
 
+# The hybrid-ep build links libibverbs / libmlx5 from the NGC base image's source build of
+# rdma-core (60, /workspace/rdma-core/build/lib) and records that directory as the extension's
+# RUNPATH. When deep_ep is imported before NCCL creates its first communicator (Megatron imports
+# it at module level in megatron/core/transformer/moe/fused_a2a.py), that rdma-core is loaded
+# first, NCCL's network plugin then loads the system rdma-core (59.1) as well, its devx HCA query
+# fails with "No space left on device" and NCCL silently falls back to NET/Socket: every transfer
+# that leaves the NVLink domain (pipeline parallelism across racks, cross-rack all-reduces) runs
+# over TCP at about 3 GB/s. Dropping the RUNPATH makes the extension resolve the system libraries
+# like NCCL does; the HYBRID_EP_MULTINODE=0 build uses no RDMA path of its own.
 RUN git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git /opt/DeepEP && \
     cd /opt/DeepEP && git checkout "${HYBRID_EP_COMMIT}" && \
     unset PIP_CONSTRAINT && \
     HYBRID_EP_MULTINODE=0 TORCH_CUDA_ARCH_LIST="10.0" \
-    python -m pip install --no-build-isolation --no-cache-dir .
+    python -m pip install --no-build-isolation --no-cache-dir . && \
+    patchelf --remove-rpath /usr/local/lib/python3.12/dist-packages/hybrid_ep_cpp*.so && \
+    ! readelf -d /usr/local/lib/python3.12/dist-packages/hybrid_ep_cpp*.so | grep -q rdma-core
 
 # NGC's triton-kernels declares pytest as a dependency.
 # Preserve dependency consistency as a build requirement.
