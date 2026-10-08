@@ -80,3 +80,27 @@ activation dtype. They support first-order autograd only.
 Floating-point operation ordering can differ from the unfused path;
 correctness tests do not establish bitwise equivalence or training
 convergence. Enabling either fusion is incompatible with deterministic mode.
+
+
+## Packed boundary selection and runtime validation
+
+GDN/KDA `_resolve_cu_seqlens` only selects padded boundaries when available,
+otherwise the actual boundaries. It takes no token capacity, CP size, or strict
+validation argument and performs no value checks or host transfers. This policy
+is the same for CP1, headwise CP, and chunkwise CP.
+
+Q/KV boundary equality remains a layer runtime check controlled by
+`strict_runtime_validation`, including with a prepared FLA CP context. KDA also
+checks that both boundary arrays contain at least one sequence. These checks
+are not relocated to microbatch construction. In particular, `always` retains
+the synchronization from CUDA Q/KV equality; disabling strict validation removes
+that runtime check. Existing CP route preparation keeps its own layout checks.
+
+The original resolver checks run once in `prepare_packed_seq_params` for every
+packed microbatch containing GDN/KDA, regardless of CP size or mode: each selected
+Q/KV boundary endpoint must match the physical input token count, and every sequence
+length must be divisible by the microbatch's effective CP size. These checks use CPU
+snapshots during batch preparation, independently of the layer's strict flag.
+Callers supply `local_tokens` from the CP-local batch tensors before TP sequence
+sharding, or an explicit global `capacity` on fixed-shape middle pipeline stages.
+The expected length is never inferred from the boundary tensor being checked.

@@ -765,7 +765,7 @@ class TestGatedDeltaNet:
             msg=lambda msg: f"THD padded output mismatch ({rank=}): {msg}",
         )
 
-        # B) no-padded branch: use actual cu_seqlens when it matches total_sequence_length.
+        # B) no-padded branch: use actual cu_seqlens.
         no_padding_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 128])
         _set_gdn_test_cp_partition_mode(no_padding_params, self.cp_size, self.linear_cp_mode)
         output_thd_no_padding, _ = self.gdn(
@@ -789,73 +789,19 @@ class TestGatedDeltaNet:
             msg=lambda msg: f"THD conv-padded output mismatch ({rank=}): {msg}",
         )
 
-        # D) padded mismatch branch: if *_padded[-1] mismatches total_sequence_length, should raise.
-        padded_mismatch_params = make_test_packed_seq_params_with_padding(
-            cu_seqlens=[0, 30, 60, 90, 120], cu_seqlens_padded=[0, 32, 64, 96, 126]
-        )
-        _set_gdn_test_cp_partition_mode(padded_mismatch_params, self.cp_size, self.linear_cp_mode)
-        with pytest.raises(ValueError, match="does not match"):
-            self.gdn(hidden_states_thd, None, packed_seq_params=padded_mismatch_params)
-
-        # E) actual mismatch branch without *_padded: should raise.
-        actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
-        _set_gdn_test_cp_partition_mode(actual_mismatch_params, self.cp_size, self.linear_cp_mode)
-        with pytest.raises(ValueError, match="does not match"):
-            self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
-
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
 class TestGDNCuSeqlensResolve:
 
-    @pytest.fixture
-    def mock_gdn(self):
-        class MockGDN:
-            _resolve_cu_seqlens = GatedDeltaNet._resolve_cu_seqlens
-
-        return MockGDN()
-
-    def test_padded_preferred_when_available(self, mock_gdn):
+    def test_padded_preferred_when_available(self):
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         padded = torch.tensor([0, 504, 1008], dtype=torch.int32)
-        result = mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q", cp_size=2)
-        assert torch.equal(result, padded)
+        assert GatedDeltaNet._resolve_cu_seqlens(padded, actual) is padded
 
-    def test_actual_used_when_no_padding(self, mock_gdn):
+    def test_actual_used_when_no_padding(self):
         actual = torch.tensor([0, 504, 1008], dtype=torch.int32)
-        result = mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
-        assert torch.equal(result, actual)
-
-    def test_raises_when_padding_mismatch(self, mock_gdn):
-        actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
-        with pytest.raises(ValueError, match="does not match"):
-            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
-
-    def test_raises_when_padded_mismatches_total(self, mock_gdn):
-        actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
-        padded = torch.tensor([0, 504, 1004], dtype=torch.int32)
-        with pytest.raises(ValueError, match="does not match"):
-            mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q", cp_size=2)
-
-    def test_raises_when_not_divisible_by_cp_size(self, mock_gdn):
-        actual = torch.tensor([0, 505, 1008], dtype=torch.int32)
-        with pytest.raises(ValueError, match="must be divisible by cp_size"):
-            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
-
-    def test_cp1_still_validates_total(self, mock_gdn):
-        mock_gdn.cp_size = 1
-        actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
-        with pytest.raises(ValueError, match="does not match"):
-            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
-
-    def test_strict_runtime_validation_can_be_skipped(self, mock_gdn):
-        invalid = torch.tensor([0, 505, 1000], dtype=torch.int32)
-
-        result = mock_gdn._resolve_cu_seqlens(
-            None, invalid, 1008, "cu_seqlens_q", cp_size=2, strict_runtime_validation=False
-        )
-
-        assert result is invalid
+        assert GatedDeltaNet._resolve_cu_seqlens(None, actual) is actual
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

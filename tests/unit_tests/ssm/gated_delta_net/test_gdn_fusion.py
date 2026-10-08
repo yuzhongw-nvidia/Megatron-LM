@@ -15,6 +15,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.training.utils.packed_seq_utils import prepare_packed_seq_params
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -930,6 +931,9 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
 
     @staticmethod
     def _run_forward(gdn, hidden_states, packed_seq_params=None):
+        prepare_packed_seq_params(
+            packed_seq_params, gdn.config, local_tokens=hidden_states.shape[0] * gdn.sp_size
+        )
         with torch.no_grad():
             output, bias = gdn(hidden_states, None, packed_seq_params=packed_seq_params)
         if torch.distributed.is_initialized():
@@ -938,6 +942,9 @@ class TestFusedPreGatedDeltaRuleChunkwiseCP:
 
     @staticmethod
     def _run_backward(gdn, hidden_states, grad_output, packed_seq_params=None):
+        prepare_packed_seq_params(
+            packed_seq_params, gdn.config, local_tokens=hidden_states.shape[0] * gdn.sp_size
+        )
         gdn.zero_grad(set_to_none=True)
         hidden_states = hidden_states.detach().clone().requires_grad_(True)
         output, _ = gdn(hidden_states, None, packed_seq_params=packed_seq_params)

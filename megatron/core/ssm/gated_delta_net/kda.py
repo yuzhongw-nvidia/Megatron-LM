@@ -429,7 +429,6 @@ class KimiDeltaAttention(_GDNBase):
 
         cp_size_chunkwise = cp_group_chunkwise.size() if cp_group_chunkwise is not None else 1
         cp_size_headwise = cp_group_headwise.size() if cp_group_headwise is not None else 1
-        cp_size_runtime = cp_group.size()
         back_to_input_converter = None
         if self.config.linear_cp_mode == "chunkwise":
             hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
@@ -490,20 +489,10 @@ class KimiDeltaAttention(_GDNBase):
             if batch != 1:
                 raise ValueError("Packed KDA expects batch dimension to be 1.")
             cu_seqlens_q = self._resolve_cu_seqlens(
-                packed_seq_params.cu_seqlens_q_padded,
-                packed_seq_params.cu_seqlens_q,
-                seq_len_global,
-                "cu_seqlens_q",
-                cp_size=cp_size_runtime,
-                strict_runtime_validation=strict_runtime_validation,
+                packed_seq_params.cu_seqlens_q_padded, packed_seq_params.cu_seqlens_q
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
-                packed_seq_params.cu_seqlens_kv_padded,
-                packed_seq_params.cu_seqlens_kv,
-                seq_len_global,
-                "cu_seqlens_kv",
-                cp_size=cp_size_runtime,
-                strict_runtime_validation=strict_runtime_validation,
+                packed_seq_params.cu_seqlens_kv_padded, packed_seq_params.cu_seqlens_kv
             )
             if strict_runtime_validation:
                 self._validate_packed_cu_seqlens(cu_seqlens_q, cu_seqlens_kv)
