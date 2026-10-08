@@ -3,7 +3,7 @@
 """Kimi Delta Attention, a channel-wise Gated DeltaNet variant."""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Optional
 
@@ -109,6 +109,9 @@ class KimiDeltaAttention(_GDNBase):
                         f"{fp8_align_size} under FP8, got {rank}."
                     )
 
+        # All input projections share the full sequence, including the duplicated low-rank
+        # down projections. Keep SP on the layer/output projection, not on these linears.
+        input_projection_config = replace(config, sequence_parallel=False, tp_comm_overlap=False)
         super().__init__(
             config=config,
             submodules=submodules,
@@ -123,6 +126,7 @@ class KimiDeltaAttention(_GDNBase):
             cp_comm_type=cp_comm_type,
             pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
+            in_proj_config=input_projection_config,
         )
 
         self.in_proj.weight.qkv_layout = self._get_in_proj_qkv_layout()
@@ -133,7 +137,7 @@ class KimiDeltaAttention(_GDNBase):
                     submodules.f_proj,
                     self.hidden_size,
                     self.qk_dim,
-                    config=self.config,
+                    config=input_projection_config,
                     init_method=self.config.init_method,
                     gather_output=False,
                     bias=False,
@@ -150,7 +154,7 @@ class KimiDeltaAttention(_GDNBase):
                     submodules.f_a_proj,
                     self.hidden_size,
                     self.config.kda_f_lora_rank,
-                    config=self.config,
+                    config=input_projection_config,
                     init_method=self.config.init_method,
                     parallel_mode="duplicated",
                     bias=False,
@@ -163,7 +167,7 @@ class KimiDeltaAttention(_GDNBase):
                     submodules.f_b_proj,
                     self.config.kda_f_lora_rank,
                     self.qk_dim,
-                    config=self.config,
+                    config=input_projection_config,
                     init_method=self.config.init_method,
                     gather_output=False,
                     bias=False,
@@ -181,7 +185,7 @@ class KimiDeltaAttention(_GDNBase):
             submodules.beta_proj,
             self.hidden_size,
             self.num_key_heads,
-            config=self.config,
+            config=input_projection_config,
             init_method=self.config.init_method,
             parallel_mode="duplicated",
             bias=bias,
@@ -190,13 +194,6 @@ class KimiDeltaAttention(_GDNBase):
             is_expert=False,
             name=(name + ".beta_proj") if name is not None else None,
         )
-        # _forward_compute explicitly handles both the SP input gather and TP output
-        # scatter. Their paired autograd mappings produce the complete, identical
-        # replicated-weight gradient on every TP rank, so beta_proj must not participate
-        # in the later sequence-parallel parameter-gradient all-reduce.
-        self.beta_proj.sequence_parallel = False
-        for parameter in self.beta_proj.parameters():
-            setattr(parameter, "sequence_parallel", False)
 
         if not self.use_legacy_fused_projections:
             if self.config.kda_gate_lora_rank is None:
@@ -204,7 +201,7 @@ class KimiDeltaAttention(_GDNBase):
                     submodules.g_proj,
                     self.hidden_size,
                     self.v_dim,
-                    config=self.config,
+                    config=input_projection_config,
                     init_method=self.config.init_method,
                     gather_output=False,
                     bias=False,
@@ -219,7 +216,7 @@ class KimiDeltaAttention(_GDNBase):
                     submodules.g_a_proj,
                     self.hidden_size,
                     self.config.kda_gate_lora_rank,
-                    config=self.config,
+                    config=input_projection_config,
                     init_method=self.config.init_method,
                     parallel_mode="duplicated",
                     bias=False,
@@ -232,7 +229,7 @@ class KimiDeltaAttention(_GDNBase):
                     submodules.g_b_proj,
                     self.config.kda_gate_lora_rank,
                     self.v_dim,
-                    config=self.config,
+                    config=input_projection_config,
                     init_method=self.config.init_method,
                     gather_output=False,
                     bias=False,
@@ -605,6 +602,12 @@ class KimiDeltaAttention(_GDNBase):
         """Core KDA computation (projections -> conv1d -> KDA -> norm -> out_proj)."""
 
         nvtx_range_push(suffix="in_proj")
+        if self.config.sequence_parallel:
+            # Column-parallel linears all-reduce their input gradients; duplicated beta's
+            # output scatter all-gathers its gradient. Only split their summed gradient here.
+            hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
+                hidden_states, tensor_parallel_output_grad=False, group=self.tp_group
+            )
         raw_g = None
         gate = None
 
@@ -659,15 +662,7 @@ class KimiDeltaAttention(_GDNBase):
                 seq_len_post_headwise,
                 packed_seq_params,
             )
-        beta_input = hidden_states
-        if self.config.sequence_parallel:
-            # The duplicated projection needs the full sequence. Its output is TP-scattered
-            # below, whose backward all-gathers the complete beta gradient; therefore this
-            # gather's backward only splits instead of reduce-scattering duplicate gradients.
-            beta_input = tensor_parallel.gather_from_sequence_parallel_region(
-                beta_input, tensor_parallel_output_grad=False, group=self.pg_collection.tp
-            )
-        beta, _ = self.beta_proj(beta_input)
+        beta, _ = self.beta_proj(hidden_states)
         beta = tensor_parallel.scatter_to_tensor_model_parallel_region(
             beta, group=self.pg_collection.tp
         )
@@ -1033,18 +1028,15 @@ class KimiDeltaAttention(_GDNBase):
             )
 
     def _projections_reading_hidden_states(self) -> list[torch.nn.Module]:
-        """in_proj plus the separate f / gate / beta projections that also read hidden states.
-
-        f_b_proj and g_b_proj consume the low-rank latents, not the hidden states. Under
-        sequence parallelism beta_proj reads an all-gathered copy of the hidden states rather
-        than the layernorm output itself, so saving its original input would only cost memory.
-        """
+        """Projections that directly consume the input-layernorm output."""
+        if self.config.sequence_parallel:
+            # All projections read the gathered copy, not the discarded layernorm output.
+            return []
         modules = super()._projections_reading_hidden_states()
         if not self.use_legacy_fused_projections:
             modules.append(self.f_proj if self.config.kda_f_lora_rank is None else self.f_a_proj)
             modules.append(self.g_proj if self.config.kda_gate_lora_rank is None else self.g_a_proj)
-        if not self.config.sequence_parallel:
-            modules.append(self.beta_proj)
+        modules.append(self.beta_proj)
         return modules
 
     def backward_dw(self) -> None:

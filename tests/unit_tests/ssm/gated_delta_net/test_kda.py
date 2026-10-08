@@ -3,12 +3,13 @@
 import copy
 import os
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
@@ -367,11 +368,12 @@ def test_kda_input_layernorm_recompute_fp8_sequence_parallel():
         layer = TransformerLayer(config, hybrid_stack_spec.submodules.kda_layer.submodules)
         assert layer.recompute_input_layernorm
         kda = layer.self_attention
-        assert kda.in_proj.save_original_input
-        assert kda.f_a_proj.save_original_input
-        assert kda.g_a_proj.save_original_input
-        # SP beta consumes an all-gathered copy, not the discarded layernorm output.
-        assert not kda.beta_proj.save_original_input
+        # Every input projection consumes the shared gather, not the discarded norm output.
+        for name, projection in kda.named_children():
+            if name.endswith("_proj") and name != "out_proj":
+                assert not projection.sequence_parallel
+                assert not projection.save_original_input
+                assert not getattr(projection.weight, "sequence_parallel", False)
     finally:
         Utils.destroy_model_parallel()
 
@@ -598,24 +600,30 @@ def test_parallel_kda_correctness(
     config = _make_config(
         linear_cp_mode=linear_cp_mode, f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank
     )
-    _test_parallel_attention_correctness(
-        transformer_config=config,
-        transformer_layer_spec=hybrid_stack_spec.submodules.kda_layer,
-        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
-        atol=1e-2,
-        rtol=1e-2,
-        # Parallel projection/reduction order can move individual BF16 values by
-        # one observed bin; the dedicated padded-CP test above also bounds relative L2.
-        input_grad_atol=_KDA_INPUT_GRAD_ATOL,
-        input_grad_rtol=1e-2,
-        tp=tp,
-        sp=sp,
-        cp=cp,
-        seed=42,
-        sequence_length=128,
-        micro_batch_size=2,
-        sequence_packing=sequence_packing,
-    )
+    with patch.object(
+        tensor_parallel,
+        "gather_from_sequence_parallel_region",
+        wraps=tensor_parallel.gather_from_sequence_parallel_region,
+    ) as gather:
+        _test_parallel_attention_correctness(
+            transformer_config=config,
+            transformer_layer_spec=hybrid_stack_spec.submodules.kda_layer,
+            tmp_path_dist_ckpt=tmp_path_dist_ckpt,
+            atol=1e-2,
+            rtol=1e-2,
+            # Parallel projection/reduction order can move individual BF16 values by
+            # one observed bin; the dedicated padded-CP test above also bounds relative L2.
+            input_grad_atol=_KDA_INPUT_GRAD_ATOL,
+            input_grad_rtol=1e-2,
+            tp=tp,
+            sp=sp,
+            cp=cp,
+            seed=42,
+            sequence_length=128,
+            micro_batch_size=2,
+            sequence_packing=sequence_packing,
+        )
+    assert gather.call_count == int(sp)
 
 
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")

@@ -127,3 +127,18 @@ FLA caching is disabled. With strict runtime validation disabled, the prepared
 layer entrance performs no metadata H2D/D2H, scalar readback, or host synchronization.
 Headwise permutations, SBHD context caching, and later recurrence chunk/backward
 indices are unchanged.
+
+## KDA sequence-parallel input projections
+
+KDA gathers its sequence-parallel input once and shares the full sequence across
+Q/K/V, decay, output-gate, and beta projections. The input linears disable SP and
+its communication overlap; the layer and output projection retain SP. Low-rank
+down projections also consume the gathered input, so their replicated weights
+already receive complete TP gradients and need no additional SP gradient reduction.
+
+Column-parallel linears retain their ordinary TP input-gradient all-reduce.
+Beta's output scatter gathers the complete beta gradient in backward. The shared
+input gather therefore only splits its backward gradient, avoiding a second
+reduction. Input-layernorm recomputation does not ask these linears to retain
+original inputs under SP: they consume the gathered copy, not the layernorm output.
+Projection parameter shapes and checkpoint layouts are unchanged.
