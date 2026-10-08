@@ -147,6 +147,7 @@ class _GDNBase(MegatronModule):
         cp_comm_type: str | None = None,
         pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
+        in_proj_config: TransformerConfig | None = None,
     ):
         """
         Args:
@@ -167,6 +168,8 @@ class _GDNBase(MegatronModule):
             pp_layer_offset (Optional[int]): Pipeline layer offset forwarded by
                 TransformerLayer. Stored for MTP/TransformerLayer API compatibility.
             is_mtp_layer (bool): Whether this module is inside an MTP prediction depth.
+            in_proj_config: Optional input-projection config for variants that gather SP input
+                outside the projection.
         """
         if not HAVE_FLA:
             raise ImportError(
@@ -255,7 +258,7 @@ class _GDNBase(MegatronModule):
             submodules.in_proj,
             self.hidden_size,
             self.in_proj_dim,
-            config=self.config,
+            config=self.config if in_proj_config is None else in_proj_config,
             init_method=self.config.init_method,
             gather_output=False,
             bias=bias,
