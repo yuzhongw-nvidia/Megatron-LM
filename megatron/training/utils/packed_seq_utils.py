@@ -2,6 +2,8 @@
 
 """Shared preparation of packed microbatch metadata before model execution."""
 
+import torch
+
 from megatron.core.context_parallel_layout import finalize_packed_seq_params
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -63,6 +65,15 @@ def prepare_packed_seq_params(
                     "All per-sequence lengths in cu_seqlens must be divisible by "
                     f"cp_size={cp_size}, but got lengths: {seq_lengths.tolist()}"
                 )
+            if name == "q":
+                cu_seqlens_q_cpu = cu_cpu
+
+        if config.linear_cp_mode == "chunkwise" and cp_size > 1:
+            prepare_linear_attention_cp(
+                packed_seq_params,
+                cu_seqlens_cpu=cu_seqlens_q_cpu,
+                conv_kernel_size=config.linear_conv_kernel_dim,
+            )
 
     if packed_seq_params is None or not getattr(config, "dsa_cp_balance_indexer", False):
         return packed_seq_params
@@ -84,6 +95,30 @@ def prepare_packed_seq_params(
         graph_dynamic_packs=dynamic_packs,
     )
     return packed_seq_params
+
+
+def prepare_linear_attention_cp(
+    packed_seq_params: PackedSeqParams, *, cu_seqlens_cpu: torch.Tensor, conv_kernel_size: int
+) -> None:
+    """Build the FLA context from this microbatch's validated CPU boundaries.
+
+    Called by ``prepare_packed_seq_params`` after resolving the CP group. The CPU
+    snapshot must be fresh for each microbatch, including reused CUDA buffers,
+    because FLA caches by tensor identity. Keep metadata unchanged through backward.
+    """
+    from fla.ops.cp import build_cp_context
+
+    cu_seqlens = (
+        packed_seq_params.cu_seqlens_q_padded
+        if packed_seq_params.cu_seqlens_q_padded is not None
+        else packed_seq_params.cu_seqlens_q
+    )
+    packed_seq_params.fla_cp_context = build_cp_context(
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        group=packed_seq_params.cp_group,
+        conv1d_kernel_size=conv_kernel_size,
+    )
 
 
 def _model_has_linear_attention(config: TransformerConfig) -> bool:

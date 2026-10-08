@@ -104,3 +104,30 @@ snapshots during batch preparation, independently of the layer's strict flag.
 Callers supply `local_tokens` from the CP-local batch tensors before TP sequence
 sharding, or an explicit global `capacity` on fixed-shape middle pipeline stages.
 The expected length is never inferred from the boundary tensor being checked.
+
+## Packed chunkwise-CP preparation
+
+The training helper `prepare_packed_seq_params` builds FLA metadata once per
+packed chunkwise-CP microbatch for models containing GDN/KDA, including hybrid
+MTP. It stores one derived `PackedSeqParams.fla_cp_context`, shared by the layers.
+The preparation helper reuses the CPU Q boundaries from the checks above.
+`prepare_linear_attention_cp` lives beside `prepare_packed_seq_params` in
+`megatron/training/utils/packed_seq_utils.py`; no additional core module is needed.
+
+Call `megatron.training.utils.packed_seq_utils.prepare_packed_seq_params` with
+the model config and physical token count before model execution. Integrations
+that construct their own metadata should validate the physical boundaries and
+provide the FLA context the same way; when they do not, the first chunkwise-CP
+layer builds the context itself (`_GDNBase._get_chunkwise_cp_context`) and stores
+it on the `PackedSeqParams`, so the remaining layers of that microbatch still share
+it at the cost of one device-to-host boundary copy per microbatch. A fresh temporary
+CPU snapshot avoids stale FLA identity-cache hits when CUDA boundary buffers are
+reused. Keep a microbatch's metadata unchanged through backward, and prepare again
+for the next microbatch. FLA may retain the snapshot in its own bounded cache; only
+its derived context is stored on the batch.
+
+Context construction and its CPU/GPU transfers occur before the model, even when
+FLA caching is disabled. With strict runtime validation disabled, the prepared
+layer entrance performs no metadata H2D/D2H, scalar readback, or host synchronization.
+Headwise permutations, SBHD context caching, and later recurrence chunk/backward
+indices are unchanged.

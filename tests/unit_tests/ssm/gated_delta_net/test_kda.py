@@ -15,12 +15,14 @@ from megatron.core.models.common.embeddings.rope_utils import (
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, KimiDeltaAttention
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.training.utils.packed_seq_utils import prepare_packed_seq_params
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
@@ -190,10 +192,7 @@ def test_kda_per_head_muon_uses_rank_major_projection_layout(
         model_parallel_cuda_manual_seed(123)
         config = _make_config(tp_size=2, f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank)
         kda = _build_kda(config)
-        assert kda.beta_proj.weight.shape == (
-            config.linear_num_key_heads,
-            config.hidden_size,
-        )
+        assert kda.beta_proj.weight.shape == (config.linear_num_key_heads, config.hidden_size)
         assert not getattr(kda.beta_proj.weight, "tensor_model_parallel", False)
         assert not getattr(kda.beta_proj.weight, "sequence_parallel", False)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -617,3 +616,87 @@ def test_parallel_kda_correctness(
         micro_batch_size=2,
         sequence_packing=sequence_packing,
     )
+
+
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+def test_kda_prepared_metadata_and_runtime_validation(monkeypatch):
+    """Preparation needs no layer transfers; Q/KV validation stays runtime-controlled."""
+    import fla.utils
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class NoHostTransfers(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            assert func not in (
+                torch.ops.aten._local_scalar_dense.default,
+                torch.ops.aten.equal.default,
+            )
+            if func == torch.ops.aten._to_copy.default:
+                destination = torch.device(kwargs.get("device", args[0].device))
+                assert (args[0].device.type == "cpu") == (destination.type == "cpu")
+            if func == torch.ops.aten.copy_.default:
+                assert (args[0].device.type == "cpu") == (args[1].device.type == "cpu")
+            return func(*args, **kwargs)
+
+    Utils.initialize_model_parallel(2, 1, context_parallel_size=2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = replace(
+            _make_config(
+                tp_size=2,
+                cp_size=2,
+                sequence_parallel=True,
+                linear_cp_mode="chunkwise",
+                f_lora_rank=8,
+                gate_lora_rank=12,
+            ),
+            cp_partition_mode="contiguous",
+            sequence_packing_scheduler="dp_balanced",
+            strict_runtime_validation_frequency="always",
+        )
+        layer = _build_kda(config)
+        hidden = torch.randn(16, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        cu = torch.tensor([0, 32, 64], device="cuda", dtype=torch.int32)
+        packed = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu.clone(),
+            cp_partition_mode="contiguous",
+            cp_group=layer.pg_collection.cp,
+        )
+
+        # Stop at the first projection: later FLA chunk-index work is a separate
+        # optimization, and numerical coverage comes from the existing CP tests.
+        class AtProjection(Exception):
+            pass
+
+        def stop_at_projection(_module, _inputs):
+            raise AtProjection
+
+        hook = layer.in_proj.register_forward_pre_hook(stop_at_projection)
+        previous_context = None
+        for boundaries, disable_cache in (
+            ([0, 32, 64], False),
+            ([0, 16, 64], False),
+            ([0, 48, 64], True),
+        ):
+            monkeypatch.setattr(fla.utils, "FLA_DISABLE_TENSOR_CACHE", disable_cache)
+            # Reuse the same device buffers for a different microbatch.
+            cu.copy_(torch.tensor(boundaries, device="cuda", dtype=cu.dtype))
+            packed.cu_seqlens_kv.copy_(cu)
+            prepare_packed_seq_params(packed, config, local_tokens=hidden.shape[0] * layer.sp_size)
+            context = packed.fla_cp_context
+            assert context is not previous_context
+            for _ in range(2):
+                with NoHostTransfers(), pytest.raises(AtProjection):
+                    layer(hidden, None, packed_seq_params=packed, strict_runtime_validation=False)
+            previous_context = context
+        # Q/KV equality remains a runtime check even with a prepared CP context.
+        packed.cu_seqlens_kv[1] -= 1
+        with pytest.raises(ValueError, match="cu_seqlens_q to equal cu_seqlens_kv"):
+            layer(hidden, None, packed_seq_params=packed, strict_runtime_validation=True)
+        with NoHostTransfers(), pytest.raises(AtProjection):
+            layer(hidden, None, packed_seq_params=packed, strict_runtime_validation=False)
+        hook.remove()
+    finally:
+        Utils.destroy_model_parallel()

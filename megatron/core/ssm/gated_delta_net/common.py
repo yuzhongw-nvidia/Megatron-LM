@@ -519,6 +519,60 @@ class _GDNBase(MegatronModule):
         """Select physical packed boundaries, preferring alignment-padded boundaries."""
         return cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens_actual
 
+    def _get_chunkwise_cp_context(
+        self,
+        *,
+        packed_seq_params: Optional[PackedSeqParams],
+        cu_seqlens_q: Optional[torch.Tensor],
+        seq_len_global: int,
+        batch: int,
+        cp_group_chunkwise: torch.distributed.ProcessGroup,
+    ) -> tuple[torch.Tensor, object]:
+        """Return ``(cu_seqlens_q, FLA chunkwise-CP context)`` for this forward call.
+
+        SBHD inputs (``cu_seqlens_q is None``) use one context per ``(seq_len, batch)``
+        shape, cached on the module. Packed THD inputs share the context that
+        ``megatron.training.utils.packed_seq_utils.prepare_packed_seq_params`` builds once
+        per microbatch (``PackedSeqParams.fla_cp_context``). A caller that did not prepare
+        the microbatch gets the context built here, from a fresh CPU snapshot of the
+        boundaries, and stored on the same ``PackedSeqParams`` so the remaining layers of
+        the microbatch reuse it; that costs one device-to-host copy per microbatch instead
+        of one per layer. The metadata must stay unchanged until the microbatch's backward
+        has run, which also holds for prepared microbatches.
+        """
+        if build_cp_context is None:
+            raise ImportError(
+                "FLA chunkwise context parallelism requires fla.ops.cp.build_cp_context. "
+                "Install an FLA build that provides the CP extension, or use CP=1/headwise CP."
+            )
+        if cu_seqlens_q is None:
+            cache_key = (seq_len_global, batch)
+            cached = self._chunkwise_cp_context_cache.get(cache_key)
+            if cached is None:
+                cached_cu_seqlens = (
+                    torch.arange(batch + 1, device=torch.cuda.current_device(), dtype=torch.long)
+                    * seq_len_global
+                )
+                cached_ctx = build_cp_context(
+                    cu_seqlens=cached_cu_seqlens,
+                    group=cp_group_chunkwise,
+                    conv1d_kernel_size=self.conv_kernel_dim,
+                )
+                cached = (cached_cu_seqlens, cached_ctx)
+                self._chunkwise_cp_context_cache[cache_key] = cached
+            return cached
+
+        context = packed_seq_params.fla_cp_context
+        if context is None:
+            context = build_cp_context(
+                cu_seqlens=cu_seqlens_q,
+                cu_seqlens_cpu=cu_seqlens_q.detach().to(device="cpu", copy=True),
+                group=cp_group_chunkwise,
+                conv1d_kernel_size=self.conv_kernel_dim,
+            )
+            packed_seq_params.fla_cp_context = context
+        return cu_seqlens_q, context
+
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
         # Guard for cases metadata is not provided

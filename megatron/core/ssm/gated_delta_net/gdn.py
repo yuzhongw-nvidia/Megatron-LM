@@ -21,7 +21,6 @@ from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,
     a2a_hp_to_cp,
-    build_cp_context,
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
@@ -252,35 +251,13 @@ class GatedDeltaNet(_GDNBase):
             cu_seqlens_kv = None
 
         if cp_size_chunkwise > 1:
-            if build_cp_context is None:
-                raise ImportError(
-                    "FLA chunkwise context parallelism requires fla.ops.cp.build_cp_context. "
-                    "Install an FLA build that provides the CP extension, or use CP=1/headwise CP."
-                )
-            if cu_seqlens_q is None:
-                cache_key = (seq_len_global, batch)
-                cached = self._chunkwise_cp_context_cache.get(cache_key)
-                if cached is None:
-                    cached_cu_seqlens = (
-                        torch.arange(
-                            batch + 1, device=torch.cuda.current_device(), dtype=torch.long
-                        )
-                        * seq_len_global
-                    )
-                    cached_ctx = build_cp_context(
-                        cu_seqlens=cached_cu_seqlens,
-                        group=cp_group_chunkwise,
-                        conv1d_kernel_size=self.conv_kernel_dim,
-                    )
-                    cached = (cached_cu_seqlens, cached_ctx)
-                    self._chunkwise_cp_context_cache[cache_key] = cached
-                cu_seqlens_q, chunkwise_cp_context = cached
-            else:
-                chunkwise_cp_context = build_cp_context(
-                    cu_seqlens=cu_seqlens_q,
-                    group=cp_group_chunkwise,
-                    conv1d_kernel_size=self.conv_kernel_dim,
-                )
+            cu_seqlens_q, chunkwise_cp_context = self._get_chunkwise_cp_context(
+                packed_seq_params=packed_seq_params,
+                cu_seqlens_q=cu_seqlens_q,
+                seq_len_global=seq_len_global,
+                batch=batch,
+                cp_group_chunkwise=cp_group_chunkwise,
+            )
         else:
             chunkwise_cp_context = None
 
