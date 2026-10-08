@@ -26,6 +26,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     causal_conv1d,
     get_parameter_local_cp,
 )
+from megatron.core.tensor_parallel.utils import split_tensor_along_last_dim
 from megatron.core.transformer.attention import QKVLayout
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
@@ -46,6 +47,43 @@ try:
     from megatron.core.fusions.fused_pre_kda import fused_streamed_pre_kda
 except ImportError:
     fused_streamed_pre_kda = None
+
+
+class _ScatterToTensorParallelRegionPartialGrad(torch.autograd.Function):
+    """Keep this rank's slice of the last dimension of a tensor replicated over TP.
+
+    `scatter_to_tensor_model_parallel_region` all-gathers the slices' gradients in backward, so
+    every rank holds the complete gradient of the replicated tensor. Here the backward zero-pads
+    this rank's slice gradient instead: the gradient of this rank's replica alone. Summing those
+    partial gradients over the TP group once (the reduce-scatter in the shared input gather's
+    backward, the sequence-parallel all-reduce of the producing weight's gradient) gives the
+    complete gradient without an all-gather or a second reduction.
+    """
+
+    @staticmethod
+    def forward(ctx, input_, group):
+        """Split along the last dimension and keep this rank's slice."""
+        ctx.group = group
+        ctx.full_width = input_.shape[-1]
+        world_size = group.size()
+        if world_size == 1:
+            return input_
+        return split_tensor_along_last_dim(input_, world_size)[group.rank()].contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Zero-pad the slice gradient to the full width."""
+        world_size = ctx.group.size()
+        if world_size == 1:
+            return grad_output, None
+        grad_input = torch.zeros(
+            (*grad_output.shape[:-1], ctx.full_width),
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        start = ctx.group.rank() * grad_output.shape[-1]
+        grad_input[..., start : start + grad_output.shape[-1]] = grad_output
+        return grad_input, None
 
 
 @dataclass
@@ -110,7 +148,14 @@ class KimiDeltaAttention(_GDNBase):
 
         # All input projections share the full sequence, including the duplicated low-rank
         # down projections. Keep SP on the layer/output projection, not on these linears.
+        # Under SP the layer gathers the input once and reduce-scatters the sum of the
+        # projections' partial input gradients once (see `_forward_compute`), so the
+        # column-parallel projections do no TP communication of their own and the duplicated
+        # ones keep SP on their weights: their partial weight gradients are summed over TP by
+        # the sequence-parallel gradient all-reduce.
+        self.explicit_input_projection_comm = bool(config.sequence_parallel)
         input_projection_config = replace(config, sequence_parallel=False, tp_comm_overlap=False)
+        duplicated_projection_config = replace(config, tp_comm_overlap=False)
         super().__init__(
             config=config,
             submodules=submodules,
@@ -126,9 +171,15 @@ class KimiDeltaAttention(_GDNBase):
             pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
             in_proj_config=input_projection_config,
+            in_proj_explicit_tp_comm=self.explicit_input_projection_comm,
         )
 
         self.in_proj.weight.qkv_layout = self._get_in_proj_qkv_layout()
+
+        # Only pass the flag when set so projection specs without it keep working.
+        column_projection_kwargs = (
+            {"explicit_tp_comm": True} if self.explicit_input_projection_comm else {}
+        )
 
         if not self.use_legacy_fused_projections:
             if self.config.kda_f_lora_rank is None:
@@ -145,6 +196,7 @@ class KimiDeltaAttention(_GDNBase):
                     tp_comm_buffer_name="f_proj",
                     tp_group=self.pg_collection.tp,
                     name=(name + ".f_proj") if name is not None else None,
+                    **column_projection_kwargs,
                 )
             else:
                 # Preserve two distinct, bias-free F-decay weights. The down
@@ -153,7 +205,7 @@ class KimiDeltaAttention(_GDNBase):
                     submodules.f_a_proj,
                     self.hidden_size,
                     self.config.kda_f_lora_rank,
-                    config=input_projection_config,
+                    config=duplicated_projection_config,
                     init_method=self.config.init_method,
                     parallel_mode="duplicated",
                     bias=False,
@@ -175,6 +227,7 @@ class KimiDeltaAttention(_GDNBase):
                     tp_comm_buffer_name="f_b_proj",
                     tp_group=self.pg_collection.tp,
                     name=(name + ".f_b_proj") if name is not None else None,
+                    **column_projection_kwargs,
                 )
 
         # Beta has only one scalar per key head. Keep this small projection replicated
@@ -184,7 +237,7 @@ class KimiDeltaAttention(_GDNBase):
             submodules.beta_proj,
             self.hidden_size,
             self.num_key_heads,
-            config=input_projection_config,
+            config=duplicated_projection_config,
             init_method=self.config.init_method,
             parallel_mode="duplicated",
             bias=bias,
@@ -209,13 +262,14 @@ class KimiDeltaAttention(_GDNBase):
                     tp_comm_buffer_name="g_proj",
                     tp_group=self.pg_collection.tp,
                     name=(name + ".g_proj") if name is not None else None,
+                    **column_projection_kwargs,
                 )
             else:
                 self.g_a_proj = build_module(
                     submodules.g_a_proj,
                     self.hidden_size,
                     self.config.kda_gate_lora_rank,
-                    config=input_projection_config,
+                    config=duplicated_projection_config,
                     init_method=self.config.init_method,
                     parallel_mode="duplicated",
                     bias=False,
@@ -237,6 +291,7 @@ class KimiDeltaAttention(_GDNBase):
                     tp_comm_buffer_name="g_b_proj",
                     tp_group=self.pg_collection.tp,
                     name=(name + ".g_b_proj") if name is not None else None,
+                    **column_projection_kwargs,
                 )
 
         # These kernel parameters participate in FP32 gate math and must remain
@@ -579,10 +634,12 @@ class KimiDeltaAttention(_GDNBase):
 
         nvtx_range_push(suffix="in_proj")
         if self.config.sequence_parallel:
-            # Column-parallel linears all-reduce their input gradients; duplicated beta's
-            # output scatter all-gathers its gradient. Only split their summed gradient here.
+            # One gather for every input projection. None of them communicates over TP: the
+            # column-parallel ones run with explicit_tp_comm and beta's output split keeps
+            # this rank's partial gradient, so the backward reduce-scatters the sum of their
+            # partial input gradients once.
             hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
-                hidden_states, tensor_parallel_output_grad=False, group=self.tp_group
+                hidden_states, tensor_parallel_output_grad=True, group=self.tp_group
             )
         raw_g = None
         gate = None
@@ -639,9 +696,14 @@ class KimiDeltaAttention(_GDNBase):
                 packed_seq_params,
             )
         beta, _ = self.beta_proj(hidden_states)
-        beta = tensor_parallel.scatter_to_tensor_model_parallel_region(
-            beta, group=self.pg_collection.tp
-        )
+        if self.explicit_input_projection_comm:
+            # Partial (this replica's) gradient: the shared gather reduce-scatters it and the
+            # sequence-parallel gradient all-reduce sums beta's weight gradient over TP.
+            beta = _ScatterToTensorParallelRegionPartialGrad.apply(beta, self.pg_collection.tp)
+        else:
+            beta = tensor_parallel.scatter_to_tensor_model_parallel_region(
+                beta, group=self.pg_collection.tp
+            )
         beta, _ = a2a_cp_to_hp(
             beta,
             (self.num_k_heads_local_tp,),

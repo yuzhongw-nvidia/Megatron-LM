@@ -148,6 +148,7 @@ class _GDNBase(MegatronModule):
         pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
         in_proj_config: TransformerConfig | None = None,
+        in_proj_explicit_tp_comm: bool = False,
     ):
         """
         Args:
@@ -170,6 +171,9 @@ class _GDNBase(MegatronModule):
             is_mtp_layer (bool): Whether this module is inside an MTP prediction depth.
             in_proj_config: Optional input-projection config for variants that gather SP input
                 outside the projection.
+            in_proj_explicit_tp_comm: Build the input projection with `explicit_tp_comm`
+                (no TP communication of its own) for variants that gather its input and reduce
+                its input gradient themselves. Only passed to the projection when True.
         """
         if not HAVE_FLA:
             raise ImportError(
@@ -267,6 +271,7 @@ class _GDNBase(MegatronModule):
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
             name=(name + ".in_proj") if name is not None else None,
+            **({"explicit_tp_comm": True} if in_proj_explicit_tp_comm else {}),
         )
 
         # Conv1d for QKV

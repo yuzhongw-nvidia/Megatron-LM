@@ -136,13 +136,29 @@ indices are unchanged.
 
 KDA gathers its sequence-parallel input once and shares the full sequence across
 Q/K/V, decay, output-gate, and beta projections. The input linears disable SP and
-its communication overlap; the layer and output projection retain SP. Low-rank
-down projections also consume the gathered input, so their replicated weights
-already receive complete TP gradients and need no additional SP gradient reduction.
+its communication overlap; the layer and output projection retain SP. The layer
+also reduces the input gradient once: the shared gather's backward reduce-scatters
+the sum of the projections' partial input gradients
+(`tensor_parallel_output_grad=True`), and no input projection communicates over TP
+on its own.
 
-Column-parallel linears retain their ordinary TP input-gradient all-reduce.
-Beta's output scatter gathers the complete beta gradient in backward. The shared
-input gather therefore only splits its backward gradient, avoiding a second
-reduction. Input-layernorm recomputation does not ask these linears to retain
-original inputs under SP: they consume the gathered copy, not the layernorm output.
-Projection parameter shapes and checkpoint layouts are unchanged.
+- Column-parallel projections (Q/K/V, full-rank decay/gate, low-rank up
+  projections) are built with `explicit_tp_comm=True` (`TEColumnParallelLinear`,
+  `ColumnParallelLinear`): the weight stays sharded along the output dimension but
+  the layer issues no all-gather or input-gradient all-reduce, like the MoE experts
+  with `explicit_expert_comm`. Their weight gradients are complete because the
+  gathered input is.
+- Duplicated projections (beta, low-rank down projections) keep SP on their
+  weights (`weight.sequence_parallel`), so their partial weight gradients are
+  summed over TP by the sequence-parallel gradient all-reduce in
+  `finalize_model_grads`, as for layer norms. Beta's output split keeps this rank's
+  partial gradient (`_ScatterToTensorParallelRegionPartialGrad` zero-pads it) instead
+  of all-gathering the complete one, so beta contributes a partial input gradient
+  like every other projection. A low-rank up projection with `explicit_tp_comm`
+  hands its down projection a partial latent gradient, which makes the down
+  projection's input and weight gradients partial as well.
+
+Without SP (replicated input), the projections keep their ordinary TE/Megatron
+tensor-parallel communication. Input-layernorm recomputation does not ask these
+linears to retain original inputs under SP: they consume the gathered copy, not the
+layernorm output. Projection parameter shapes and checkpoint layouts are unchanged.
