@@ -759,6 +759,10 @@ class TELinear(te.pytorch.Linear):
         - "duplicated": No tensor parallelism and weight is duplicated across TP ranks
         - Note: For expert linear layers, we will disable communication logic here
                 as TP communication is handled in token_dispatcher.
+        - Note: explicit_tp_comm=True keeps the "column"/"row" weight sharding but also
+                disables the communication logic here, for callers that gather the input
+                and reduce the input gradient themselves (for example once for several
+                linears that share one input).
     """
 
     def __init__(
@@ -774,14 +778,23 @@ class TELinear(te.pytorch.Linear):
         skip_weight_param_allocation: bool,
         tp_comm_buffer_name: Optional[str] = None,
         is_expert: bool = False,
+        explicit_tp_comm: bool = False,
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
     ):
         """
         Args:
+            explicit_tp_comm (bool): Shard the weight as `parallel_mode` says but issue no
+                tensor-parallel communication inside the layer: the caller provides the
+                already-gathered (column) or still-sharded (row) input and reduces the
+                input gradient (column) or the output (row) itself. Not valid with
+                `parallel_mode="duplicated"`.
             name (str | None): module instance name passed top-down from its paranet module
         """
+        if explicit_tp_comm and parallel_mode == "duplicated":
+            raise ValueError("explicit_tp_comm requires a column- or row-parallel linear")
+        self.explicit_tp_comm = explicit_tp_comm
         if not HAVE_TE:
             raise ImportError(
                 "Transformer Engine is not installed. "
@@ -825,7 +838,12 @@ class TELinear(te.pytorch.Linear):
             )
 
         if is_te_min_version("0.8.0"):
-            if self.config.tp_comm_overlap and parallel_mode != "duplicated":
+            # No overlap settings for layers that do no TP communication of their own.
+            if (
+                self.config.tp_comm_overlap
+                and parallel_mode != "duplicated"
+                and not explicit_tp_comm
+            ):
                 if is_te_min_version("1.5.0"):
                     # Use old overlap flags if they were supplied instead
                     extra_kwargs["ub_overlap_ag"] = (
@@ -894,7 +912,8 @@ class TELinear(te.pytorch.Linear):
             # Disable communications in TE when using TP or EP by
             explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
-            if explicit_expert_comm:
+            # Also when the caller gathers the input / reduces the input gradient itself.
+            if explicit_expert_comm or explicit_tp_comm:
                 if parallel_mode == "column":
                     output_size = divide(output_size, tp_size)
                 elif parallel_mode == "row":
@@ -1403,10 +1422,14 @@ class TEColumnParallelLinear(TELinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
+        explicit_tp_comm: bool = False,
         name: str | None = None,
     ):
         """
         Args:
+            explicit_tp_comm (bool): Keep the output-dimension sharding but do no
+                tensor-parallel communication in the layer: the input is already gathered
+                and the caller reduces the input gradient (see `TELinear`).
             name (str | None): module instance name passed top-down from its paranet module
         """
         if not HAVE_TE:
@@ -1436,12 +1459,20 @@ class TEColumnParallelLinear(TELinear):
             bias=bias,
             skip_bias_add=skip_bias_add,
             is_expert=is_expert,
+            explicit_tp_comm=explicit_tp_comm,
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
             name=name,
         )
+
+        if explicit_tp_comm:
+            # TE was built without tensor parallelism; the parameters are sharded all the same
+            # (plain setattr: TE may already have stamped partition_dim).
+            for param in self.parameters():
+                setattr(param, "tensor_model_parallel", True)
+                setattr(param, "partition_dim", 0)
 
         # Set proper partition_stride
         setattr(self.weight, 'partition_stride', stride)

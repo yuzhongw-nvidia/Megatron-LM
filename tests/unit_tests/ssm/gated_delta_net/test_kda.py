@@ -19,6 +19,7 @@ from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, KimiDeltaAttention
+from megatron.core.tensor_parallel import mappings
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
@@ -368,12 +369,22 @@ def test_kda_input_layernorm_recompute_fp8_sequence_parallel():
         layer = TransformerLayer(config, hybrid_stack_spec.submodules.kda_layer.submodules)
         assert layer.recompute_input_layernorm
         kda = layer.self_attention
-        # Every input projection consumes the shared gather, not the discarded norm output.
+        assert kda.explicit_input_projection_comm
+        # Every input projection consumes the shared gather, not the discarded norm output,
+        # and none of them communicates over TP on its own.
         for name, projection in kda.named_children():
             if name.endswith("_proj") and name != "out_proj":
                 assert not projection.sequence_parallel
                 assert not projection.save_original_input
-                assert not getattr(projection.weight, "sequence_parallel", False)
+                if name in ("f_a_proj", "g_a_proj", "beta_proj"):
+                    # Replicated weights see partial gradients, summed by the SP grad all-reduce.
+                    assert getattr(projection.weight, "sequence_parallel", False)
+                else:
+                    # Sharded weights, no TP communication inside the linear.
+                    assert projection.explicit_tp_comm
+                    assert projection.tp_size == 1 and projection.parallel_mode is None
+                    assert not getattr(projection.weight, "sequence_parallel", False)
+        assert kda.in_proj.weight.shape[0] == kda.in_proj_dim // 2
     finally:
         Utils.destroy_model_parallel()
 
@@ -624,6 +635,99 @@ def test_parallel_kda_correctness(
             sequence_packing=sequence_packing,
         )
     assert gather.call_count == int(sp)
+    if sp:
+        # The single gather also carries the single input-gradient reduction.
+        assert gather.call_args.kwargs["tensor_parallel_output_grad"] is True
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize(
+    ("f_lora_rank", "gate_lora_rank"),
+    [(None, None), (16, None), (8, 12)],
+    ids=["legacy-fused", "low-rank-f-full-rank-gate", "low-rank-f-low-rank-gate"],
+)
+def test_kda_sequence_parallel_reduces_input_gradient_once(f_lora_rank, gate_lora_rank):
+    """TP2 + SP matches TP2 without SP with one reduce-scatter and no TP all-reduce."""
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2, pipeline_model_parallel_size=1, context_parallel_size=1
+    )
+    try:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_rank = tp_group.rank()
+        seq_len, batch = 64, 2
+
+        model_parallel_cuda_manual_seed(123)
+        reference = _build_kda(
+            _make_config(tp_size=2, f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank)
+        )
+        kda = _build_kda(
+            _make_config(
+                tp_size=2,
+                sequence_parallel=True,
+                f_lora_rank=f_lora_rank,
+                gate_lora_rank=gate_lora_rank,
+            )
+        )
+        kda.load_state_dict(reference.state_dict())
+        assert kda.explicit_input_projection_comm and not reference.explicit_input_projection_comm
+
+        torch.manual_seed(7)
+        hidden_states = torch.randn(
+            (seq_len, batch, reference.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        local_slice = slice(tp_rank * seq_len // 2, (tp_rank + 1) * seq_len // 2)
+        full_input = hidden_states.clone().requires_grad_(True)
+        shard_input = hidden_states[local_slice].clone().requires_grad_(True)
+
+        # Without SP every column-parallel projection all-reduces its input gradient in TE.
+        with patch.object(
+            torch.distributed, "all_reduce", wraps=torch.distributed.all_reduce
+        ) as all_reduce:
+            reference_out, _ = reference(full_input, attention_mask=None)
+            reference_out.sum().backward()
+        assert all_reduce.call_count > 0
+
+        # With SP: no all-reduce at all, and the shared gather's backward is the only
+        # Megatron-side reduce-scatter (out_proj's forward reduce-scatter is TE's).
+        with patch.object(
+            torch.distributed, "all_reduce", wraps=torch.distributed.all_reduce
+        ) as all_reduce, patch.object(
+            mappings, "dist_reduce_scatter_func", wraps=mappings.dist_reduce_scatter_func
+        ) as reduce_scatter:
+            out, _ = kda(shard_input, attention_mask=None)
+            assert reduce_scatter.call_count == 0
+            out.sum().backward()
+        assert all_reduce.call_count == 0
+        assert reduce_scatter.call_count == 1
+
+        torch.testing.assert_close(out, reference_out[local_slice], atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(
+            shard_input.grad, full_input.grad[local_slice], atol=2e-2, rtol=2e-2
+        )
+        reference_grads = dict(reference.named_parameters())
+        # The per-head output norm weight is replicated across TP and every rank holds the sum
+        # over its local heads. Megatron sums it over TP only under SP (the sequence-parallel
+        # gradient all-reduce), so the reference's copy stays partial: sum it here as well.
+        partial_in_reference = {f"out_norm.{n}" for n, _ in reference.out_norm.named_parameters()}
+        for name, param in kda.named_parameters():
+            if param.grad is None:
+                assert reference_grads[name].grad is None, name
+                continue
+            grad = param.grad.clone()
+            if getattr(param, "sequence_parallel", False):
+                # What finalize_model_grads does for sequence-parallel (replicated) weights.
+                torch.distributed.all_reduce(grad, group=tp_group)
+            reference_grad = reference_grads[name].grad.clone()
+            if name in partial_in_reference:
+                torch.distributed.all_reduce(reference_grad, group=tp_group)
+            torch.testing.assert_close(
+                grad, reference_grad, atol=2e-2, rtol=2e-2, msg=lambda m: f"{name}: {m}"
+            )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")

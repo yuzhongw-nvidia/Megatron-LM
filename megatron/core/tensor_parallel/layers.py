@@ -832,6 +832,10 @@ class ColumnParallelLinear(torch.nn.Module):
             If True, reduction of output gradients across tensor-parallel ranks
             will be disabled. Defaults to False. This feature is used by Lora Adapter in Nemo to
             delay and fuse reduction along with other gradients for performance optimization.
+        explicit_tp_comm:
+            If True, keep the output-dimension sharding but do no tensor-parallel
+            communication in the layer: the input is already gathered (or replicated) and the
+            caller reduces the input gradient itself, as the MoE experts do. Defaults to False.
     """
 
     def __init__(
@@ -853,6 +857,7 @@ class ColumnParallelLinear(torch.nn.Module):
         tp_comm_buffer_name: Optional[str] = None,  # Not used
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        explicit_tp_comm: bool = False,
         name: str | None = None,
     ):
         super(ColumnParallelLinear, self).__init__()
@@ -870,6 +875,7 @@ class ColumnParallelLinear(torch.nn.Module):
         self.config = config
         self.disable_grad_reduce = disable_grad_reduce
         self.tp_group = tp_group
+        self.explicit_tp_comm = explicit_tp_comm
 
         self.tp_group = get_tensor_model_parallel_group_if_none(
             self.tp_group, is_expert=self.is_expert
@@ -1040,10 +1046,14 @@ class ColumnParallelLinear(torch.nn.Module):
 
         bias = self.bias if not self.skip_bias_add else None
 
+        # The caller handles the TP communication for expert layers and for layers built with
+        # explicit_tp_comm (gathered input, input gradient reduced by the caller).
+        explicit_comm = self.explicit_expert_comm or self.explicit_tp_comm
+
         if (
             self.allreduce_dgrad
             or self.sequence_parallel
-            or self.explicit_expert_comm
+            or explicit_comm
             or self.disable_grad_reduce
         ):
             input_parallel = input_
@@ -1058,7 +1068,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 self.embedding_activation_buffer.append(input_parallel)
 
         # Matrix multiply.
-        allreduce_dgrad = False if self.explicit_expert_comm else self.allreduce_dgrad
+        allreduce_dgrad = False if explicit_comm else self.allreduce_dgrad
 
         if self.config._cpu_offloading_context is not None:
             if self.config._cpu_offloading_context.inside_context is True:
@@ -1075,7 +1085,7 @@ class ColumnParallelLinear(torch.nn.Module):
             bias=bias,
             gradient_accumulation_fusion=self.gradient_accumulation_fusion,
             allreduce_dgrad=allreduce_dgrad,
-            sequence_parallel=False if self.explicit_expert_comm else self.sequence_parallel,
+            sequence_parallel=False if explicit_comm else self.sequence_parallel,
             grad_output_buffer=(
                 self.grad_output_buffer if self.config.defer_embedding_wgrad_compute else None
             ),
