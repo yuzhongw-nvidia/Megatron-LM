@@ -72,6 +72,43 @@ def test_unpacked_batch_needs_no_attention_config(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    ("pattern", "variant", "frequency", "expected"),
+    [
+        (None, None, None, False),
+        (None, "kda", 1, False),
+        (None, "gdn", [0, 0], False),
+        ("*E*E", "kda", None, False),
+        ("*E/KE", "kda", None, True),
+        ("GE*E", None, None, True),
+        (None, "gdn", [1, 0], True),
+    ],
+)
+def test_linear_metadata_only_for_models_with_linear_attention(
+    monkeypatch, pattern, variant, frequency, expected
+):
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda params, **_: params)
+    calls = []
+    monkeypatch.setattr(
+        packed_seq_utils,
+        "prepare_linear_attention_cp",
+        lambda params, *, cu_seqlens_cpu, conv_kernel_size: calls.append(
+            (params, conv_kernel_size)
+        ),
+    )
+    cu = torch.tensor([0, 16, 32], dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cp_group=_Group(), cu_seqlens_q=cu, cu_seqlens_kv=cu)
+    config = SimpleNamespace(
+        hybrid_layer_pattern=pattern,
+        experimental_attention_variant=variant,
+        linear_attention_freq=frequency,
+        linear_cp_mode="chunkwise",
+        linear_conv_kernel_dim=4,
+    )
+    packed_seq_utils.prepare_packed_seq_params(packed, config, local_tokens=8)
+    assert calls == ([(packed, 4)] if expected else [])
+
+
+@pytest.mark.parametrize(
     ("cp_size", "mode", "field", "boundaries", "padded", "local_tokens", "capacity", "error"),
     [
         (1, "chunkwise", "q", [0, 10, 32], None, 32, 64, None),

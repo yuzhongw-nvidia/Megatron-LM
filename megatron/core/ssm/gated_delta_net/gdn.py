@@ -276,11 +276,12 @@ class GatedDeltaNet(_GDNBase):
                     self._chunkwise_cp_context_cache[cache_key] = cached
                 cu_seqlens_q, chunkwise_cp_context = cached
             else:
-                chunkwise_cp_context = build_cp_context(
-                    cu_seqlens=cu_seqlens_q,
-                    group=cp_group_chunkwise,
-                    conv1d_kernel_size=self.conv_kernel_dim,
-                )
+                chunkwise_cp_context = packed_seq_params.fla_cp_context
+                if chunkwise_cp_context is None:
+                    raise RuntimeError(
+                        "Call prepare_linear_attention_cp when constructing the packed "
+                        "microbatch, before entering chunkwise-CP layers."
+                    )
         else:
             chunkwise_cp_context = None
 

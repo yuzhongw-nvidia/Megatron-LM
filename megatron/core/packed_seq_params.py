@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 if TYPE_CHECKING:
+    from fla.ops.cp.context import FLACPContext
+
     from megatron.core.context_parallel_layout import ThdCpRoute
 
 
@@ -45,6 +47,7 @@ class PackedSeqParams:
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
     tp_cp_partition_route: Optional["ThdCpRoute"] = None
+    fla_cp_context: Optional["FLACPContext"] = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
