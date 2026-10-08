@@ -50,6 +50,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, MTPLossLoggingHelper
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.training.utils.packed_seq_utils import prepare_packed_seq_params
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -1241,7 +1242,7 @@ def _prepare_mixed_model_batch(seq_indices, cp_group, config, vocab_size):
     # Mirror batch construction: resolve the CP and TP x CP groups of this microbatch
     # (the TP x sub-group under dynamic CP) and prebuild the layout routes, including
     # the fused TP x CP route under sequence parallelism.
-    finalize_packed_seq_params(packed_seq_params, sequence_parallel=config.sequence_parallel)
+    prepare_packed_seq_params(packed_seq_params, config, local_tokens=batch["tokens"].numel())
     return batch, packed_seq_params
 
 

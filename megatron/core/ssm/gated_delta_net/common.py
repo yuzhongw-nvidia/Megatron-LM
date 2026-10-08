@@ -514,38 +514,10 @@ class _GDNBase(MegatronModule):
         """
         raise NotImplementedError
 
-    def _resolve_cu_seqlens(
-        self,
-        cu_seqlens_padded,
-        cu_seqlens_actual,
-        total_seq_len,
-        name,
-        cp_size: int = 1,
-        strict_runtime_validation: bool = True,
-    ) -> torch.Tensor:
-        """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
-        if cu_seqlens_padded is not None:
-            cu_seqlens = cu_seqlens_padded
-        else:
-            cu_seqlens = cu_seqlens_actual
-
-        if strict_runtime_validation:
-            total_cu = cu_seqlens[-1].cpu().item()
-            if total_cu != total_seq_len:
-                raise ValueError(
-                    f"GDN: {name}[-1]={total_cu} does not match "
-                    f"total_sequence_length={total_seq_len}. "
-                    f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
-                )
-
-            seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-            if (seq_lengths % cp_size != 0).any():
-                raise ValueError(
-                    "All per-sequence lengths in cu_seqlens must be divisible by "
-                    f"cp_size={cp_size}, but got lengths: {seq_lengths.tolist()}"
-                )
-
-        return cu_seqlens
+    @staticmethod
+    def _resolve_cu_seqlens(cu_seqlens_padded, cu_seqlens_actual) -> torch.Tensor:
+        """Select physical packed boundaries, preferring alignment-padded boundaries."""
+        return cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens_actual
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""

@@ -190,7 +190,7 @@ def get_batch(data_iterator, vp_stage=None):
             dynamic_cp=is_dynamic_cp,
             config=config,
         )
-        prepare_packed_seq_params(packed_seq_params, config)
+        prepare_packed_seq_params(packed_seq_params, config, local_tokens=padding_mask.numel())
         return (
             attention_mask,
             None,
@@ -417,7 +417,15 @@ def forward_step(data_iterator, model: HybridModel):
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
         )
-        prepare_packed_seq_params(packed_seq_params, get_attr_wrapped_model(model, "config"))
+        prepare_packed_seq_params(
+            packed_seq_params,
+            get_attr_wrapped_model(model, "config"),
+            local_tokens=next(
+                (t.numel() for t in (tokens, labels, padding_mask) if t is not None), None
+            ),
+            # Middle PP stages of the fixed-shape loader have no batch tensors.
+            capacity=args.seq_length * args.micro_batch_size,
+        )
 
     timers('batch-generator').stop()
 

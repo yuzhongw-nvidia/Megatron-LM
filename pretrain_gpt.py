@@ -146,7 +146,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
         )
-        prepare_packed_seq_params(batch[5], config)
+        prepare_packed_seq_params(batch[5], config, local_tokens=batch[6].numel())
         return batch
 
     # TODO: this is pretty hacky, find a better way
@@ -242,7 +242,18 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         if 'position_ids' in batch:
             batch['position_ids'] = position_ids
 
-    prepare_packed_seq_params(packed_seq_params, config)
+    prepare_packed_seq_params(
+        packed_seq_params,
+        config,
+        local_tokens=next(
+            (
+                t.numel()
+                for t in (batch.get("tokens"), batch.get("labels"), padding_mask)
+                if t is not None
+            ),
+            None,
+        ),
+    )
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (

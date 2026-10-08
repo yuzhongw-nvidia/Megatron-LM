@@ -2,6 +2,7 @@
 
 """Batch entrypoints must prepare attention routes at the physical pack capacity."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -64,5 +65,49 @@ def test_prepare_attention_routes_uses_physical_capacity(
 
 
 def test_unpacked_batch_needs_no_attention_config(monkeypatch):
-    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda params, **_kwargs: params)
+    monkeypatch.setattr(
+        packed_seq_utils, "finalize_packed_seq_params", lambda params, **_kwargs: params
+    )
     assert packed_seq_utils.prepare_packed_seq_params(None, SimpleNamespace()) is None
+
+
+@pytest.mark.parametrize(
+    ("cp_size", "mode", "field", "boundaries", "padded", "local_tokens", "capacity", "error"),
+    [
+        (1, "chunkwise", "q", [0, 10, 32], None, 32, 64, None),
+        (4, "headwise", "q", [0, 10, 30], [0, 16, 32, 32], None, 32, None),
+        (1, "headwise", "q", [0, 16, 30], None, 32, None, "total_sequence_length"),
+        (4, "chunkwise", "kv", [0, 16, 30], None, None, 32, "total_sequence_length"),
+        (4, "headwise", "q", [0, 7, 32], None, 8, None, "divisible by cp_size"),
+        (2, "chunkwise", "kv", [0, 7, 32], None, 16, None, "divisible by cp_size"),
+    ],
+    ids=[
+        "cp1-local",
+        "padded-middle-pp",
+        "q-total",
+        "kv-total",
+        "q-divisibility",
+        "kv-divisibility",
+    ],
+)
+def test_linear_packed_boundaries_checked_at_batch_preparation(
+    monkeypatch, cp_size, mode, field, boundaries, padded, local_tokens, capacity, error
+):
+    """Preserve the original resolver checks at their new microbatch entrypoint."""
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda params, **_: params)
+    cu = torch.tensor([0, 16, 32], dtype=torch.int32)
+    packed = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        cp_group=SimpleNamespace(size=lambda: cp_size),
+    )
+    setattr(packed, f"cu_seqlens_{field}", torch.tensor(boundaries, dtype=cu.dtype))
+    if padded is not None:
+        setattr(packed, f"cu_seqlens_{field}_padded", torch.tensor(padded, dtype=cu.dtype))
+    config = SimpleNamespace(hybrid_layer_pattern="K", linear_cp_mode=mode)
+    context = pytest.raises(ValueError, match=error) if error else nullcontext()
+    with context:
+        packed_seq_utils.prepare_packed_seq_params(
+            packed, config, local_tokens=local_tokens, capacity=capacity
+        )

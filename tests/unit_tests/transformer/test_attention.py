@@ -32,6 +32,7 @@ from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
+from megatron.training.utils.packed_seq_utils import prepare_packed_seq_params
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
@@ -868,6 +869,11 @@ def _test_parallel_attention_correctness(
             cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
             packed_seq_params.cp_partition_mode = cp_partition_mode
+            prepare_packed_seq_params(
+                packed_seq_params,
+                transformer_config,
+                capacity=input_hidden_states.shape[0] * input_hidden_states.shape[1],
+            )
         else:
             packed_seq_params = None
         input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
