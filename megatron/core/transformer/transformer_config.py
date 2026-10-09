@@ -308,6 +308,12 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
+    mla_latent_cp: bool = False
+    """Experimental. Multi-latent attention context parallelism that exchanges the latent KV
+    (kv_lora_rank + qk_pos_emb_head_dim channels) between CP ranks and recomputes the KV
+    up-projection per ring step, bypassing the Transformer Engine attention wrapper. Requires
+    multi_latent_attention, THD packed input, cp_comm_type p2p and attention_backend fused/flash."""
+
     no_rope_freq: Optional[Union[int, List[int]]] = None
     """Controls which layers perform Rotary Position Embedding (RoPE). Accepts either:
     An integer N: Creates a pattern where RoPE is skipped every N-1 layers. For example,
@@ -3435,6 +3441,35 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
+
+        if self.mla_latent_cp:
+            cp_comm_types = (
+                self.cp_comm_type if isinstance(self.cp_comm_type, list) else [self.cp_comm_type]
+            )
+            unsupported = {
+                "multi_latent_attention=False": not self.multi_latent_attention,
+                "cp_comm_type other than p2p": any(t not in (None, "p2p") for t in cp_comm_types),
+                "attention_backend other than fused/flash/auto": self.attention_backend
+                not in (AttnBackend.fused, AttnBackend.flash, AttnBackend.auto),
+                "tensor parallelism without sequence_parallel": self.tensor_model_parallel_size > 1
+                and not self.sequence_parallel,
+                "attention_dropout > 0": self.attention_dropout != 0.0,
+                "core_attn in recompute_modules": self.recompute_granularity == "selective"
+                and "core_attn" in self.recompute_modules,
+                "qk_clip / log_max_attention_logit": self.qk_clip or self.log_max_attention_logit,
+                "window_size": self.window_size is not None,
+                "softmax_type other than vanilla": self.softmax_type != "vanilla",
+                "cuda_graph_impl other than none": self.cuda_graph_impl != "none",
+                "delay_wgrad_compute": self.delay_wgrad_compute,
+                "tp_comm_overlap": self.tp_comm_overlap,
+                "fp8_recipe=delayed": self.fp8 is not None and self.fp8_recipe == "delayed",
+                "experimental_attention_variant dsa/dsv4_hybrid": self.experimental_attention_variant
+                in ("dsa", "dsv4_hybrid"),
+                "mla_down_proj_fusion": getattr(self, "mla_down_proj_fusion", False),
+            }
+            rejected = [name for name, hit in unsupported.items() if hit]
+            if rejected:
+                raise ValueError(f"mla_latent_cp does not support: {', '.join(rejected)}.")
 
         # MuP (Maximal Update Parameterization) configuration
         if self.use_mup:
