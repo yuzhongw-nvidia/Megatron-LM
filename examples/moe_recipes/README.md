@@ -1,10 +1,13 @@
 # MoE Recipes
 
-This directory contains self-contained MoE training recipes. Each YAML file includes:
+This directory contains MoE training recipes. Each YAML file includes:
 
-- `DEPENDENCIES`: PyTorch base image and Dockerfile content used for the recipe.
+- `DEPENDENCIES`: PyTorch base image and either Dockerfile content (`dockerfile`)
+  or a Dockerfile path relative to the repository root (`dockerfile_path`).
 - `ENV_VARS`: Environment variables expected by the runtime.
 - `ARGS`: Megatron-LM training arguments.
+
+Kimi-K3 container build and launch instructions are in the [Kimi-K3 guide](kimi_k3/README.md).
 
 ## Recipe Index
 
@@ -21,6 +24,42 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td>Kimi-K3</td>
+      <td><a href="kimi_k3/gb300/mxfp8_THD512K_256GPU_TP4PP4EP64CP16_muon.yaml">GB300 MXFP8 THD 512K</a></td>
+      <td>256</td>
+      <td>4/4/64/16/1</td>
+      <td>1/32/524288</td>
+      <td>MLA latent CP (a2a8+p2p2); FA4; contiguous CP; MTP1; per-head Muon; HybridEP; selective recompute; attention offload</td>
+      <td>767.5</td>
+    </tr>
+    <tr>
+      <td>Kimi-K3</td>
+      <td><a href="kimi_k3/gb300/mxfp8_THD64K_256GPU_TP4PP4EP64CP2_muon.yaml">GB300 MXFP8 THD 64K</a></td>
+      <td>256</td>
+      <td>4/4/64/2/1</td>
+      <td>1/256/65536</td>
+      <td>MLA latent CP (a2a2); FA4; contiguous CP; MTP1; per-head Muon; HybridEP; selective recompute; attention offload</td>
+      <td></td>
+    </tr>
+    <tr>
+      <td>Kimi-K3 9L proxy</td>
+      <td><a href="kimi_k3_proxy_9layer/gb300/mxfp8_THD512K_64GPU_TP4PP1EP64CP16_muon.yaml">GB300 MXFP8 THD 512K</a></td>
+      <td>64</td>
+      <td>4/1/64/16/1</td>
+      <td>1/32/524288</td>
+      <td>MLA latent CP (a2a8+p2p2); FA4; contiguous CP; MTP1; per-head Muon; HybridEP; selective recompute; attention offload</td>
+      <td>903.3</td>
+    </tr>
+    <tr>
+      <td>Kimi-K3 9L proxy</td>
+      <td><a href="kimi_k3_proxy_9layer/gb300/mxfp8_THD64K_64GPU_TP4PP1EP64CP2_muon.yaml">GB300 MXFP8 THD 64K</a></td>
+      <td>64</td>
+      <td>4/1/64/2/1</td>
+      <td>1/256/65536</td>
+      <td>MLA latent CP (a2a2); FA4; contiguous CP; MTP1; per-head Muon; HybridEP; selective recompute; attention offload</td>
+      <td></td>
+    </tr>
     <tr>
       <td>DeepSeek-V4-Pro</td>
       <td><a href="deepseek_v4_pro/gb300/mxfp8_SL4K_256GPU_TP1PP4EP64.yaml">GB300 MXFP8</a></td>
