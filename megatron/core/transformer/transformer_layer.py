@@ -3202,21 +3202,23 @@ class AttnResTransformerLayer(TransformerLayer):
             self.attn_res_is_block_start = is_attn_res_block_start(self.layer_number, block_layers)
             self.attn_res_num_sources = attn_res_num_sources(self.layer_number, block_layers)
 
-        # Norm fusion: the aggregation emits norm(h) with the norm module's own weight, so
-        # the module must exist as a standalone RMSNorm (specs that fold the norm into the
-        # first linear leave an IdentityOp here and cannot fuse it into AttnRes).
+        # Norm fusion: the aggregation emits norm(h) with the norm module's own weight, so it
+        # applies per sublayer wherever the norm exists as a standalone module. Specs that fold
+        # the norm into the first linear (TE LayerNormLinear) leave an IdentityOp here; those
+        # sublayers keep the unfused aggregation.
         self.attn_res_norm_fusion = self.config.attn_res_norm_fusion
-        if self.attn_res_norm_fusion:
-            for name in ("input_layernorm", "pre_mlp_layernorm"):
-                norm = getattr(self, name)
-                if isinstance(norm, IdentityOp) or not isinstance(
-                    getattr(norm, "weight", None), torch.Tensor
-                ):
-                    raise ValueError(
-                        f"attn_res_norm_fusion requires a standalone RMSNorm module with a "
-                        f"weight as {name} of layer {self.layer_number}, got "
-                        f"{type(norm).__name__}."
-                    )
+
+        def has_standalone_norm(norm):
+            return not isinstance(norm, IdentityOp) and isinstance(
+                getattr(norm, "weight", None), torch.Tensor
+            )
+
+        self._fuse_input_norm = self.attn_res_norm_fusion and has_standalone_norm(
+            self.input_layernorm
+        )
+        self._fuse_pre_mlp_norm = self.attn_res_norm_fusion and has_standalone_norm(
+            self.pre_mlp_layernorm
+        )
         attn_res_recompute = self.config.recompute_granularity == 'selective' and 'attn_res' in (
             self.config.recompute_modules or []
         )
@@ -3294,7 +3296,7 @@ class AttnResTransformerLayer(TransformerLayer):
         nvtx_range_push(suffix="self_attention_attn_res")
         aggregated = self.self_attention_attn_res(
             values,
-            output_norm_weight=self.input_layernorm.weight if self.attn_res_norm_fusion else None,
+            output_norm_weight=self.input_layernorm.weight if self._fuse_input_norm else None,
         )
         nvtx_range_pop(suffix="self_attention_attn_res")
 
@@ -3310,7 +3312,7 @@ class AttnResTransformerLayer(TransformerLayer):
                 inference_context=None,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-                input_is_normalized=self.attn_res_norm_fusion,
+                input_is_normalized=self._fuse_input_norm,
             )
         )
 
@@ -3363,7 +3365,7 @@ class AttnResTransformerLayer(TransformerLayer):
         nvtx_range_push(suffix="mlp_attn_res")
         aggregated = self.mlp_attn_res(
             values,
-            output_norm_weight=self.pre_mlp_layernorm.weight if self.attn_res_norm_fusion else None,
+            output_norm_weight=self.pre_mlp_layernorm.weight if self._fuse_pre_mlp_norm else None,
         )
         nvtx_range_pop(suffix="mlp_attn_res")
 
@@ -3375,7 +3377,7 @@ class AttnResTransformerLayer(TransformerLayer):
             padding_mask=padding_mask,
             input_ids=input_ids,
             packed_seq_params=packed_seq_params,
-            input_is_normalized=self.attn_res_norm_fusion,
+            input_is_normalized=self._fuse_pre_mlp_norm,
         )
 
         output = self._forward_post_mlp(

@@ -33,6 +33,7 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
     AbsorbedMLASelfAttention,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -1232,13 +1233,24 @@ class TestAttnResHybridBlock:
         reason="AttnRes norm fusion runs on FLA's fused kernel",
     )
     @pytest.mark.parametrize(
-        "layer_pattern,model_kwargs,fused_tolerance",
+        "layer_pattern,model_kwargs,fused_tolerance,standalone_mlp_norm",
         [
             pytest.param(
                 Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION + Symbols.MLP,
                 {},
                 1e-4,
+                True,
                 id="dense-fp32",
+            ),
+            # The dense MLP entries keep the TE LayerNormLinear fc1 (no standalone pre-MLP
+            # norm, as in Kimi-K3's '-' entry): they must fall back to the unfused aggregation
+            # while the attention entries fuse.
+            pytest.param(
+                Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION + Symbols.MLP,
+                {},
+                1e-4,
+                False,
+                id="dense-fp32-fused-fc1",
             ),
             pytest.param(
                 Symbols.ATTENTION + Symbols.MOE + Symbols.ATTENTION + Symbols.MOE,
@@ -1255,12 +1267,13 @@ class TestAttnResHybridBlock:
                     "add_bias_linear": False,
                 },
                 3e-2,
+                True,
                 id="moe-bf16",
             ),
         ],
     )
     def test_norm_fusion_and_recompute_match_unfused(
-        self, layer_pattern, model_kwargs, fused_tolerance
+        self, layer_pattern, model_kwargs, fused_tolerance, standalone_mlp_norm
     ):
         """attn_res_norm_fusion and 'attn_res' recompute against the unfused stack.
 
@@ -1268,9 +1281,15 @@ class TestAttnResHybridBlock:
         layout and load each other's state dicts strictly. Recompute variants replay the same
         kernels and match tightly; the fused kernel skips the bf16 rounding of the mixed
         residual before the norm, so the fused/unfused comparison carries a dtype tolerance.
+        Entries without a standalone pre-norm keep the unfused aggregation.
         """
         layer_type_list = validate_segment_layers(layer_pattern)
         submodules = TestHybridBlock._non_fused_norm_submodules()
+        if not standalone_mlp_norm:
+            submodules = deepcopy(hybrid_stack_spec.submodules)
+            attention_submodules = submodules.attention_layer.submodules
+            attention_submodules.input_layernorm = TENorm
+            attention_submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
 
         def make(**config_kwargs):
             config = self._make_config(
@@ -1298,10 +1317,21 @@ class TestAttnResHybridBlock:
         for variant in (unfused_recompute, fused, fused_recompute):
             assert set(variant.state_dict().keys()) == set(state.keys())
             variant.load_state_dict(state)
+        fused_entries = 0
         for layer in fused.layers:
-            assert layer.attn_res_norm_fusion and layer.fused_norm is not None
+            assert layer.attn_res_norm_fusion
+            inner = layer.inner_layer
+            norm = (
+                inner.pre_mlp_layernorm
+                if isinstance(inner.self_attention, IdentityOp)
+                else inner.input_layernorm
+            )
+            # Fused exactly where the entry owns a standalone pre-norm; folded norms fall back.
+            assert (layer.fused_norm is not None) == (not isinstance(norm, IdentityOp))
+            fused_entries += layer.fused_norm is not None
             # The fused norm is the inner entry's own module, not a second registered child.
             assert "_fused_norm" not in dict(layer.named_modules())
+        assert fused_entries == (len(fused.layers) if standalone_mlp_norm else 2)
         for layer in fused_recompute.layers:
             assert layer.attn_res.recompute
 

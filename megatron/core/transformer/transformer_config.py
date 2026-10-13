@@ -1486,9 +1486,10 @@ class TransformerConfig(ModelParallelConfig):
     flash-linear-attention >= 0.5.1): the kernel emits the normalized sublayer input directly and
     the mixed residual is never materialized. The norm modules keep owning their weights, so
     checkpoints are interchangeable with the unfused path; only their forward is bypassed.
-    Requires attn_res_impl='fla', RMSNorm without zero-centered gamma, standalone norm modules in
-    the layer spec (no norm+linear fusion such as mla_down_proj_fusion) and no attn_norm/mlp_norm
-    fine-grained offloading. The final-norm aggregation stays unfused. With selective recompute,
+    Requires attn_res_impl='fla', RMSNorm without zero-centered gamma and no attn_norm/mlp_norm
+    fine-grained offloading. Sublayers whose norm is folded into their first linear (TE
+    LayerNormLinear specs, e.g. the dense MLP entry of Kimi-K3; mla_down_proj_fusion is rejected)
+    keep the unfused aggregation, and so does the final-norm aggregation. With selective recompute,
     'attn_res' and 'layernorm' must be enabled together or not at all: the fused output is the
     norm output, so one output-discarding checkpoint covers both."""
 
@@ -3548,7 +3549,8 @@ class TransformerConfig(ModelParallelConfig):
                     t not in (None, "p2p", "a2a", "a2a+p2p") for t in cp_comm_types
                 ),
                 "a2a+p2p without two hierarchical_context_parallel_sizes whose product is "
-                "context_parallel_size": "a2a+p2p" in a2a_modes and not hcp_ok,
+                "context_parallel_size": "a2a+p2p" in a2a_modes
+                and not hcp_ok,
                 "an a2a group size that does not divide the attention heads per tensor-parallel "
                 "rank": any(heads_per_tp_rank % size for size in a2a_sizes),
                 "a2a/a2a+p2p with dynamic_context_parallel": bool(a2a_modes)

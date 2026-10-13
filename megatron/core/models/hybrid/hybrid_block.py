@@ -992,6 +992,12 @@ class AttnResHybridLayer(MegatronModule):
         self._fused_norm_name = (
             self._resolve_fused_norm_name(layer) if self.attn_res_norm_fusion else None
         )
+        if self.attn_res_norm_fusion and self._fused_norm_name is None:
+            warnings.warn(
+                f"attn_res_norm_fusion: hybrid entry {self.layer_number} "
+                f"({type(layer).__name__}) has no standalone pre-norm (folded into its first "
+                "linear); its AttnRes aggregation stays unfused."
+            )
         # Hybrid entries are single sublayers: attn_res_block_layers counts
         # pattern entries here (see attention_residual.py docstrings).
         if is_mtp_layer:
@@ -1018,13 +1024,15 @@ class AttnResHybridLayer(MegatronModule):
         return getattr(self.inner_layer, self._fused_norm_name)
 
     @staticmethod
-    def _resolve_fused_norm_name(layer: MegatronModule) -> str:
-        """Name of the inner entry's pre-norm whose RMSNorm the fused AttnRes kernel applies."""
+    def _resolve_fused_norm_name(layer: MegatronModule) -> Optional[str]:
+        """Name of the inner entry's standalone pre-norm, or None when the entry has none.
+
+        Entries whose norm is folded into their first linear (TE LayerNormLinear specs, e.g.
+        the dense MLP entry of Kimi-K3, or Mamba mixers) keep the unfused aggregation: there
+        is no separate norm whose weight the fused kernel could apply.
+        """
         if not isinstance(layer, TransformerLayer):
-            raise ValueError(
-                "attn_res_norm_fusion requires TransformerLayer hybrid entries; entry "
-                f"{layer.layer_number} is {type(layer).__name__}."
-            )
+            return None
         has_attention = not isinstance(layer.self_attention, IdentityOp)
         has_mlp = not isinstance(layer.mlp, IdentityOp)
         if has_attention == has_mlp:
@@ -1036,11 +1044,7 @@ class AttnResHybridLayer(MegatronModule):
         if isinstance(norm, IdentityOp) or not isinstance(
             getattr(norm, "weight", None), torch.Tensor
         ):
-            raise ValueError(
-                f"attn_res_norm_fusion requires a standalone RMSNorm module with a weight as "
-                f"{name} of hybrid entry {layer.layer_number}, got {type(norm).__name__} "
-                "(specs that fold the norm into the first linear cannot fuse it into AttnRes)."
-            )
+            return None
         return name
 
     def forward(
@@ -1092,7 +1096,7 @@ class AttnResHybridLayer(MegatronModule):
                 input_ids=input_ids,
                 _called_from_hybrid_attn_res_wrapper=True,
                 _return_layer_delta=True,
-                _input_is_normalized=self.attn_res_norm_fusion,
+                _input_is_normalized=fused_norm is not None,
                 strict_runtime_validation=strict_runtime_validation,
             )
         else:
