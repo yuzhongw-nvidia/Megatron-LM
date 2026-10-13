@@ -14,6 +14,11 @@ attention wrapper. THD packed input, causal self-attention, no RoPE (``no_rope_f
 group: the latents of its ``A`` ranks are gathered, query tokens are exchanged for heads, and the
 gathered block is reordered into the zigzag of the p2p group (natural order for pure ``a2a``), so
 the ring runs unchanged with ``A``-times longer steps on ``H/A`` heads (``P/A`` steps).
+
+``cp_comm_type`` ``all_gather`` gathers the latents of the whole CP group instead (0.6 GB at 512K
+tokens, against TE's K/V all-gather of 8 GB), builds K/V for the block once and runs two
+prefix-attention calls per layer on the unchanged local queries; it supports dynamic context
+parallelism and needs no hierarchical groups, at the price of the full-block K/V transients.
 """
 
 from __future__ import annotations
@@ -91,6 +96,11 @@ class _Step(NamedTuple):
     max_q: int
     max_kv: int
     causal: bool
+    bottom_right: bool = False  # causal diagonal at the bottom right (queries vs. a longer prefix)
+
+
+def _cumsum0(lengths):
+    return F.pad(torch.cumsum(lengths, dim=-1, dtype=torch.int32), (1, 0))
 
 
 class _StepPlan(NamedTuple):
@@ -124,11 +134,7 @@ def _build_step_plan(packed_seq_params, cp_size: int, cp_rank: int, num_tokens: 
     # Actual tokens in chunk c of a sequence with s actual tokens: clamp(s - c * half, 0, half).
     first = torch.minimum((seqlens - owners * half).clamp_(min=0), half)
     second = torch.minimum((seqlens - (2 * cp_size - 1 - owners) * half).clamp_(min=0), half)
-
-    def cumsum0(lengths):
-        return F.pad(torch.cumsum(lengths, dim=-1, dtype=torch.int32), (1, 0))
-
-    act_full, act_first, act_second = cumsum0(first + second), cumsum0(first), cumsum0(second)
+    act_full, act_first, act_second = _cumsum0(first + second), _cumsum0(first), _cumsum0(second)
     L = int(packed_seq_params.max_seqlen_q) // cp_size
     steps = []
     for i in range(cp_size):
@@ -162,6 +168,65 @@ def _build_step_plan(packed_seq_params, cp_size: int, cp_rank: int, num_tokens: 
         pattern = torch.tensor([True, False, True, False], device=device).repeat(half.numel())
         valid = torch.repeat_interleave(pattern, lens, output_size=num_tokens)
     return _StepPlan(steps=steps, rows=rows, valid=valid)
+
+
+class _AGPlan(NamedTuple):
+    """THD metadata of the all-gather mode on one CP rank (device int32)."""
+
+    steps: tuple  # (this rank's first chunk, its second chunk) against their sequence prefixes
+    first_rows: torch.Tensor  # [T] bool rows of the first chunks in the local layout
+    valid: Optional[torch.Tensor]  # [T] bool actual-token rows (None without padded cu_seqlens)
+
+
+def _build_allgather_plan(packed_seq_params, cp_size: int, cp_rank: int, num_tokens: int):
+    """Two prefix-attention steps for ``_LatentCPAllGatherAttention``.
+
+    K/V are the gathered latents in sequence order, so the global padded offsets are their THD
+    offsets; the queries are passed whole with per-chunk offsets (as TE's THD all-gather does).
+    Chunk ``c`` (global ``r`` first, ``2P-1-r`` second) attends to the prefix of ``c+1`` chunks of
+    its sequence under a bottom-right aligned causal mask: query ``j`` of the chunk must see keys
+    ``<= c*half + j``, and the alignment offset ``prefix - rows`` equals ``c*half`` both for a full
+    chunk (``prefix = (c+1)*half``, ``rows = half``) and for a sequence ending inside the chunk
+    (``prefix = s = c*half + rows``) -- the invariant behind the clamped prefix lengths.
+    """
+    cu = packed_seq_params.cu_seqlens_q
+    cup = packed_seq_params.cu_seqlens_q_padded
+    padded = cup is not None
+    if not padded:
+        cup = cu
+    off_local = torch.div(cup, cp_size, rounding_mode="floor")
+    half = torch.div(off_local[1:] - off_local[:-1], 2, rounding_mode="floor")
+    seqlens = cu[1:] - cu[:-1]
+    L = int(packed_seq_params.max_seqlen_q) // (2 * cp_size)
+    steps, rows_of = [], []
+    for n, chunk in enumerate((cp_rank, 2 * cp_size - 1 - cp_rank)):
+        rows = torch.minimum((seqlens - chunk * half).clamp_(min=0), half)
+        prefix = torch.minimum(seqlens, (chunk + 1) * half)
+        off_q = off_local if n == 0 else torch.cat([off_local[:-1] + half, off_local[-1:]])
+        step = _Step(
+            False, _cumsum0(rows), _cumsum0(prefix), off_q, cup, L, (chunk + 1) * L, True, True
+        )
+        steps.append(step)
+        rows_of.append(rows)
+
+    def row_mask(lens, pattern):
+        pattern = torch.tensor(pattern, device=cu.device).repeat(half.numel())
+        lens = torch.stack(lens, dim=1).reshape(-1).to(torch.int64)
+        return torch.repeat_interleave(pattern, lens, output_size=num_tokens)
+
+    first_rows = row_mask([half, half], [True, False])
+    valid = None
+    if padded:
+        a, b = rows_of
+        valid = row_mask([a, half - a, b, half - b], [True, False, True, False])
+    return _AGPlan((steps[0], steps[1]), first_rows, valid)
+
+
+def _combine(plan, first, second):
+    """Rows of this rank's first chunks from ``first``, of its second chunks from ``second``;
+    padding rows zero (a kernel may leave rows beyond a segment's actual length untouched)."""
+    out = torch.where(plan.first_rows[:, None, None], first, second)
+    return out if plan.valid is None else out.masked_fill_(~plan.valid[:, None, None], 0)
 
 
 class _Permute(torch.autograd.Function):
@@ -215,6 +280,8 @@ def _lengths(cu):
 
 
 def _mask(step):
+    if step.bottom_right:
+        return "padding_causal_bottom_right"
     return "padding_causal" if step.causal else "padding"
 
 
@@ -583,20 +650,87 @@ class _LatentCPRingAttention(torch.autograd.Function):
             dzb[i % 2].add_(grads[0])
         if rows is not None:
             dq.index_add_(0, rows, dq_u)
-        dparams = []
-        for p, leaf, g in zip(params, leaves, grads_p):
-            if g is None:  # keep the outer AccumulateGrad (and the DDP hook) firing
-                g = torch.zeros_like(p)
-            elif leaf is not p:  # the slab's gradient belongs to rows [r0, r1) of the full weight
-                full = torch.zeros(p.shape, dtype=g.dtype, device=g.device)
-                if getattr(leaf, "grad_added_to_main_grad", False):
-                    p.grad_added_to_main_grad = True  # TE accumulated into main_grad[r0:r1]
-                else:
-                    full[slab.r0 : slab.r1] = g
-                g = full
-            dparams.append(g.to(p.dtype))
+        dparams = _route_param_grads(params, leaves, grads_p, slab)
         dz = dzb[last % 2]
         return (dq.to(q.dtype), dz.to(z_last.dtype), *([None] * 6), *dparams)
+
+
+def _route_param_grads(params, leaves, grads, slab):
+    """Gradients of the recompute graph's leaves mapped onto the Function's parameter inputs."""
+    dparams = []
+    for p, leaf, g in zip(params, leaves, grads):
+        if g is None:  # keep the outer AccumulateGrad (and the DDP hook) firing
+            g = torch.zeros_like(p)
+        elif leaf is not p:  # the slab's gradient belongs to rows [r0, r1) of the full weight
+            full = torch.zeros(p.shape, dtype=g.dtype, device=g.device)
+            if getattr(leaf, "grad_added_to_main_grad", False):
+                p.grad_added_to_main_grad = True  # TE accumulated into main_grad[r0:r1]
+            else:
+                full[slab.r0 : slab.r1] = g
+            g = full
+        dparams.append(g.to(p.dtype))
+    return dparams
+
+
+def _gathered(z, group, perm):
+    """The CP group's latents in sequence order: rank-major all-gather, then ``perm``."""
+    if group.size() > 1:
+        full = z.new_empty((group.size() * z.shape[0],) + z.shape[1:])
+        dist.all_gather_into_tensor(full, z.contiguous(), group=group)
+        z = full
+    return z.index_select(0, perm)
+
+
+class _LatentCPAllGatherAttention(torch.autograd.Function):
+    """Latent all-gather attention (``cp_comm_type="all_gather"``).
+
+    The latents of the CP group are gathered into sequence order, K/V are built for the whole
+    block (all local heads) and the local queries attend to their causal prefixes in two calls, one
+    per zigzag chunk, with bottom-right aligned masks: no merge, no permutation of the output.
+    Saves ``(q, local latent, out, lse per call)``; backward re-gathers the latent, recomputes K/V
+    with grad, runs the two attention backwards, back-propagates once through the up-projection
+    and reduce-scatters the latent gradient over the CP group (summed in fp32).
+    """
+
+    @staticmethod
+    def forward(ctx, q, z, module, plan, group, perm, inv, attn_fwd, attn_bwd, scale, *up_params):
+        fp8 = FP8GlobalStateManager.is_fp8_enabled()
+        with torch.no_grad(), _te_recompute_ctx(fp8, recompute_phase=False):
+            k, v = module._expand_kv(_gathered(z, group, perm))
+        outs, lses, rngs = zip(*[attn_fwd(q, k, v, step, scale) for step in plan.steps])
+        del k, v
+        out = _combine(plan, *outs)
+        ctx.save_for_backward(q, z, out, *lses)
+        ctx.module, ctx.plan, ctx.group, ctx.perm, ctx.inv = module, plan, group, perm, inv
+        ctx.attn_bwd, ctx.scale, ctx.rngs, ctx.params = attn_bwd, scale, rngs, up_params
+        ctx.fp8, ctx.fp8_recipe = fp8, FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, z, out, *lses = ctx.saved_tensors
+        module, plan, params = ctx.module, ctx.plan, ctx.params
+        dout = dout.contiguous()
+        with torch.enable_grad(), fp8_autocast(enabled=ctx.fp8, fp8_recipe=ctx.fp8_recipe):
+            with _te_recompute_ctx(ctx.fp8, recompute_phase=True):
+                z_j = _gathered(z.detach(), ctx.group, ctx.perm).requires_grad_()
+                k, v = module._expand_kv(z_j)
+        dqs, dk, dv = [], None, None
+        for step, lse, rng in zip(plan.steps, lses, ctx.rngs):
+            det = module.config.deterministic_mode
+            dq_i, dk_i, dv_i = ctx.attn_bwd(q, k, v, out, dout, lse, rng, step, ctx.scale, det)
+            dqs.append(dq_i)
+            dk, dv = (dk_i, dv_i) if dk is None else (dk.add_(dk_i), dv.add_(dv_i))
+        dq = _combine(plan, *dqs)
+        grads = torch.autograd.grad((k, v), (z_j, *params), (dk, dv), allow_unused=True)
+        del k, v, dk, dv, dqs
+        dz = grads[0].index_select(0, ctx.inv).float()  # rank-major; summed over the group
+        if ctx.group.size() > 1:
+            dz_local = dz.new_empty(z.shape)
+            dist.reduce_scatter_tensor(dz_local, dz, group=ctx.group)
+            dz = dz_local
+        dparams = _route_param_grads(params, params, grads[1:], None)
+        return (dq.to(q.dtype), dz.to(z.dtype), *([None] * 8), *dparams)
 
 
 class MLAWithLatentCP(MLASelfAttention):
@@ -752,6 +886,36 @@ class MLAWithLatentCP(MLASelfAttention):
             raise NotImplementedError(
                 "mla_latent_cp a2a modes do not support dynamic context parallelism."
             )
+        if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
+            # One gather of the latent (and one reduce-scatter of its gradient, by autograd)
+            # instead of a gather and a reduce-scatter inside every ring step.
+            key = gather_from_sequence_parallel_region(key, group=self.tp_group)
+        # Everything the per-step KV expansion differentiates besides the latent itself.
+        up_params = [
+            p
+            for m in (self.kv_layernorm, self.linear_kv_up_proj)
+            for p in m.parameters()
+            if p.requires_grad
+        ]
+        if self.cp_comm_type == "all_gather":
+            # Gather the group's latents, K/V for the whole block, two prefix-attention calls on the
+            # local queries; the output is already in the local layout.
+            P = cp_group.size()
+            plan = _build_allgather_plan(packed_seq_params, P, cp_group.rank(), tokens)
+            perm, inv = _a2a_permutation(packed_seq_params, P, P, tokens)
+            return _LatentCPAllGatherAttention.apply(
+                query,
+                key,
+                self,
+                plan,
+                cp_group,
+                perm,
+                inv,
+                self._attn_fwd,
+                self._attn_bwd,
+                self.softmax_scale,
+                *up_params,
+            )
         # The ring runs over the p2p group on blocks of A ranks' tokens and H/A heads.
         ring_size, a = cp_group.size() // A, 0 if A == 1 else a2a.rank()
         if ring_size > 1:
@@ -763,10 +927,6 @@ class MLAWithLatentCP(MLASelfAttention):
         else:
             ring = _Ring(None, 0, 1, -1, -1)
         plan = _build_step_plan(packed_seq_params, ring_size, ring.rank, A * tokens)
-        if get_pg_size(self.tp_group) > 1 and self.config.sequence_parallel:
-            # One gather of the latent (and one reduce-scatter of its gradient, by autograd)
-            # instead of a gather and a reduce-scatter inside every ring step.
-            key = gather_from_sequence_parallel_region(key, group=self.tp_group)
         if A > 1:
             # Ulysses stage: gather the A latents (backward reduce-scatter = the head sum), exchange
             # query tokens for heads; both arrive rank-major and are permuted into the sequence
@@ -775,13 +935,6 @@ class MLAWithLatentCP(MLASelfAttention):
             key = _Permute.apply(gather_from_sequence_parallel_region(key, group=a2a), perm, inv)
             query = all_to_all_sp2hp(query.reshape(tokens, -1), group=a2a)
             query = _Permute.apply(query.view(A * tokens, heads // A, -1), perm, inv)
-        # Everything the per-step KV expansion differentiates besides the latent itself.
-        up_params = [
-            p
-            for m in (self.kv_layernorm, self.linear_kv_up_proj)
-            for p in m.parameters()
-            if p.requires_grad
-        ]
         # a2a modes: project only this rank's heads (their rows of the up-projection weight).
         rows = heads // A * (self.config.qk_head_dim + self.config.v_head_dim)
         self._slab = _Slab(a * rows, (a + 1) * rows) if A > 1 else None

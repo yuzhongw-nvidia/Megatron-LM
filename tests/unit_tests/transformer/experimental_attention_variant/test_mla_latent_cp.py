@@ -321,6 +321,10 @@ def _run_parity(
         else:
             assert saved_shapes.count(q_shape) <= 1, saved_shapes
             assert saved_shapes.count((tokens, heads_tp, v_head_dim)) <= 1, saved_shapes
+        if comm == "all_gather" and eff_cp > 1:  # the gathered K/V of the group are never saved
+            assert not any(
+                len(s) == 3 and s[0] == eff_cp * tokens for s in saved_shapes
+            ), saved_shapes
         # The up-projection weight accumulates its gradient exactly once per microbatch.
         assert len(hook_fires) == 1
 
@@ -435,6 +439,21 @@ class TestMLALatentCPParity:
         head-slab view into it (a2a modes) match the reference after the CP reduction."""
         _run_parity(tp, cp, False, comm=comm, a2a=a2a, fused_wgrad=True)
 
+    @pytest.mark.parametrize(("tp", "cp"), ((1, 2), (1, 4), (2, 2), (2, 4), (1, 8)))
+    @pytest.mark.parametrize("padded", (False, True), ids=("packed", "padded"))
+    def test_parity_all_gather(self, tp, cp, padded):
+        _run_parity(tp, cp, padded, comm="all_gather")
+
+    def test_parity_all_gather_cp1(self):
+        _run_parity(2, 1, False, comm="all_gather")
+
+    def test_parity_all_gather_dynamic_cp(self):
+        _run_parity(1, 4, False, dynamic=True, comm="all_gather")
+
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 needs Blackwell")
+    def test_parity_all_gather_mxfp8(self):
+        _run_parity(1, 4, False, fp8=True, comm="all_gather")
+
     def test_a2a_rejects_dynamic_cp(self):
         if Utils.world_size < 4 or Utils.world_size % 4 != 0:
             pytest.skip("Needs a multiple of 4 CUDA ranks.")
@@ -453,16 +472,14 @@ class TestMLALatentCPParity:
             Utils.destroy_model_parallel()
 
 
-@pytest.mark.experimental
-@requires_te
-def test_old_path_a2a_p2p_matches_p2p():
-    """TE's own a2a+p2p on THD MLA (the perf reference of the hierarchical recipes) agrees with
-    its p2p ring; both are the old path, so this only qualifies the reference."""
-    tp, cp, a2a = 1, 4, 2
+def _old_path_matches_p2p(comm, hcp):
+    """TE's own ``comm`` scheme on THD MLA agrees with its p2p ring; both are the old path, so this
+    only qualifies ``comm`` as a reference for the 9L runs."""
+    tp, cp = 1, 4
     if Utils.world_size < cp or Utils.world_size % cp != 0:
         pytest.skip(f"Needs a multiple of {cp} CUDA ranks.")
     Utils.initialize_model_parallel(
-        tp, 1, context_parallel_size=cp, hierarchical_context_parallel_sizes=[a2a, cp // a2a]
+        tp, 1, context_parallel_size=cp, hierarchical_context_parallel_sizes=hcp
     )
     try:
         cp_group = parallel_state.get_context_parallel_group()
@@ -472,7 +489,7 @@ def test_old_path_a2a_p2p_matches_p2p():
         pgs = ProcessGroupCollection.use_mpu_process_groups()
         spec = _attention_spec()
         p2p = _build(spec, config, pg_collection=pgs)
-        hier = _build(spec, config, pg_collection=pgs, cp_comm_type="a2a+p2p")
+        hier = _build(spec, config, pg_collection=pgs, cp_comm_type=comm)
         hier.load_state_dict(p2p.state_dict())
         torch.manual_seed(7)
         full_hidden = torch.randn(TOTAL_TOKENS, 1, HIDDEN, dtype=torch.bfloat16).cuda()
@@ -495,12 +512,27 @@ def test_old_path_a2a_p2p_matches_p2p():
 
 
 @pytest.mark.experimental
+@requires_te
+def test_old_path_a2a_p2p_matches_p2p():
+    _old_path_matches_p2p("a2a+p2p", [2, 2])
+
+
+@pytest.mark.experimental
+@requires_te
+def test_old_path_all_gather_matches_p2p():
+    """TE 2.20's KV all-gather CP supports THD; this qualifies it as the old-path reference of the
+    all_gather recipes (it gathers K/V, the new path the latent)."""
+    _old_path_matches_p2p("all_gather", None)
+
+
+@pytest.mark.experimental
 @pytest.mark.skipif(not (_IS_BLACKWELL and HAVE_FA4_B11), reason="FlashAttention-4 needs Blackwell")
 class TestMLALatentCPFlashAttn4:
     """FA4 backend against the cuDNN backend of the same module."""
 
     @pytest.mark.parametrize(
-        ("tp", "cp", "comm", "a2a"), ((1, 2, "p2p", 1), (1, 4, "p2p", 1), (1, 4, "a2a+p2p", 2))
+        ("tp", "cp", "comm", "a2a"),
+        ((1, 2, "p2p", 1), (1, 4, "p2p", 1), (1, 4, "a2a+p2p", 2), (1, 4, "all_gather", 1)),
     )
     def test_flash_matches_fused(self, tp, cp, comm, a2a):
         world = tp * cp
@@ -628,7 +660,6 @@ def test_a2a_permutation_matches_chunk_bookkeeping(cp, a2a):
     "overrides",
     (
         dict(multi_latent_attention=False),
-        dict(cp_comm_type="all_gather"),
         dict(cp_comm_type="a2a+p2p"),  # no hierarchical sizes
         dict(
             cp_comm_type="a2a+p2p",
