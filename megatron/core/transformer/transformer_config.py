@@ -331,12 +331,14 @@ class TransformerConfig(ModelParallelConfig):
     (kv_lora_rank + qk_pos_emb_head_dim channels) between CP ranks and recomputes the KV
     up-projection per ring step, bypassing the Transformer Engine attention wrapper. Requires
     multi_latent_attention, THD packed input in the zigzag CP layout (a contiguous layout for MLA
-    depends on PR #7545), cp_comm_type p2p/a2a/a2a+p2p and attention_backend fused/flash."""
+    depends on PR #7545), cp_comm_type p2p/a2a/a2a+p2p/all_gather and attention_backend
+    fused/flash."""
 
     mla_latent_cp_two_stream: bool = False
     """MLAWithLatentCP only: run alternate ring steps of the forward on a second CUDA stream (TE's
     cp_stream pattern). Off by default: measured neutral at 64K/CP4 and 512K/CP16 on GB300 (the
-    overlapped attention kernels run correspondingly slower); kept for short-sequence experiments."""
+    overlapped attention kernels run correspondingly slower); kept for short-sequence experiments.
+    No effect with cp_comm_type all_gather (two attention calls, no ring)."""
 
     no_rope_freq: Optional[Union[int, List[int]]] = None
     """Controls which layers perform Rotary Position Embedding (RoPE). Accepts either:
@@ -3314,8 +3316,8 @@ class TransformerConfig(ModelParallelConfig):
             heads_per_tp_rank = self.num_attention_heads // self.tensor_model_parallel_size
             unsupported = {
                 "multi_latent_attention=False": not self.multi_latent_attention,
-                "cp_comm_type other than p2p/a2a/a2a+p2p": any(
-                    t not in (None, "p2p", "a2a", "a2a+p2p") for t in cp_comm_types
+                "cp_comm_type other than p2p/a2a/a2a+p2p/all_gather": any(
+                    t not in (None, "p2p", "a2a", "a2a+p2p", "all_gather") for t in cp_comm_types
                 ),
                 "a2a+p2p without two hierarchical_context_parallel_sizes whose product is "
                 "context_parallel_size": "a2a+p2p" in a2a_modes and not hcp_ok,
