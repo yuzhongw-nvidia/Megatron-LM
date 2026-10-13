@@ -985,10 +985,13 @@ class AttnResHybridLayer(MegatronModule):
             ),
         )
         # Norm fusion: the aggregation emits the entry's pre-norm output directly, using the
-        # weight of the inner entry's norm module (which keeps owning it; checkpoint layout
-        # is unchanged). Resolved once here so misconfigured specs fail at build time.
+        # weight of the inner entry's norm module, which keeps owning it. Only the attribute
+        # name is kept here: storing the module itself would register it as a second child
+        # and duplicate its weight in the state dict (checkpoint layout must not change).
         self.attn_res_norm_fusion = config.attn_res_norm_fusion
-        self._fused_norm = self._resolve_fused_norm(layer) if self.attn_res_norm_fusion else None
+        self._fused_norm_name = (
+            self._resolve_fused_norm_name(layer) if self.attn_res_norm_fusion else None
+        )
         # Hybrid entries are single sublayers: attn_res_block_layers counts
         # pattern entries here (see attention_residual.py docstrings).
         if is_mtp_layer:
@@ -1007,9 +1010,16 @@ class AttnResHybridLayer(MegatronModule):
                 self.layer_number, config.attn_res_block_layers
             )
 
+    @property
+    def fused_norm(self) -> Optional[MegatronModule]:
+        """The inner entry's pre-norm fused into the aggregation, or None without norm fusion."""
+        if self._fused_norm_name is None:
+            return None
+        return getattr(self.inner_layer, self._fused_norm_name)
+
     @staticmethod
-    def _resolve_fused_norm(layer: MegatronModule) -> MegatronModule:
-        """The inner entry's pre-norm whose RMSNorm the fused AttnRes kernel applies."""
+    def _resolve_fused_norm_name(layer: MegatronModule) -> str:
+        """Name of the inner entry's pre-norm whose RMSNorm the fused AttnRes kernel applies."""
         if not isinstance(layer, TransformerLayer):
             raise ValueError(
                 "attn_res_norm_fusion requires TransformerLayer hybrid entries; entry "
@@ -1031,7 +1041,7 @@ class AttnResHybridLayer(MegatronModule):
                 f"{name} of hybrid entry {layer.layer_number}, got {type(norm).__name__} "
                 "(specs that fold the norm into the first linear cannot fuse it into AttnRes)."
             )
-        return norm
+        return name
 
     def forward(
         self,
@@ -1065,9 +1075,9 @@ class AttnResHybridLayer(MegatronModule):
         # the depth sources by the caller, so there is no partial sum yet.
         partial = None if self.attn_res_is_block_start else hidden_states
         values = list(attn_res_sources) if partial is None else [*attn_res_sources, partial]
+        fused_norm = self.fused_norm
         aggregated = self.attn_res(
-            values,
-            output_norm_weight=self._fused_norm.weight if self._fused_norm is not None else None,
+            values, output_norm_weight=fused_norm.weight if fused_norm is not None else None
         )
 
         if isinstance(self.inner_layer, TransformerLayer):

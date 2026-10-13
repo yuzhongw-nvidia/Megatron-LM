@@ -1299,7 +1299,9 @@ class TestAttnResHybridBlock:
             assert set(variant.state_dict().keys()) == set(state.keys())
             variant.load_state_dict(state)
         for layer in fused.layers:
-            assert layer.attn_res_norm_fusion and layer._fused_norm is not None
+            assert layer.attn_res_norm_fusion and layer.fused_norm is not None
+            # The fused norm is the inner entry's own module, not a second registered child.
+            assert "_fused_norm" not in dict(layer.named_modules())
         for layer in fused_recompute.layers:
             assert layer.attn_res.recompute
 
