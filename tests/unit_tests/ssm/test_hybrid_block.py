@@ -1329,22 +1329,26 @@ class TestAttnResHybridBlock:
             }
             return output.detach().float().cpu(), hidden_states.grad.detach().float().cpu(), grads
 
+        def assert_within(got, want, tolerance, name):
+            # Absolute tolerance relative to the tensor's own scale: an elementwise rtol
+            # alone fails on near-zero entries (a bf16 parameter gradient summed over
+            # tokens has such entries), and a fixed atol does not transfer between
+            # tensors whose magnitudes differ by orders of magnitude.
+            scale = max(1.0, want.abs().max().item())
+            torch.testing.assert_close(
+                got, want, rtol=tolerance, atol=tolerance * scale, msg=lambda msg: f"{name}: {msg}"
+            )
+
         def compare(got, want, tolerance):
-            torch.testing.assert_close(got[0], want[0], rtol=tolerance, atol=tolerance)
-            torch.testing.assert_close(got[1], want[1], rtol=tolerance, atol=tolerance)
+            assert_within(got[0], want[0], tolerance, "output")
+            assert_within(got[1], want[1], tolerance, "input gradient")
             assert set(got[2]) == set(want[2])
             for name, want_grad in want[2].items():
                 got_grad = got[2][name]
                 if want_grad is None or got_grad is None:
                     assert want_grad is None and got_grad is None, name
                     continue
-                torch.testing.assert_close(
-                    got_grad,
-                    want_grad,
-                    rtol=tolerance,
-                    atol=tolerance,
-                    msg=lambda msg: f"{name}: {msg}",
-                )
+                assert_within(got_grad, want_grad, tolerance, name)
 
         baseline_result = run_iteration(baseline)
         compare(run_iteration(unfused_recompute), baseline_result, 1e-4)
