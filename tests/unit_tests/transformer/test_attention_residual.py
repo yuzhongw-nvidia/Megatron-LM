@@ -300,6 +300,18 @@ class TestAttnResCompileParity:
 class TestAttnResFlaParity:
     """attn_res_impl='fla' must match the independent PyTorch reference."""
 
+    def setup_method(self, method):
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.destroy_model_parallel()
+
     @pytest.mark.parametrize("n_sources", [1, 3, 6])
     def test_fla_matches_reference(self, n_sources):
         from megatron.core.transformer.transformer_config import TransformerConfig
@@ -343,6 +355,64 @@ class TestAttnResFlaParity:
         reference_grads = torch.autograd.grad(
             reference_output,
             [reference_query, reference_weight, *reference_values],
+            grad_output.double(),
+        )
+
+        torch.testing.assert_close(output.float(), reference_output.float(), rtol=2e-2, atol=5e-3)
+        for got, want in zip(grads, reference_grads):
+            torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=5e-3)
+
+    @pytest.mark.parametrize("n_sources", [2, 3, 6])
+    def test_fla_fused_output_norm_matches_reference(self, n_sources):
+        """attn_res_norm_fusion: the kernel returns RMSNorm_w(aggregation) with the norm's eps."""
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        torch.manual_seed(37)
+        eps = 1e-6
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            enable_attention_residuals=True,
+            attn_res_block_layers=1,
+            attn_res_impl="fla",
+            attn_res_norm_fusion=True,
+            normalization="RMSNorm",
+            layernorm_epsilon=eps,
+        )
+        module = AttentionResidual(config).cuda()
+        with torch.no_grad():
+            module.pseudo_query.copy_(torch.randn(32, device="cuda") * 0.05)
+            module.key_norm_weight.copy_(
+                torch.ones(32, device="cuda") + torch.randn(32, device="cuda") * 0.1
+            )
+        norm_weight = (
+            (torch.ones(32, device="cuda") + torch.randn(32, device="cuda") * 0.1)
+            .to(torch.bfloat16)
+            .requires_grad_(True)
+        )
+
+        values = [
+            (torch.randn(4, 2, 32, device="cuda", dtype=torch.bfloat16) * (0.5 + index))
+            .detach()
+            .requires_grad_(True)
+            for index in range(n_sources)
+        ]
+        reference_query = module.pseudo_query.detach().double().requires_grad_(True)
+        reference_weight = module.key_norm_weight.detach().double().requires_grad_(True)
+        reference_norm_weight = norm_weight.detach().double().requires_grad_(True)
+        reference_values = [value.detach().double().requires_grad_(True) for value in values]
+        grad_output = torch.randn(4, 2, 32, device="cuda", dtype=torch.bfloat16)
+
+        output = module(values, output_norm_weight=norm_weight)
+        grads = torch.autograd.grad(
+            output, [module.pseudo_query, module.key_norm_weight, norm_weight, *values], grad_output
+        )
+        mixed = _reference_attn_res(reference_query, reference_weight, eps, reference_values)
+        reference_output = torch.nn.functional.rms_norm(mixed, (32,), reference_norm_weight, eps)
+        reference_grads = torch.autograd.grad(
+            reference_output,
+            [reference_query, reference_weight, reference_norm_weight, *reference_values],
             grad_output.double(),
         )
 
@@ -469,6 +539,221 @@ class TestAttentionResidualModule:
             "return_weights": False,
             "checkpoint_level": 1,
         }
+
+    def test_fla_backend_receives_output_norm_weight(self, monkeypatch):
+        """Norm fusion hands the consuming RMSNorm's weight to the fused kernel."""
+        from megatron.core.transformer import attention_residual
+
+        calls = {}
+
+        def fake_fused_attnres(query, residuals, rms_weight, **kwargs):
+            calls.update(kwargs=kwargs)
+            return torch.stack(list(residuals)).mean(dim=0)
+
+        monkeypatch.setattr(
+            attention_residual, "_get_fla_fused_attnres", lambda: fake_fused_attnres
+        )
+        module = attention_residual.AttentionResidual(self._make_config(attn_res_impl="fla"))
+        norm_weight = torch.full((16,), 1.5)
+        module([torch.randn(4, 2, 16) for _ in range(3)], output_norm_weight=norm_weight)
+
+        assert calls["kwargs"]["output_rms_weight"] is norm_weight
+        assert calls["kwargs"]["rms_eps"] == module.eps
+        assert calls["kwargs"]["checkpoint_level"] == 1
+
+    def test_single_source_output_norm_matches_rms_norm(self, monkeypatch):
+        """Block-0 entries bypass the kernel; the fused norm is applied with plain torch ops."""
+        from megatron.core.transformer import attention_residual
+
+        monkeypatch.setattr(attention_residual, "_get_fla_fused_attnres", lambda: object())
+        module = attention_residual.AttentionResidual(self._make_config(attn_res_impl="fla"))
+        torch.manual_seed(5)
+        value = torch.randn(4, 2, 16, dtype=torch.bfloat16, requires_grad=True)
+        norm_weight = (torch.ones(16) + 0.1 * torch.randn(16)).requires_grad_(True)
+
+        out = module([value], output_norm_weight=norm_weight)
+        reference = torch.nn.functional.rms_norm(value.float(), (16,), norm_weight, module.eps)
+
+        assert out.dtype == torch.bfloat16
+        torch.testing.assert_close(out.float(), reference.to(torch.bfloat16).float())
+        out.float().sum().backward()
+        assert value.grad is not None and norm_weight.grad is not None
+        # Explicit zero gradients keep DDP's grad-ready accounting intact at block 0.
+        assert module.pseudo_query.grad is not None and torch.all(module.pseudo_query.grad == 0)
+
+    def test_non_fla_backends_reject_output_norm_weight(self):
+        module = AttentionResidual(self._make_config(attn_res_impl="eager"))
+        with pytest.raises(RuntimeError, match="attn_res_impl='fla'"):
+            module([torch.randn(4, 2, 16) for _ in range(2)], output_norm_weight=torch.ones(16))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="output-discarding recompute uses the CUDA RNG tracker"
+)
+class TestAttnResRecompute:
+    """'attn_res' selective recompute: release the aggregation output, rebuild it in backward."""
+
+    def setup_method(self, method):
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.destroy_model_parallel()
+
+    def _make_config(self, attn_res_impl="eager", **overrides):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        kwargs = dict(
+            num_layers=4,
+            hidden_size=32,
+            num_attention_heads=4,
+            enable_attention_residuals=True,
+            attn_res_block_layers=2,
+            attn_res_impl=attn_res_impl,
+            layernorm_epsilon=1e-6,
+            recompute_granularity="selective",
+            recompute_modules=["attn_res"],
+        )
+        kwargs.update(overrides)
+        return TransformerConfig(**kwargs)
+
+    @staticmethod
+    def _make_module(config, recompute):
+        module = AttentionResidual(config, recompute=recompute).cuda()
+        torch.manual_seed(31)
+        with torch.no_grad():
+            module.pseudo_query.copy_(torch.randn(32, device="cuda") * 0.05)
+            module.key_norm_weight.copy_(
+                torch.ones(32, device="cuda") + torch.randn(32, device="cuda") * 0.1
+            )
+        return module
+
+    @staticmethod
+    def _make_values(n_sources, dtype=torch.float32):
+        torch.manual_seed(17)
+        return [
+            (torch.randn(6, 2, 32, device="cuda", dtype=dtype) * (0.5 + index)).requires_grad_(True)
+            for index in range(n_sources)
+        ]
+
+    @staticmethod
+    def _run(module, values, output_norm_weight=None):
+        """One forward/backward with a downstream consumer standing in for the sublayer."""
+        values = [value.detach().clone().requires_grad_(True) for value in values]
+        for param in module.parameters():
+            param.grad = None
+        if output_norm_weight is not None:
+            output_norm_weight.grad = None
+
+        out = module(values, output_norm_weight=output_norm_weight)
+        consumer = out * 3.0 + 1.0
+        if module.recompute:
+            module.discard_output_and_register_recompute(consumer)
+            assert out.untyped_storage().size() == 0, "aggregation output was not released"
+        (consumer.float() ** 2).sum().backward()
+
+        grads = [module.pseudo_query.grad, module.key_norm_weight.grad, *[v.grad for v in values]]
+        if output_norm_weight is not None:
+            grads.append(output_norm_weight.grad)
+        return consumer.detach().float(), [grad.detach().float().clone() for grad in grads]
+
+    @pytest.mark.parametrize("n_sources", [1, 3, 6])
+    def test_eager_recompute_matches_no_recompute(self, n_sources):
+        config = self._make_config()
+        reference = self._make_module(config, recompute=False)
+        recomputed = self._make_module(config, recompute=True)
+        values = self._make_values(n_sources)
+
+        out_ref, grads_ref = self._run(reference, values)
+        out_rec, grads_rec = self._run(recomputed, values)
+
+        torch.testing.assert_close(out_rec, out_ref, rtol=1e-6, atol=1e-6)
+        for got, want in zip(grads_rec, grads_ref):
+            torch.testing.assert_close(got, want, rtol=1e-6, atol=1e-6)
+
+    def test_recompute_chained_with_norm_checkpoint(self):
+        """Unfused path with 'attn_res' and 'layernorm' both recomputed.
+
+        The norm checkpoint saves the aggregation output as its input. The aggregation hook
+        sits on the sublayer output, downstream of the norm hook's tensor, so autograd replays
+        the aggregation first and the norm replay reads a live tensor.
+        """
+        from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+
+        config = self._make_config(recompute_modules=["layernorm", "attn_res"])
+        values = self._make_values(3)
+        torch.manual_seed(23)
+        norm_weight_data = torch.ones(32, device="cuda") + 0.1 * torch.randn(32, device="cuda")
+        branch_weight_data = torch.randn(32, device="cuda")
+
+        def run(recompute):
+            module = self._make_module(config, recompute=recompute)
+            norm_weight = norm_weight_data.clone().requires_grad_(True)
+            branch_weight = branch_weight_data.clone().requires_grad_(True)
+            local_values = [value.detach().clone().requires_grad_(True) for value in values]
+
+            def norm(x):
+                return torch.nn.functional.rms_norm(x, (32,), norm_weight, 1e-6)
+
+            out = module(local_values)
+            if recompute:
+                norm_checkpoint = CheckpointWithoutOutput()
+                normed = norm_checkpoint.checkpoint(norm, out)
+            else:
+                normed = norm(out)
+            # The branch saves the norm output for its own weight gradient (like a GEMM).
+            branch = normed * branch_weight
+            sublayer_output = branch + 0.5
+            if recompute:
+                norm_checkpoint.discard_output_and_register_recompute(branch)
+                module.discard_output_and_register_recompute(sublayer_output)
+                assert out.untyped_storage().size() == 0
+                assert normed.untyped_storage().size() == 0
+            (sublayer_output**2).sum().backward()
+            grads = [
+                module.pseudo_query.grad,
+                module.key_norm_weight.grad,
+                norm_weight.grad,
+                branch_weight.grad,
+                *[value.grad for value in local_values],
+            ]
+            return sublayer_output.detach(), [grad.detach().clone() for grad in grads]
+
+        out_ref, grads_ref = run(recompute=False)
+        out_rec, grads_rec = run(recompute=True)
+        torch.testing.assert_close(out_rec, out_ref, rtol=1e-6, atol=1e-6)
+        for got, want in zip(grads_rec, grads_ref):
+            torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+
+    @pytest.mark.skipif(not HAVE_FLA_ATTNRES, reason="requires flash-linear-attention")
+    @pytest.mark.parametrize("n_sources", [1, 3])
+    def test_fla_fused_norm_recompute_matches_no_recompute(self, n_sources):
+        """The fused-norm output is released and rebuilt by the same kernels."""
+        config = self._make_config(
+            attn_res_impl="fla",
+            attn_res_norm_fusion=True,
+            normalization="RMSNorm",
+            recompute_modules=["layernorm", "attn_res"],
+        )
+        reference = self._make_module(config, recompute=False)
+        recomputed = self._make_module(config, recompute=True)
+        values = self._make_values(n_sources, dtype=torch.bfloat16)
+        torch.manual_seed(23)
+        norm_weight = (torch.ones(32, device="cuda") + 0.1 * torch.randn(32, device="cuda")).to(
+            torch.bfloat16
+        )
+
+        out_ref, grads_ref = self._run(reference, values, norm_weight.clone().requires_grad_(True))
+        out_rec, grads_rec = self._run(recomputed, values, norm_weight.clone().requires_grad_(True))
+
+        torch.testing.assert_close(out_rec, out_ref, rtol=0, atol=0)
+        for got, want in zip(grads_rec, grads_ref):
+            torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
 
 
 class TestAttnResInitEquivalence:
@@ -723,6 +1008,99 @@ class TestAttnResConfigValidation:
 
         with pytest.raises(ValueError, match="mutually"):
             TransformerConfig(**self._base_kwargs(enable_hyper_connections=True))
+
+    def test_attn_res_recompute_requires_enable(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="'attn_res' in recompute_modules requires"):
+            TransformerConfig(
+                **self._base_kwargs(
+                    enable_attention_residuals=False,
+                    attn_res_block_layers=None,
+                    recompute_granularity="selective",
+                    recompute_modules=["attn_res"],
+                )
+            )
+
+    @pytest.mark.parametrize(
+        "recompute_modules", [["attn_res"], ["layernorm", "attn_res"], ["attn_res", "core_attn"]]
+    )
+    def test_attn_res_recompute_accepted_unfused(self, recompute_modules):
+        """Without norm fusion the two output-discarding checkpoints chain; no pairing rule."""
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        config = TransformerConfig(
+            **self._base_kwargs(
+                recompute_granularity="selective", recompute_modules=recompute_modules
+            )
+        )
+        assert "attn_res" in config.recompute_modules
+
+    @pytest.mark.parametrize("offload_module", ["attn_norm", "mlp_norm"])
+    def test_attn_res_recompute_rejects_norm_input_offload(self, offload_module):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match=offload_module):
+            TransformerConfig(
+                **self._base_kwargs(
+                    recompute_granularity="selective",
+                    recompute_modules=["attn_res"],
+                    fine_grained_activation_offloading=True,
+                    offload_modules=[offload_module],
+                )
+            )
+
+    def test_norm_fusion_requires_enable(self):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        with pytest.raises(ValueError, match="attn_res_norm_fusion requires enable_attention"):
+            TransformerConfig(
+                **self._base_kwargs(
+                    enable_attention_residuals=False,
+                    attn_res_block_layers=None,
+                    attn_res_norm_fusion=True,
+                )
+            )
+
+    @pytest.mark.parametrize(
+        "recompute_modules",
+        [None, ["core_attn"], ["layernorm", "attn_res"], ["mlp", "attn_res", "layernorm"]],
+    )
+    def test_norm_fusion_accepted(self, recompute_modules):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        config = TransformerConfig(
+            **self._base_kwargs(
+                attn_res_norm_fusion=True,
+                normalization="RMSNorm",
+                recompute_granularity="selective" if recompute_modules else None,
+                recompute_modules=recompute_modules,
+            )
+        )
+        assert config.attn_res_norm_fusion and config.attn_res_impl == "fla"
+
+    @pytest.mark.parametrize(
+        "overrides,match",
+        [
+            (dict(attn_res_impl="eager"), "attn_res_impl='fla'"),
+            (dict(attn_res_impl="compile"), "attn_res_impl='fla'"),
+            (dict(normalization="LayerNorm"), "RMSNorm"),
+            (dict(layernorm_zero_centered_gamma=True), "zero_centered_gamma"),
+            (
+                dict(fine_grained_activation_offloading=True, offload_modules=["mlp_norm"]),
+                "mlp_norm",
+            ),
+            (dict(recompute_granularity="selective", recompute_modules=["layernorm"]), "together"),
+            (dict(recompute_granularity="selective", recompute_modules=["attn_res"]), "together"),
+        ],
+    )
+    def test_norm_fusion_rejections(self, overrides, match):
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        kwargs = self._base_kwargs(attn_res_norm_fusion=True, normalization="RMSNorm")
+        kwargs.update(overrides)
+        with pytest.raises(ValueError, match=match):
+            TransformerConfig(**kwargs)
 
     @pytest.mark.parametrize(
         "overrides,match",
