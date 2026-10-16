@@ -33,6 +33,7 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
     AbsorbedMLASelfAttention,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -1226,6 +1227,164 @@ class TestAttnResHybridBlock:
                 )
         finally:
             off_interface.reset_instance()
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or _get_fla_fused_attnres() is None,
+        reason="AttnRes norm fusion runs on FLA's fused kernel",
+    )
+    @pytest.mark.parametrize(
+        "layer_pattern,model_kwargs,fused_tolerance,standalone_mlp_norm",
+        [
+            pytest.param(
+                Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION + Symbols.MLP,
+                {},
+                1e-4,
+                True,
+                id="dense-fp32",
+            ),
+            # The dense MLP entries keep the TE LayerNormLinear fc1 (no standalone pre-MLP
+            # norm, as in Kimi-K3's '-' entry): they must fall back to the unfused aggregation
+            # while the attention entries fuse.
+            pytest.param(
+                Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION + Symbols.MLP,
+                {},
+                1e-4,
+                False,
+                id="dense-fp32-fused-fc1",
+            ),
+            pytest.param(
+                Symbols.ATTENTION + Symbols.MOE + Symbols.ATTENTION + Symbols.MOE,
+                {
+                    "bf16": True,
+                    "params_dtype": torch.bfloat16,
+                    "num_moe_experts": 4,
+                    "moe_ffn_hidden_size": 512,
+                    "moe_router_topk": 2,
+                    "moe_router_load_balancing_type": "none",
+                    "moe_grouped_gemm": True,
+                    "gated_linear_unit": True,
+                    "activation_func": torch.nn.functional.silu,
+                    "add_bias_linear": False,
+                },
+                3e-2,
+                True,
+                id="moe-bf16",
+            ),
+        ],
+    )
+    def test_norm_fusion_and_recompute_match_unfused(
+        self, layer_pattern, model_kwargs, fused_tolerance, standalone_mlp_norm
+    ):
+        """attn_res_norm_fusion and 'attn_res' recompute against the unfused stack.
+
+        The norm modules keep owning their weights, so all variants share the checkpoint
+        layout and load each other's state dicts strictly. Recompute variants replay the same
+        kernels and match tightly; the fused kernel skips the bf16 rounding of the mixed
+        residual before the norm, so the fused/unfused comparison carries a dtype tolerance.
+        Entries without a standalone pre-norm keep the unfused aggregation.
+        """
+        layer_type_list = validate_segment_layers(layer_pattern)
+        submodules = TestHybridBlock._non_fused_norm_submodules()
+        if not standalone_mlp_norm:
+            submodules = deepcopy(hybrid_stack_spec.submodules)
+            attention_submodules = submodules.attention_layer.submodules
+            attention_submodules.input_layernorm = TENorm
+            attention_submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
+
+        def make(**config_kwargs):
+            config = self._make_config(
+                len(layer_type_list),
+                block_layers=2,
+                attn_res_impl="fla",
+                normalization="RMSNorm",
+                **model_kwargs,
+                **config_kwargs,
+            )
+            model_parallel_cuda_manual_seed(123)
+            torch.manual_seed(123)
+            stack = self._make_stack(config, layer_type_list, submodules=submodules)
+            return config, stack.cuda().train()
+
+        recompute_kwargs = dict(
+            recompute_granularity="selective", recompute_modules=["layernorm", "attn_res"]
+        )
+        baseline_config, baseline = make()
+        _, unfused_recompute = make(**recompute_kwargs)
+        _, fused = make(attn_res_norm_fusion=True)
+        _, fused_recompute = make(attn_res_norm_fusion=True, **recompute_kwargs)
+
+        state = baseline.state_dict()
+        for variant in (unfused_recompute, fused, fused_recompute):
+            assert set(variant.state_dict().keys()) == set(state.keys())
+            variant.load_state_dict(state)
+        fused_entries = 0
+        for layer in fused.layers:
+            assert layer.attn_res_norm_fusion
+            inner = layer.inner_layer
+            norm = (
+                inner.pre_mlp_layernorm
+                if isinstance(inner.self_attention, IdentityOp)
+                else inner.input_layernorm
+            )
+            # Fused exactly where the entry owns a standalone pre-norm; folded norms fall back.
+            assert (layer.fused_norm is not None) == (not isinstance(norm, IdentityOp))
+            fused_entries += layer.fused_norm is not None
+            # The fused norm is the inner entry's own module, not a second registered child.
+            assert "_fused_norm" not in dict(layer.named_modules())
+        assert fused_entries == (len(fused.layers) if standalone_mlp_norm else 2)
+        for layer in fused_recompute.layers:
+            assert layer.attn_res.recompute
+
+        sequence_length, micro_batch_size = 32, 2
+        torch.manual_seed(7)
+        hidden_data = torch.randn(
+            (sequence_length, micro_batch_size, baseline_config.hidden_size),
+            device="cuda",
+            dtype=baseline_config.params_dtype,
+        )
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool, device="cuda"
+        )
+
+        def run_iteration(model):
+            for param in model.parameters():
+                param.grad = None
+            hidden_states = hidden_data.detach().clone().requires_grad_(True)
+            output = model(hidden_states, attention_mask=attention_mask)
+            output.float().sum().backward()
+            torch.cuda.synchronize()
+            grads = {
+                name: param.grad.detach().float().cpu() if param.grad is not None else None
+                for name, param in model.named_parameters()
+            }
+            return output.detach().float().cpu(), hidden_states.grad.detach().float().cpu(), grads
+
+        def assert_within(got, want, tolerance, name):
+            # Absolute tolerance relative to the tensor's own scale: an elementwise rtol
+            # alone fails on near-zero entries (a bf16 parameter gradient summed over
+            # tokens has such entries), and a fixed atol does not transfer between
+            # tensors whose magnitudes differ by orders of magnitude.
+            scale = max(1.0, want.abs().max().item())
+            torch.testing.assert_close(
+                got, want, rtol=tolerance, atol=tolerance * scale, msg=lambda msg: f"{name}: {msg}"
+            )
+
+        def compare(got, want, tolerance):
+            assert_within(got[0], want[0], tolerance, "output")
+            assert_within(got[1], want[1], tolerance, "input gradient")
+            assert set(got[2]) == set(want[2])
+            for name, want_grad in want[2].items():
+                got_grad = got[2][name]
+                if want_grad is None or got_grad is None:
+                    assert want_grad is None and got_grad is None, name
+                    continue
+                assert_within(got_grad, want_grad, tolerance, name)
+
+        baseline_result = run_iteration(baseline)
+        compare(run_iteration(unfused_recompute), baseline_result, 1e-4)
+        fused_result = run_iteration(fused)
+        compare(fused_result, baseline_result, fused_tolerance)
+        compare(run_iteration(fused_recompute), fused_result, 1e-4)
 
     @pytest.mark.parametrize(
         "layer_pattern",

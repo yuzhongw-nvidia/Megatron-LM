@@ -711,9 +711,30 @@ class AttentionResidual(MegatronModule):
     to TP (hidden dim intact under sequence parallelism), CP, and EP. The
     parameters are replicated; under sequence parallelism their gradients are
     all-reduced across the TP group via the ``sequence_parallel`` attribute.
+
+    Two optional memory features, both driven by the owning layer:
+
+    - Norm fusion (``config.attn_res_norm_fusion``): the caller passes the weight
+      of the RMSNorm that consumes the aggregation (``output_norm_weight``) and
+      FLA's fused kernel emits the normalized sublayer input directly; the
+      mixed residual is never materialized and the layer bypasses its norm
+      module (which keeps owning the weight, so checkpoints stay interchangeable
+      with the unfused path). FLA-only; the single-source case applies the same
+      RMSNorm with plain PyTorch ops.
+    - Recompute (``recompute=True``, i.e. ``'attn_res'`` in ``recompute_modules``):
+      the aggregation runs under an output-discarding checkpoint. The caller
+      releases the output once the sublayer's forward no longer needs it via
+      :meth:`discard_output_and_register_recompute`, passing the sublayer's
+      output as the hook tensor: its gradient is computed before the gradient of
+      anything inside the sublayer, so the output is rebuilt from the (still
+      alive) depth sources before the norm's own recompute hook or backward
+      reads it. The depth sources themselves stay saved; only the aggregation
+      output (the norm input, or the fused norm output) is freed.
     """
 
-    def __init__(self, config: TransformerConfig, layer_number: Optional[int] = None):
+    def __init__(
+        self, config: TransformerConfig, layer_number: Optional[int] = None, recompute: bool = False
+    ):
         super().__init__(config)
         self.eps = config.layernorm_epsilon
         self.impl = getattr(config, 'attn_res_impl', 'fla')
@@ -723,6 +744,8 @@ class AttentionResidual(MegatronModule):
                 "attn_res_impl='fla' requires FLA with fused AttnRes support. "
                 "Install it with `pip install flash-linear-attention==0.5.1`."
             )
+        self.recompute = recompute
+        self._checkpoint = None
         # Zero init is mandatory: uniform initial attention weights.
         self.pseudo_query = mark_keep_in_fp32(nn.Parameter(torch.zeros(config.hidden_size)))
         self.key_norm_weight = mark_keep_in_fp32(nn.Parameter(torch.ones(config.hidden_size)))
@@ -730,41 +753,108 @@ class AttentionResidual(MegatronModule):
             setattr(self.pseudo_query, 'sequence_parallel', True)
             setattr(self.key_norm_weight, 'sequence_parallel', True)
 
-    def forward(self, values: Sequence[Tensor]) -> Tensor:
-        """Aggregate depth sources (+ optional partial sum) into the sublayer input."""
-        assert len(values) >= 1, "AttentionResidual requires at least one depth source"
-        nvtx_range_push(msg=f"attn_res.aggregate_n{len(values)}")
+    def _output_norm(self, out: Tensor, output_norm_weight: Tensor) -> Tensor:
+        """RMSNorm of the aggregation output for the paths that bypass the fused kernel.
+
+        Same math as the fused kernel and as TE's RMSNorm: fp32 statistics and scaling,
+        result cast back to the residual dtype.
+        """
+        return torch.nn.functional.rms_norm(
+            out.float(), (out.shape[-1],), output_norm_weight.float(), self.eps
+        ).to(out.dtype)
+
+    def _aggregate(
+        self,
+        pseudo_query: Tensor,
+        key_norm_weight: Tensor,
+        output_norm_weight: Optional[Tensor],
+        values: Sequence[Tensor],
+    ) -> Tensor:
+        """Backend dispatch; parameters are explicit so the recompute path can replay it."""
         if len(values) == 1:
             # A one-source softmax is identically one. Keep explicit zero
             # parameter gradients for DDP's grad-ready accounting, without
             # introducing fused-backward cancellation noise at block 0.
-            zero = (self.pseudo_query.sum() + self.key_norm_weight.sum()) * 0.0
+            zero = (pseudo_query.sum() + key_norm_weight.sum()) * 0.0
             out = values[0] + zero.to(values[0].dtype)
-        elif self.impl == 'fla':
+            if output_norm_weight is not None:
+                out = self._output_norm(out, output_norm_weight)
+            return out
+        if self.impl == 'fla':
             assert self._fla_fused_attnres is not None
-            out = self._fla_fused_attnres(
-                self.pseudo_query,
+            return self._fla_fused_attnres(
+                pseudo_query,
                 values,
-                self.key_norm_weight,
-                output_rms_weight=None,
+                key_norm_weight,
+                output_rms_weight=output_norm_weight,
                 rms_eps=self.eps,
                 scale=1.0,
                 return_weights=False,
                 checkpoint_level=1,
             )
-        elif self.impl == 'compile':
+        if output_norm_weight is not None:
+            raise RuntimeError("AttnRes norm fusion is only implemented for attn_res_impl='fla'.")
+        if self.impl == 'compile':
             compiled_attn_res = _get_compiled_attn_res()
-            if compiled_attn_res is None:
-                out = _AttnResAggregation.apply(
-                    self.pseudo_query, self.key_norm_weight, self.eps, *values
-                )
-            else:
-                out = compiled_attn_res(
-                    self.pseudo_query, self.key_norm_weight, self.eps, list(values)
-                )
+            if compiled_attn_res is not None:
+                return compiled_attn_res(pseudo_query, key_norm_weight, self.eps, list(values))
+        return _AttnResAggregation.apply(pseudo_query, key_norm_weight, self.eps, *values)
+
+    def _aggregate_unpacked(
+        self,
+        pseudo_query: Tensor,
+        key_norm_weight: Tensor,
+        output_norm_weight: Optional[Tensor],
+        *values: Tensor,
+    ) -> Tensor:
+        """Positional-tensor form of :meth:`_aggregate` for the checkpoint helper."""
+        return self._aggregate(pseudo_query, key_norm_weight, output_norm_weight, list(values))
+
+    def forward(
+        self, values: Sequence[Tensor], output_norm_weight: Optional[Tensor] = None
+    ) -> Tensor:
+        """Aggregate depth sources (+ optional partial sum) into the sublayer input.
+
+        Args:
+            values: depth sources (and the running partial sum).
+            output_norm_weight: weight of the consuming RMSNorm when the owning layer
+                fuses it into the aggregation (``config.attn_res_norm_fusion``); the
+                returned tensor is then the normalized sublayer input.
+        """
+        assert len(values) >= 1, "AttentionResidual requires at least one depth source"
+        nvtx_range_push(msg=f"attn_res.aggregate_n{len(values)}")
+        if self.recompute:
+            from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+
+            # One checkpoint object per forward call; the owning layer discards the
+            # output and registers the recompute hook once the sublayer has consumed it.
+            assert self._checkpoint is None, (
+                "AttentionResidual.forward was called again before "
+                "discard_output_and_register_recompute released the previous checkpoint"
+            )
+            self._checkpoint = CheckpointWithoutOutput()
+            out = self._checkpoint.checkpoint(
+                self._aggregate_unpacked,
+                self.pseudo_query,
+                self.key_norm_weight,
+                output_norm_weight,
+                *values,
+            )
         else:
-            out = _AttnResAggregation.apply(
-                self.pseudo_query, self.key_norm_weight, self.eps, *values
+            out = self._aggregate(
+                self.pseudo_query, self.key_norm_weight, output_norm_weight, values
             )
         nvtx_range_pop(msg=f"attn_res.aggregate_n{len(values)}")
         return out
+
+    def discard_output_and_register_recompute(self, hook_tensor: Tensor) -> None:
+        """Release the last aggregation output and rebuild it when ``hook_tensor``'s grad arrives.
+
+        No-op unless the module was built with ``recompute=True``. ``hook_tensor`` must be
+        downstream of every backward consumer of the output (the sublayer's output is the
+        natural choice), and the output must not be read by the forward anymore.
+        """
+        if self._checkpoint is None:
+            return
+        self._checkpoint.discard_output_and_register_recompute(hook_tensor)
+        self._checkpoint = None

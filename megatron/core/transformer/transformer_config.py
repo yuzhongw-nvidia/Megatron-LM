@@ -727,7 +727,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc", "gdn", "gdn_norm_out".
+             "shared_experts", "mhc", "gdn", "gdn_norm_out", "attn_res".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -744,7 +744,13 @@ class TransformerConfig(ModelParallelConfig):
             out_proj). Requires a GDN-family experimental attention variant or a hybrid model.
     "gdn_norm_out": recompute gated output normalization and layout restoration for
             Gated DeltaNet-family layers, including GatedDeltaNet and KDA.
-    "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use
+    "attn_res": recompute the Attention Residuals depth aggregation: its output (the
+            sublayer's norm input, or the normalized input under attn_res_norm_fusion) is
+            released after the sublayer's forward and rebuilt from the depth sources when
+            the sublayer output's gradient arrives, before the "layernorm" checkpoint of the
+            same sublayer replays. The depth sources and partial sums stay saved. Requires
+            enable_attention_residuals=True; incompatible with attn_norm/mlp_norm offloading.
+    "moe_act", "layernorm", "mla_up_proj", "mhc", "gdn_norm_out", and "attn_res" use
     output-discarding checkpointing,
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
@@ -1487,6 +1493,19 @@ class TransformerConfig(ModelParallelConfig):
     at small hidden sizes — so 'fla' is the default, with 'compile' as the dependency-free
     optimized path."""
 
+    attn_res_norm_fusion: bool = False
+    """Fuse the RMSNorm that consumes each AttnRes aggregation (the sublayer's input_layernorm
+    or pre_mlp_layernorm) into FLA's fused AttnRes kernel (``fused_attnres(output_rms_weight=...)``,
+    flash-linear-attention >= 0.5.1): the kernel emits the normalized sublayer input directly and
+    the mixed residual is never materialized. The norm modules keep owning their weights, so
+    checkpoints are interchangeable with the unfused path; only their forward is bypassed.
+    Requires attn_res_impl='fla', RMSNorm without zero-centered gamma and no attn_norm/mlp_norm
+    fine-grained offloading. Sublayers whose norm is folded into their first linear (TE
+    LayerNormLinear specs, e.g. the dense MLP entry of Kimi-K3; mla_down_proj_fusion is rejected)
+    keep the unfused aggregation, and so does the final-norm aggregation. With selective recompute,
+    'attn_res' and 'layernorm' must be enabled together or not at all: the fused output is the
+    norm output, so one output-discarding checkpoint covers both."""
+
     hybrid_layer_pattern: Optional[str] = None
     """Unified hybrid layer pattern string (mirrors --hybrid-layer-pattern; populated
     automatically by the argument bridge). Consumed by config-only consumers that need the
@@ -1723,10 +1742,25 @@ class TransformerConfig(ModelParallelConfig):
         would silently bypass the AttnRes residual interception (fused residual
         norms, fp32 residual connection) or the interleaved schedule's uniform
         payload-width reasoning (variable sequence lengths with VPP).
+
+        Two memory knobs are validated here as well: ``'attn_res'`` in
+        ``recompute_modules`` (output-discarding recompute of the aggregation) and
+        ``attn_res_norm_fusion`` (the consuming RMSNorm fused into the FLA kernel).
         """
+        recompute_attn_res = (
+            self.recompute_granularity == "selective"
+            and self.recompute_modules is not None
+            and "attn_res" in self.recompute_modules
+        )
         if not self.enable_attention_residuals:
             if self.attn_res_block_layers is not None:
                 raise ValueError("attn_res_block_layers requires enable_attention_residuals=True.")
+            if self.attn_res_norm_fusion:
+                raise ValueError("attn_res_norm_fusion requires enable_attention_residuals=True.")
+            if recompute_attn_res:
+                raise ValueError(
+                    "'attn_res' in recompute_modules requires enable_attention_residuals=True."
+                )
             return
 
         if self.enable_hyper_connections:
@@ -1748,6 +1782,51 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_res_impl must be 'eager', 'compile', or 'fla', "
                 f"got {self.attn_res_impl!r}."
             )
+        norm_offload_modules = set()
+        if self.fine_grained_activation_offloading and self.offload_modules:
+            norm_offload_modules = {"attn_norm", "mlp_norm"} & set(self.offload_modules)
+        if recompute_attn_res and norm_offload_modules:
+            # Both target the aggregation output (the norm input): the recompute releases it
+            # and regenerates it in backward, so there is nothing for the offload to transfer.
+            raise ValueError(
+                "'attn_res' in recompute_modules is incompatible with offload_modules "
+                f"{sorted(norm_offload_modules)}: they offload the AttnRes aggregation output "
+                "that the recompute discards. Remove one of the two."
+            )
+        if self.attn_res_norm_fusion:
+            if self.attn_res_impl != "fla":
+                raise ValueError(
+                    "attn_res_norm_fusion requires attn_res_impl='fla' (the consuming RMSNorm is "
+                    f"applied by FLA's fused_attnres kernel), got {self.attn_res_impl!r}."
+                )
+            if self.normalization != "RMSNorm" or self.layernorm_zero_centered_gamma:
+                raise ValueError(
+                    "attn_res_norm_fusion fuses a plain RMSNorm (y = x * rsqrt(mean(x^2) + eps) "
+                    "* w) into the aggregation; it requires normalization='RMSNorm' without "
+                    "layernorm_zero_centered_gamma."
+                )
+            if getattr(self, "mla_down_proj_fusion", False):
+                raise ValueError(
+                    "attn_res_norm_fusion requires standalone input norms; mla_down_proj_fusion "
+                    "folds the MLA input norm into the down projections."
+                )
+            if norm_offload_modules:
+                raise ValueError(
+                    "attn_res_norm_fusion is incompatible with offload_modules "
+                    f"{sorted(norm_offload_modules)}: the norm input is never materialized."
+                )
+            recompute_layernorm = (
+                self.recompute_granularity == "selective"
+                and self.recompute_modules is not None
+                and "layernorm" in self.recompute_modules
+            )
+            if recompute_layernorm != recompute_attn_res:
+                raise ValueError(
+                    "With attn_res_norm_fusion, 'attn_res' and 'layernorm' in recompute_modules "
+                    "must be enabled together or not at all: the fused kernel's output is the "
+                    "norm output, so one output-discarding checkpoint covers both (got "
+                    f"layernorm={recompute_layernorm}, attn_res={recompute_attn_res})."
+                )
         unsupported = []
         has_variable_sequences = (
             self.variable_seq_lengths or self.sequence_packing_scheduler is not None
@@ -2901,6 +2980,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc",
                     "gdn",
                     "gdn_norm_out",
+                    "attn_res",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -3488,7 +3568,8 @@ class TransformerConfig(ModelParallelConfig):
                     t not in (None, "p2p", "a2a", "a2a+p2p") for t in cp_comm_types
                 ),
                 "a2a+p2p without two hierarchical_context_parallel_sizes whose product is "
-                "context_parallel_size": "a2a+p2p" in a2a_modes and not hcp_ok,
+                "context_parallel_size": "a2a+p2p" in a2a_modes
+                and not hcp_ok,
                 "an a2a group size that does not divide the attention heads per tensor-parallel "
                 "rank": any(heads_per_tp_rank % size for size in a2a_sizes),
                 "a2a/a2a+p2p with dynamic_context_parallel": bool(a2a_modes)
