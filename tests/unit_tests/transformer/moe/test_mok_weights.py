@@ -6,7 +6,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from megatron.core.activations import situlu
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe.megakernel import (
+    megakernel_fuses_shared_expert,
+    prepare_megakernel_shared_expert_config,
+)
 from megatron.core.transformer.moe.megakernel.mok import weights
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -24,6 +29,7 @@ def _mok_transformer_config(**overrides):
         "moe_ffn_hidden_size": 256,
         "moe_shared_expert_intermediate_size": 256,
         "expert_model_parallel_size": 4,
+        "expert_tensor_parallel_size": 1,
         "gated_linear_unit": True,
         "activation_func": F.silu,
         "gradient_accumulation_fusion": True,
@@ -55,7 +61,7 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
     "overrides",
     [
         {},
-        {"moe_shared_expert_gate": True},
+        {"moe_shared_expert_gate": True, "activation_func": situlu},
         {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True, "moe_shared_expert_gate": True},
         {
             "fp8": "hybrid",
@@ -69,6 +75,41 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
 )
 def test_mok_accepts_key_supported_configurations(overrides):
     assert _mok_transformer_config(**overrides).moe_megakernel_backend == "mok"
+
+
+def test_shared_execution_is_independent_of_activation_and_preserves_native_precision():
+    for activation in (F.silu, situlu):
+        assert megakernel_fuses_shared_expert(_mok_transformer_config(activation_func=activation))
+        for overrides in (
+            {"moe_megakernel_shared_expert_mode": "native"},
+            {"moe_latent_size": 64},
+            {"moe_shared_expert_intermediate_size": 512},
+            {"moe_shared_expert_intermediate_size": None},
+            {"tensor_model_parallel_size": 4, "sequence_parallel": True},
+        ):
+            config = _mok_transformer_config(
+                activation_func=activation,
+                fp8="hybrid",
+                fp8_recipe="mxfp8",
+                fp8_param=True,
+                **overrides,
+            )
+            assert not megakernel_fuses_shared_expert(config)
+            assert prepare_megakernel_shared_expert_config(config) is config
+            assert config.fp8_param and config.fp8 == "hybrid"
+    for overrides in (
+        {"moe_latent_size": 64},
+        {"moe_shared_expert_intermediate_size": 512},
+        {"tensor_model_parallel_size": 4, "sequence_parallel": True},
+    ):
+        with pytest.raises(ValueError, match="Fused MOK shared execution requires"):
+            _mok_transformer_config(moe_megakernel_shared_expert_mode="fused", **overrides)
+    with pytest.raises(ValueError, match="must be auto, fused, or native"):
+        _mok_transformer_config(moe_megakernel_shared_expert_mode="invalid")
+    with pytest.raises(ValueError, match="requires sequence_parallel=True"):
+        _mok_transformer_config(tensor_model_parallel_size=4)
+    with pytest.raises(ValueError, match="requires expert TP=1"):
+        _mok_transformer_config(expert_tensor_parallel_size=2)
 
 
 @pytest.mark.parametrize(
