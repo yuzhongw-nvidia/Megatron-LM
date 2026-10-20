@@ -23,6 +23,12 @@ ARG CAUSAL_CONV1D_COMMIT=4f6ae4e26ae5fe8af9372f8d312ab25cc4595223
 # does and ran the 512K packed-THD recipe cleanly. Place each EP64 group
 # within one NVLink domain; this is not a cross-domain RDMA build.
 ARG HYBRID_EP_COMMIT=10d4dd7377d5bce900fbb4b80cce863764892b95
+# Mixture-of-Kittens (MoK), the deterministic MoE training megakernel for NVL72
+# (https://github.com/QiZhangNV/mixture-of-kittens, Kimi-K3 integration branch
+# qizhang/mok-routed-only-and-situ-glu). Pinned to the revision that adds routed-only
+# experts and the independent SiTU-GLU activation; the ThunderKittens submodule is
+# pinned by the MoK checkout and receives MoK's MXFP8 MN-major patch.
+ARG MOK_COMMIT=d59188aab3c9d5f92dd197d9997226ba3a43c701
 ARG NVTE_CUDA_ARCHS="100a;103a"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -91,6 +97,22 @@ RUN git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git /opt/
     python -m pip install --no-build-isolation --no-cache-dir . && \
     patchelf --remove-rpath /usr/local/lib/python3.12/dist-packages/hybrid_ep_cpp*.so && \
     ! readelf -d /usr/local/lib/python3.12/dist-packages/hybrid_ep_cpp*.so | grep -q rdma-core
+
+# MoK compiles csrc/bindings.cu in one nvcc invocation; MOK_ARCH=ALL emits sm_100a and
+# sm_103a cubins. setup.py requires Python >= 3.12, torch >= 2.10 built for CUDA >= 13.0 and
+# an nvcc whose major.minor equals torch.version.cuda (13.2 here; MoK is validated on 13.0 and
+# only warns). prepare_thunderkittens.sh initialises the submodule and applies the MN-major
+# MXFP8 B-operand patch MoK needs for native TE column-wise weights (idempotent). The import
+# check runs from / so the source tree does not shadow the installed package, and with the
+# CUDA driver stub because mok._C links libcuda and no driver exists at build time.
+RUN git clone https://github.com/QiZhangNV/mixture-of-kittens.git /opt/mixture-of-kittens && \
+    cd /opt/mixture-of-kittens && git checkout "${MOK_COMMIT}" && \
+    ./scripts/prepare_thunderkittens.sh && \
+    unset PIP_CONSTRAINT && \
+    MOK_ARCH=ALL python -m pip install --no-build-isolation --no-deps --no-cache-dir . && \
+    mkdir -p /tmp/cuda-stubs && ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-stubs/libcuda.so.1 && \
+    cd / && LD_LIBRARY_PATH=/tmp/cuda-stubs:${LD_LIBRARY_PATH:-} python -c 'import mok, glob, os, subprocess; assert not mok.__file__.startswith("/opt/mixture-of-kittens"), mok.__file__; so = glob.glob(os.path.join(os.path.dirname(mok.__file__), "_C*.so"))[0]; elf = subprocess.check_output(["cuobjdump", "--list-elf", so], text=True); assert "sm_100a" in elf and "sm_103a" in elf, elf; print("mok", mok.__version__, os.path.basename(so))' && \
+    rm -rf /tmp/cuda-stubs
 
 # NGC's triton-kernels declares pytest as a dependency.
 # Preserve dependency consistency and the MLA latent CP split-API version pin.
