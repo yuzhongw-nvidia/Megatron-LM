@@ -252,6 +252,9 @@ class MLASelfAttentionSubmodules:
     linear_kv_up_proj: Union[ModuleSpec, type] = None
     linear_qkv_down_proj: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
+    # MLA output gating (dev #8006). The build/apply logic in MultiLatentAttention is carried in a
+    # follow-up commit; the field exists here so the hybrid MLA spec (linear_gate=...) type-checks.
+    linear_gate: Union[ModuleSpec, type] = None
 
 
 class MultiLatentAttention(Attention):
