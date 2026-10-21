@@ -682,7 +682,9 @@ def test_a2a_permutation_matches_chunk_bookkeeping(cp, a2a):
             tensor_model_parallel_size=4,
             sequence_parallel=True,
         ),  # 8 heads / TP4 = 2 heads per rank, not divisible by the a2a group of 4
-        dict(cp_comm_type="a2a", dynamic_context_parallel=True),
+        # dynamic_context_parallel turns on a packing scheduler, which on the synced dev requires
+        # max_seqlen_per_dp_cp_rank; set it so the intended latent-CP a2a+dynamic rejection is reached.
+        dict(cp_comm_type="a2a", dynamic_context_parallel=True, max_seqlen_per_dp_cp_rank=128),
         dict(
             cp_comm_type="a2a", recompute_granularity="selective", recompute_modules=["mla_up_proj"]
         ),
