@@ -1610,44 +1610,21 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         return (d_qkvzba, d_weight, d_A_log, d_dt_bias, None, None, None, None, None, None)
 
 
-def fused_streamed_pre_gated_delta_rule(
+def _validate_fused_streamed_pre_gated_delta_rule_inputs(
     qkvzba: Tensor,
     conv1d_weight: Tensor,
     conv1d_bias: Optional[Tensor],
-    A_log: Tensor,
-    dt_bias: Tensor,
     *,
     num_key_heads: int,
     num_value_heads: int,
     key_head_dim: int,
     value_head_dim: int,
-    use_qk_l2norm: bool = True,
-    cu_seqlens: Optional[Tensor] = None,
-    seq_idx: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Streamed fused pre-gated-delta-rule entry point.
-
-    Args:
-        qkvzba: ``[seq_len, batch, in_proj_dim]`` projection output. Must be
-            on CUDA.
-        conv1d_weight: ``[conv_dim, 1, k_w]`` depthwise conv weight.
-        conv1d_bias: Must be ``None`` (conv bias is not supported).
-        A_log: ``[num_value_heads]`` raw decay parameter.
-        dt_bias: ``[num_value_heads]`` time-step bias.
-        num_key_heads / num_value_heads / key_head_dim / value_head_dim: GDN
-            architecture parameters. ``num_value_heads`` must be an integer
-            multiple of ``num_key_heads``.
-        use_qk_l2norm: Must be ``True``; the fused backward closes over the
-            l2norm path.
-        cu_seqlens: Optional packed THD cumulative sequence lengths. When set,
-            ``qkvzba`` must have ``batch == 1`` and ``cu_seqlens[-1] == seq_len``.
-        seq_idx: Optional precomputed token-to-sequence map with shape
-            ``[1, seq_len]``. Used by causal-conv backward in packed THD mode.
-
-    Returns:
-        ``(query, key, value, gate, beta, g)`` matching the unfused
-        :meth:`GatedDeltaNet.pre_gated_delta_rule` API.
-    """
+    use_qk_l2norm: bool,
+    cu_seqlens: Optional[Tensor],
+    seq_idx: Optional[Tensor],
+    cp_size: int,
+) -> None:
+    """Validate the public contract for streamed fused GDN preprocessing."""
 
     if causal_conv1d_bwd_function is None:
         raise ImportError(
@@ -1669,6 +1646,25 @@ def fused_streamed_pre_gated_delta_rule(
     assert (
         num_value_heads % num_key_heads == 0
     ), f"{num_value_heads=} must be a multiple of {num_key_heads=}."
+
+    if cp_size > 1:
+        if qkvzba.shape[1] != 1:
+            raise ValueError(
+                "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
+                f"for fused_pre_gated_delta_rule; got batch={qkvzba.shape[1]}."
+            )
+        boundary = conv1d_weight.shape[-1] - 1
+        if boundary > 0 and qkvzba.shape[0] < boundary:
+            raise ValueError(
+                "fused_pre_gated_delta_rule chunkwise CP requires local chunk length "
+                f"({qkvzba.shape[0]}) >= conv_kernel_dim - 1 ({boundary})."
+            )
+        if seq_idx is not None:
+            raise ValueError(
+                "fused_pre_gated_delta_rule derives packed seq_idx internally when "
+                "chunkwise CP is active."
+            )
+
     if cu_seqlens is not None:
         assert cu_seqlens.is_cuda, (
             "Packed fused_pre_gated_delta_rule requires CUDA cu_seqlens; "
@@ -1689,15 +1685,80 @@ def fused_streamed_pre_gated_delta_rule(
             "Packed fused_pre_gated_delta_rule requires at least one packed sequence; "
             f"got {cu_seqlens.shape=}."
         )
+    else:
+        assert seq_idx is None, "seq_idx requires cu_seqlens for packed THD mode."
+
+
+def fused_streamed_pre_gated_delta_rule(
+    qkvzba: Tensor,
+    conv1d_weight: Tensor,
+    conv1d_bias: Optional[Tensor],
+    A_log: Tensor,
+    dt_bias: Tensor,
+    *,
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    use_qk_l2norm: bool = True,
+    cu_seqlens: Optional[Tensor] = None,
+    seq_idx: Optional[Tensor] = None,
+    cp_group=None,
+    strict_runtime_validation: bool = True,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Streamed fused pre-gated-delta-rule entry point.
+
+    Args:
+        qkvzba: ``[seq_len, batch, in_proj_dim]`` projection output. Must be
+            on CUDA.
+        conv1d_weight: ``[conv_dim, 1, k_w]`` depthwise conv weight.
+        conv1d_bias: Must be ``None`` (conv bias is not supported).
+        A_log: ``[num_value_heads]`` raw decay parameter.
+        dt_bias: ``[num_value_heads]`` time-step bias.
+        num_key_heads / num_value_heads / key_head_dim / value_head_dim: GDN
+            architecture parameters. ``num_value_heads`` must be an integer
+            multiple of ``num_key_heads``.
+        use_qk_l2norm: Must be ``True``; the fused backward closes over the
+            l2norm path.
+        cu_seqlens: Optional packed THD cumulative sequence lengths. When set,
+            ``qkvzba`` must have ``batch == 1`` and ``cu_seqlens[-1] == seq_len``.
+        seq_idx: Optional precomputed token-to-sequence map with shape
+            ``[1, seq_len]``. Used by causal-conv backward in packed THD mode.
+        cp_group: Optional chunkwise-CP process group. When it has size > 1,
+            the fused path prepends a previous-rank conv boundary internally.
+        strict_runtime_validation: Whether to validate the public wrapper
+            contract before launching the fused path.
+
+    Returns:
+        ``(query, key, value, gate, beta, g)`` matching the unfused
+        :meth:`GatedDeltaNet.pre_gated_delta_rule` API.
+    """
+
+    cp_size = cp_group.size() if cp_group is not None else 1
+    if strict_runtime_validation:
+        _validate_fused_streamed_pre_gated_delta_rule_inputs(
+            qkvzba,
+            conv1d_weight,
+            conv1d_bias,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+            use_qk_l2norm=use_qk_l2norm,
+            cu_seqlens=cu_seqlens,
+            seq_idx=seq_idx,
+            cp_size=cp_size,
+        )
+
+    if cu_seqlens is not None:
         # Caller contract: packed boundaries start at zero, are monotonically
         # non-decreasing, and end at the local token count. Checking those
         # values here requires GPU reductions and D2H synchronizations, so the
         # fused hot path trusts the packed-sequence scheduler to provide valid
         # cu_seqlens.
         cu_seqlens = cu_seqlens.contiguous()
-        seq_idx = _resolve_packed_seq_idx(cu_seqlens, seq_idx, qkvzba.shape[0])
-    else:
-        assert seq_idx is None, "seq_idx requires cu_seqlens for packed THD mode."
+        if cp_size == 1:
+            seq_idx = _resolve_packed_seq_idx(cu_seqlens, seq_idx, qkvzba.shape[0])
 
     return FusedPreGatedDeltaRuleFunction.apply(
         qkvzba,
