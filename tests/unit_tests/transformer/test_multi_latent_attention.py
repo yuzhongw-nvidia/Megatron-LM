@@ -1,14 +1,17 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
+import warnings
 from inspect import signature
 from unittest import mock
 
 import pytest
 import torch
+import torch.distributed as dist
 
 import megatron.core.transformer.multi_latent_attention as mla_module
 from megatron.core import parallel_state
+from megatron.core.context_parallel_layout import prebuild_thd_cp_partition_routes
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.common.embeddings.rope_utils import (
@@ -788,6 +791,441 @@ class TestContextParallelMLAAttention:
             assert output.shape[1] == micro_batch_size
             assert output.shape[2] == config.hidden_size
             assert bias.shape[0] == config.hidden_size
+
+
+def _thd_cp_layout_token_indices(cu_seqlens_padded, cp_size, cp_rank, cp_partition_mode):
+    """Global packed-token indices held by one CP rank for a THD layout."""
+    total_tokens = cu_seqlens_padded[-1]
+    if cp_partition_mode == "contiguous":
+        part_len = total_tokens // cp_size
+        return torch.arange(cp_rank * part_len, (cp_rank + 1) * part_len, dtype=torch.long)
+    assert cp_partition_mode == "zigzag"
+    token_indices = []
+    for seq_start, seq_end in zip(cu_seqlens_padded[:-1], cu_seqlens_padded[1:]):
+        chunk_len = (seq_end - seq_start) // (2 * cp_size)
+        for chunk in (cp_rank, 2 * cp_size - cp_rank - 1):
+            chunk_start = seq_start + chunk * chunk_len
+            token_indices.extend(range(chunk_start, chunk_start + chunk_len))
+    return torch.tensor(token_indices, dtype=torch.long)
+
+
+def _thd_sp_shard_token_indices(
+    cu_seqlens_padded, cp_size, cp_rank, tp_size, tp_rank, cp_partition_mode
+):
+    """Global packed-token indices of one (cp_rank, tp_rank) sequence-parallel shard."""
+    cp_local = _thd_cp_layout_token_indices(cu_seqlens_padded, cp_size, cp_rank, cp_partition_mode)
+    assert cp_local.numel() % tp_size == 0
+    return cp_local.chunk(tp_size)[tp_rank].contiguous()
+
+
+def _gather_full_thd(local, token_indices, total_tokens, group):
+    """Reassemble the full packed sequence from equal-sized shards of a process group."""
+    local = local.detach().contiguous()
+    token_indices = token_indices.to(local.device)
+    gathered = [torch.empty_like(local) for _ in range(group.size())]
+    gathered_indices = [torch.empty_like(token_indices) for _ in range(group.size())]
+    dist.all_gather(gathered, local, group=group)
+    dist.all_gather(gathered_indices, token_indices, group=group)
+    full = torch.empty(
+        (total_tokens,) + tuple(local.shape[1:]), dtype=local.dtype, device=local.device
+    )
+    for shard, indices in zip(gathered, gathered_indices):
+        full[indices] = shard
+    return full
+
+
+def _assert_bitwise_equal(actual, expected, what):
+    """Assert bit-exact equality and describe the mismatch when it fails."""
+    if actual.shape != expected.shape or actual.dtype != expected.dtype:
+        raise AssertionError(
+            f"{what}: shape/dtype mismatch, got {tuple(actual.shape)} {actual.dtype}, "
+            f"expected {tuple(expected.shape)} {expected.dtype}"
+        )
+    if torch.equal(actual, expected):
+        return
+    mismatch = actual != expected
+    abs_diff = (actual.float() - expected.float()).abs()
+    raise AssertionError(
+        f"{what}: {int(mismatch.sum())} of {mismatch.numel()} elements differ, "
+        f"max abs diff = {abs_diff.max().item():.6g}"
+    )
+
+
+@pytest.mark.experimental
+@pytest.mark.skipif(
+    not is_te_min_version("2.5.0", check_equality=True),
+    reason="Requires TransformerEngine >= 2.5.0",
+)
+@pytest.mark.parametrize(
+    ("rope_type", "apply_rope_fusion"), (('rope', False), ('rope', True), ('yarn', True))
+)
+@pytest.mark.parametrize(("tp_size", "cp_size"), ((1, 2), (2, 2), (2, 4), (4, 2)))
+@pytest.mark.parametrize("padded", (False, True), ids=("packed", "padded"))
+class TestContextParallelMLAAttentionLayoutConversion:
+    """MLA accepts a contiguous THD CP layout by converting to zigzag internally.
+
+    A module fed contiguous shards (``config.cp_partition_mode="contiguous"``) must
+    produce the same outputs and gradients as an identical module fed zigzag shards,
+    both for pure CP and for TP x CP with sequence parallelism (fused TP x CP route).
+    """
+
+    hidden_size = 12
+    total_tokens = 128
+    cu_seqlens_padded = [0, 16, 48, 64, 128]
+
+    def _make_config(self, tp_size, cp_size, rope_type, apply_rope_fusion):
+        return MLATransformerConfig(
+            num_layers=2,
+            hidden_size=self.hidden_size,
+            num_attention_heads=4,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rotary_base=10000,
+            original_max_position_embeddings=64,
+            tensor_model_parallel_size=tp_size,
+            sequence_parallel=tp_size > 1,
+            context_parallel_size=cp_size,
+            bf16=True,
+            rope_type=rope_type,
+            apply_rope_fusion=apply_rope_fusion,
+            # The modules run in training mode; dropout would consume different RNG
+            # state in the reference and candidate forwards and break bit-exactness.
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+
+    def _build_attention(self, config):
+        model_parallel_cuda_manual_seed(123)
+        attention = MLASelfAttention(
+            config,
+            get_mla_self_attn_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        return attention.bfloat16().cuda()
+
+    def _make_packed_seq_params(self, padded, cp_partition_mode):
+        if padded:
+            packed_seq_params = make_test_packed_seq_params_with_padding(
+                cu_seqlens=[0, 12, 40, 60, 120], cu_seqlens_padded=self.cu_seqlens_padded
+            )
+        else:
+            packed_seq_params = make_test_packed_seq_params(cu_seqlens=self.cu_seqlens_padded)
+        packed_seq_params.cp_partition_mode = cp_partition_mode
+        return packed_seq_params
+
+    def test_contiguous_input_matches_zigzag_reference(
+        self, rope_type, apply_rope_fusion, tp_size, cp_size, padded
+    ):
+        required_world_size = tp_size * cp_size
+        if (
+            not torch.cuda.is_available()
+            or Utils.world_size < required_world_size
+            or Utils.world_size % required_world_size != 0
+        ):
+            pytest.skip(f"Needs a multiple of {required_world_size} CUDA ranks.")
+
+        Utils.initialize_model_parallel(tp_size, 1, context_parallel_size=cp_size)
+        try:
+            cp_group = parallel_state.get_context_parallel_group()
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            tp_cp_group = parallel_state.get_tensor_and_context_parallel_group()
+            cp_rank, tp_rank = cp_group.rank(), tp_group.rank()
+            device = torch.device("cuda", torch.cuda.current_device())
+
+            reference = self._build_attention(
+                self._make_config(tp_size, cp_size, rope_type, apply_rope_fusion)
+            )
+            candidate_config = self._make_config(tp_size, cp_size, rope_type, apply_rope_fusion)
+            # The module reads config.cp_partition_mode as the layout of its input. The
+            # config-level contiguous-CP checks describe complete model builds (packing
+            # scheduler, hybrid attention variants), so set the attribute directly here.
+            candidate_config.cp_partition_mode = "contiguous"
+            candidate = self._build_attention(candidate_config)
+            candidate.load_state_dict(reference.state_dict())
+
+            torch.manual_seed(7)
+            full_hidden = torch.randn(
+                self.total_tokens, 1, self.hidden_size, dtype=torch.bfloat16, device=device
+            )
+            full_grad = torch.randn_like(full_hidden)
+            zigzag_indices = _thd_sp_shard_token_indices(
+                self.cu_seqlens_padded, cp_size, cp_rank, tp_size, tp_rank, "zigzag"
+            ).to(device)
+            contiguous_indices = _thd_sp_shard_token_indices(
+                self.cu_seqlens_padded, cp_size, cp_rank, tp_size, tp_rank, "contiguous"
+            ).to(device)
+
+            reference_input = full_hidden.index_select(0, zigzag_indices).requires_grad_(True)
+            # Padded THD (padding between sequences) leaves TE with cuDNN fused attention
+            # only: FlashAttention 2/4 are excluded for THD with padding between sequences
+            # and the unfused backend for pad_between_seqs, and cuDNN rejects head_dim 192
+            # bf16 THD with padding on some TE/cuDNN builds. That is a capability limit of
+            # the reference configuration, independent of the layout conversion, so it is
+            # a skip rather than a failure; the candidate forward and all comparisons stay
+            # strict.
+            try:
+                reference_output, reference_bias = reference(
+                    reference_input,
+                    None,
+                    packed_seq_params=self._make_packed_seq_params(padded, "zigzag"),
+                )
+            except ValueError as error:
+                if "No dot product attention backend" not in str(error):
+                    raise
+                pytest.skip(
+                    "TransformerEngine has no attention backend for padded THD MLA attention "
+                    "(head_dim 192, bf16) on this TE/cuDNN build; "
+                    "TestParallelMLAAttention::test_gpu_forward_thd_padded fails the same way"
+                )
+            reference_output.mul(full_grad.index_select(0, zigzag_indices)).sum().backward()
+
+            candidate_packed_seq_params = self._make_packed_seq_params(padded, "contiguous")
+            prebuild_thd_cp_partition_routes(
+                candidate_packed_seq_params, cp_group, tp_group=tp_group, tp_cp_group=tp_cp_group
+            )
+            candidate_input = full_hidden.index_select(0, contiguous_indices).requires_grad_(True)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                candidate_output, candidate_bias = candidate(
+                    candidate_input, None, packed_seq_params=candidate_packed_seq_params
+                )
+            assert not [
+                w
+                for w in caught
+                if issubclass(w.category, (RuntimeWarning, FutureWarning))
+                and "layout" in str(w.message)
+            ], [str(w.message) for w in caught]
+            # The output is handed back in the caller's (contiguous) layout.
+            assert candidate_packed_seq_params.cp_partition_mode == "contiguous"
+            assert candidate_output.shape == candidate_input.shape
+            candidate_output.mul(full_grad.index_select(0, contiguous_indices)).sum().backward()
+
+            full_reference_output = _gather_full_thd(
+                reference_output, zigzag_indices, self.total_tokens, tp_cp_group
+            )
+            full_candidate_output = _gather_full_thd(
+                candidate_output, contiguous_indices, self.total_tokens, tp_cp_group
+            )
+            # The conversion is a pure permutation, so the forward must be bit-exact.
+            _assert_bitwise_equal(full_candidate_output, full_reference_output, "output")
+            if reference_bias is not None:
+                _assert_bitwise_equal(candidate_bias, reference_bias, "output bias")
+
+            # Backward: the input gradient comes back in the contiguous layout, and every
+            # rank accumulates parameter gradients from the same zigzag tokens. Both runs
+            # see identical tensors, but attention backward kernels are not guaranteed to
+            # be run-to-run deterministic (atomic accumulation), so gradients are compared
+            # with a tolerance instead of bit for bit.
+            full_reference_grad = _gather_full_thd(
+                reference_input.grad, zigzag_indices, self.total_tokens, tp_cp_group
+            )
+            full_candidate_grad = _gather_full_thd(
+                candidate_input.grad, contiguous_indices, self.total_tokens, tp_cp_group
+            )
+            torch.testing.assert_close(
+                full_candidate_grad.float(), full_reference_grad.float(), rtol=2e-2, atol=2e-2
+            )
+            reference_grads = dict(reference.named_parameters())
+            for name, param in candidate.named_parameters():
+                if param.grad is None:
+                    assert reference_grads[name].grad is None, name
+                    continue
+                torch.testing.assert_close(
+                    param.grad.float(),
+                    reference_grads[name].grad.float(),
+                    rtol=2e-2,
+                    atol=2e-2,
+                    msg=lambda message, name=name: f"{name}: {message}",
+                )
+        finally:
+            Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("gate_granularity", ("elementwise", "headwise"))
+class TestMLAOutputGate:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self, gate_granularity):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.transformer_config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+            rope_type="yarn",
+            rotary_base=10000,
+            original_max_position_embeddings=32,
+            attention_output_gate=True,
+            gated_attention_proj_granularity=gate_granularity,
+        )
+        self.parallel_attention = MLASelfAttention(
+            self.transformer_config,
+            get_mla_self_attn_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_constructor_builds_configured_gate_projection(self, gate_granularity):
+        gate = self.parallel_attention.linear_gate
+        assert gate is not None
+        expected_projection_size = (
+            self.parallel_attention.query_projection_size
+            if gate_granularity == "elementwise"
+            else self.transformer_config.num_attention_heads
+        )
+        assert gate.weight.shape == (expected_projection_size, self.transformer_config.hidden_size)
+        assert gate.bias is None or gate.bias.numel() == 0
+
+    def test_gate_matches_independent_fp32_sigmoid_reference(self, gate_granularity):
+        output_size = self.parallel_attention.query_projection_size
+        core_attn_out = torch.linspace(-2.0, 2.0, 2 * output_size, dtype=torch.bfloat16).view(
+            2, 1, output_size
+        )
+        gate_size = (
+            output_size
+            if gate_granularity == "elementwise"
+            else self.transformer_config.num_attention_heads
+        )
+        gate = torch.linspace(-4.0, 4.0, 2 * gate_size, dtype=torch.bfloat16).view(2, 1, gate_size)
+
+        output = self.parallel_attention._apply_mla_output_gate(core_attn_out, gate)
+        reference_scale = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
+        if gate_granularity == "headwise":
+            reference_scale = torch.repeat_interleave(
+                reference_scale, self.transformer_config.v_head_dim, dim=-1
+            )
+        expected = core_attn_out * reference_scale
+
+        assert output.dtype == core_attn_out.dtype
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+    def test_gate_matches_fp32_sigmoid_reference_vjp(self, gate_granularity):
+        generator = torch.Generator().manual_seed(20260814)
+        output_size = self.parallel_attention.query_projection_size
+        gate_size = (
+            output_size
+            if gate_granularity == "elementwise"
+            else self.transformer_config.num_attention_heads
+        )
+        gate_input = torch.randn((8, 1, gate_size), generator=generator, dtype=torch.bfloat16)
+        core_output = torch.randn((8, 1, output_size), generator=generator, dtype=torch.bfloat16)
+        output_gradient = torch.randn(core_output.shape, generator=generator, dtype=torch.bfloat16)
+
+        actual_gate = gate_input.detach().clone().requires_grad_(True)
+        actual_core = core_output.detach().clone().requires_grad_(True)
+        actual_output = self.parallel_attention._apply_mla_output_gate(actual_core, actual_gate)
+        actual_gradients = torch.autograd.grad(
+            actual_output, (actual_gate, actual_core), output_gradient
+        )
+
+        sigmoid_fp32 = torch.sigmoid(gate_input.float())
+        native_scale = sigmoid_fp32.to(core_output.dtype)
+        if gate_granularity == "headwise":
+            native_scale = torch.repeat_interleave(
+                native_scale, self.transformer_config.v_head_dim, dim=-1
+            )
+            expected_core_gradient = output_gradient * native_scale
+            head_shape = (*core_output.shape[:-1], gate_size, self.transformer_config.v_head_dim)
+            scale_gradient = (
+                output_gradient.float().view(head_shape) * core_output.float().view(head_shape)
+            ).sum(dim=-1)
+            # The fused broadcast reduction returns a native-dtype gradient to the
+            # FP32-sigmoid cast before applying the sigmoid derivative.
+            scale_gradient = scale_gradient.to(gate_input.dtype).float()
+        else:
+            expected_core_gradient = output_gradient * native_scale
+            scale_gradient = (output_gradient * core_output).float()
+
+        expected_output = core_output * native_scale
+        expected_gate_gradient = (scale_gradient * sigmoid_fp32 * (1.0 - sigmoid_fp32)).to(
+            gate_input.dtype
+        )
+
+        torch.testing.assert_close(actual_output, expected_output, atol=0, rtol=0)
+        torch.testing.assert_close(actual_gradients[0], expected_gate_gradient)
+        torch.testing.assert_close(actual_gradients[1], expected_core_gradient)
+
+    def test_missing_gate_spec_raises(self):
+        submodules = get_mla_self_attn_submodules()
+        submodules.linear_gate = None
+        with pytest.raises(ValueError, match="linear_gate module spec"):
+            MLASelfAttention(
+                self.transformer_config,
+                submodules,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+
+    def test_fused_down_projection_is_rejected(self, gate_granularity):
+        with pytest.raises(ValueError, match="does not support fused down projections"):
+            MLATransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                q_lora_rank=32,
+                kv_lora_rank=32,
+                qk_head_dim=128,
+                v_head_dim=128,
+                qk_pos_emb_head_dim=64,
+                rope_type=self.transformer_config.rope_type,
+                rotary_base=10000,
+                original_max_position_embeddings=32,
+                attention_output_gate=True,
+                gated_attention_proj_granularity=gate_granularity,
+                mla_down_proj_fusion=True,
+            )
+
+    def test_gpu_forward_thd(self):
+        if not is_te_min_version("1.10.0"):
+            pytest.skip("MLA requires TransformerEngine >= 1.10.0")
+
+        attention = self.parallel_attention.cuda().bfloat16()
+        call_order = []
+        core_attention_hook = attention.core_attention.register_forward_pre_hook(
+            lambda *_: call_order.append("core_attention")
+        )
+        gate_projection_hook = attention.linear_gate.register_forward_pre_hook(
+            lambda *_: call_order.append("linear_gate")
+        )
+        sequence_length = 32
+        hidden_states = torch.ones(
+            (sequence_length, 1, self.transformer_config.hidden_size),
+            device='cuda',
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        packed_seq_params = make_test_packed_seq_params(sequence_length=sequence_length)
+
+        try:
+            with mock.patch.dict(
+                os.environ, {"NVTE_FUSED_ATTN": "1", "NVTE_FLASH_ATTN": "0"}, clear=False
+            ):
+                output, bias = attention(
+                    hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+                )
+                output.sum().backward()
+        finally:
+            core_attention_hook.remove()
+            gate_projection_hook.remove()
+
+        assert call_order == ["core_attention", "linear_gate"]
+        assert output.shape == hidden_states.shape
+        assert bias.shape == (self.transformer_config.hidden_size,)
+        assert hidden_states.grad is not None
+        assert attention.linear_gate.weight.grad is not None
 
 
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))

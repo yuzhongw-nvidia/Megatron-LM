@@ -378,6 +378,12 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
 
+    apply_dsa_kernel_fusion: Optional[bool] = None
+    """Opt in to the fused DSA indexer kernels when available; None auto-selects."""
+
+    dsa_cp_balance_indexer: bool = False
+    """Balance the DSA indexer workload across context-parallel ranks."""
+
     dsa_kernel_backend: (
         Literal["none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"]
         | None
@@ -1885,6 +1891,125 @@ class TransformerConfig(ModelParallelConfig):
                 "gdn_kernel_backend must be one of {'transformer_engine', 'fla', 'torch'}, "
                 f"got {self.gdn_kernel_backend!r}."
             )
+
+        if is_gated_delta_net_variant(self.experimental_attention_variant):
+            if (
+                self.experimental_attention_variant != "kda"
+                and self.deterministic_mode
+                and self.gdn_kernel_backend != "torch"
+            ):
+                raise ValueError(
+                    "deterministic_mode=True requires gdn_kernel_backend='torch' for "
+                    "Gated DeltaNet."
+                )
+
+            # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern
+            # symbol 'G', where linear_attention_freq is unused; the GPT experimental
+            # attention route raises a clear error downstream if it is missing.
+            if self.experimental_attention_variant == "gdn" and not self.is_hybrid_model:
+                assert (
+                    self.linear_attention_freq is not None
+                ), "linear_attention_freq must be set for linear gdn."
+
+        if self.experimental_attention_variant is not None:
+            self.experimental_attention_variant = normalize_experimental_attention_variant(
+                self.experimental_attention_variant
+            )
+
+        if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
+            self.moe_use_grouped_tensor = True
+
+        if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
+            raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
+
+        if self.cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+
+        if self.cp_partition_mode == "contiguous" and (
+            self.context_parallel_size > 1 or self.dynamic_context_parallel
+        ):
+            if self.sequence_packing_scheduler is None and not (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and not self.dynamic_context_parallel
+            ):
+                raise ValueError(
+                    "cp_partition_mode='contiguous' with context parallelism requires THD "
+                    "inputs from a sequence_packing_scheduler; BSHD inputs are not supported. "
+                    "The legacy non-scheduler CP batch slicing path only supports zigzag layout."
+                )
+            # Static DSv4 callers may supply THD metadata directly (main #7469).
+            # CSA validates the actual input format at runtime and still rejects SBHD CP.
+
+        has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
+        if has_context_parallelism:
+            if self.cp_partition_mode == "contiguous":
+                # MultiLatentAttention converts its input to the zigzag layout internally,
+                # like Attention, so it no longer restricts cp_partition_mode.
+                if self.experimental_attention_variant != "dsv4_hybrid" and not (
+                    is_gated_delta_net_variant(self.experimental_attention_variant)
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' with context parallelism currently "
+                        "requires experimental_attention_variant to be 'dsv4_hybrid', 'gdn', "
+                        "or 'kda'."
+                    )
+                if (
+                    is_gated_delta_net_variant(self.experimental_attention_variant)
+                    and self.linear_cp_mode == "headwise"
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is incompatible with "
+                        "GDN-family linear_cp_mode='headwise'."
+                    )
+                if self.experimental_attention_variant == "gdn2":
+                    # GDN2 always runs headwise CP; see linear_cp_mode.
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is incompatible with "
+                        "experimental_attention_variant='gdn2', which supports only headwise CP."
+                    )
+            elif self.cp_partition_mode == "zigzag":
+                if self.experimental_attention_variant == "dsv4_hybrid":
+                    raise ValueError(
+                        "DSv4 Hybrid with context parallelism requires "
+                        "cp_partition_mode='contiguous'."
+                    )
+
+        if self.dsa_cp_balance_indexer and self.experimental_attention_variant != "dsv4_hybrid":
+            # The flag is consumed only by the CSA indexer; on any other model the
+            # data-step prebuild would burn per-microbatch host syncs for nothing.
+            raise ValueError(
+                "dsa_cp_balance_indexer requires " "experimental_attention_variant='dsv4_hybrid'."
+            )
+
+        # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
+        # selectors have been folded into experimental_attention_variant, and immediately
+        # before the centralized attention-variant validation consumes dsa_kernel_backend.
+        if self.apply_dsa_kernel_fusion is not None:
+            if self.experimental_attention_variant != "dsv4_hybrid":
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "apply_dsa_kernel_fusion is deprecated and ignored outside "
+                    "experimental_attention_variant='dsv4_hybrid'; use dsa_kernel_backend "
+                    "instead.",
+                )
+            else:
+                legacy_backend = "cudnn" if self.apply_dsa_kernel_fusion else "none"
+                if self.dsa_kernel_backend not in ("none", legacy_backend):
+                    raise ValueError(
+                        "Conflicting DSA kernel controls: "
+                        f"apply_dsa_kernel_fusion={self.apply_dsa_kernel_fusion} maps to "
+                        f"dsa_kernel_backend={legacy_backend!r}, but "
+                        f"dsa_kernel_backend={self.dsa_kernel_backend!r} was also selected. "
+                        "Remove apply_dsa_kernel_fusion and use dsa_kernel_backend only."
+                    )
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "apply_dsa_kernel_fusion is deprecated and will be removed in a future "
+                    f"release; use dsa_kernel_backend={legacy_backend!r} instead.",
+                )
+                self.dsa_kernel_backend = legacy_backend
 
         if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):
             raise ValueError(

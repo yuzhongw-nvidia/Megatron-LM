@@ -19,7 +19,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -1434,6 +1434,21 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             packed_sequence_cp_metadata is None
         ), "Attention does not support packed-sequence chunkwise CP metadata."
         runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            key_value_states=key_value_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=runtime_cp_group,
+            tp_group=self.pg_collection.tp,
+            tp_cp_group=resolve_tp_cp_group(
+                getattr(self.pg_collection, "tp_cp", None), packed_seq_params
+            ),
+            target_partition_mode="zigzag",
+            sequence_parallel=self.config.sequence_parallel,
+            config=self.config,
+            attention_mask=attention_mask,
+            attention_bias=attention_bias,
+        )
 
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
