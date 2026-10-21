@@ -1696,6 +1696,210 @@ def test_muon_optimizer_qkv_split():
     ), "Weights should be different between split_qkv=True and split_qkv=False"
 
 
+def test_muon_optimizer_qkv_split_per_head_is_opt_in():
+    """Per-head splitting is guarded and differs from projection splitting."""
+    grad = torch.arange(48, dtype=torch.float32, device='cuda').view(16, 3)
+    projection_param = torch.nn.Parameter(torch.zeros_like(grad))
+    projection_param.is_qkv = True
+    projection_param.qkv_split_shapes = [4, 2, 2]
+    head_param = torch.nn.Parameter(torch.zeros_like(grad))
+    head_param.is_qkv = True
+    head_param.qkv_split_shapes = [2] * 8
+    orthogonalize_call_shapes = []
+
+    def center_rows(x, tp_group=None, partition_dim=None, tp_mode_this_group=None):
+        del tp_group, partition_dim, tp_mode_this_group
+        orthogonalize_call_shapes.append(tuple(x.shape))
+        return x - x.mean(dim=-2, keepdim=True)
+
+    projection_optimizer = TensorParallelMuon(
+        params=[projection_param],
+        split_qkv=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=[4, 2, 2],
+        pg_collection=None,
+    )
+    projection_optimizer.scaled_orthogonalize_fn = center_rows
+    projection_out = projection_optimizer.orthogonalize(projection_param, grad)
+    orthogonalize_call_shapes.clear()
+
+    head_optimizer = TensorParallelMuon(
+        params=[head_param],
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=[2] * 8,
+        pg_collection=None,
+    )
+    head_optimizer.scaled_orthogonalize_fn = center_rows
+    head_out = head_optimizer.orthogonalize(head_param, grad)
+    assert orthogonalize_call_shapes == [(8, 2, 3)]
+
+    expected_head_out = torch.cat(
+        [center_rows(head) for head in torch.split(grad, [2] * 8, dim=0)], dim=0
+    )
+    torch.testing.assert_close(head_out, expected_head_out)
+    assert not torch.equal(projection_out, head_out)
+
+
+def test_muon_optimizer_qkv_split_per_head_requires_split_qkv():
+    """The per-head switch cannot enable QKV splitting by itself."""
+    param = torch.nn.Parameter(torch.zeros(4, 4, dtype=torch.float32, device='cuda'))
+    with pytest.raises(ValueError, match="split_qkv_per_head requires split_qkv=True"):
+        TensorParallelMuon(
+            params=[param], split_qkv=False, split_qkv_per_head=True, pg_collection=None
+        )
+
+
+def test_muon_optimizer_uniform_per_head_splits_use_batched_ns():
+    """Uniform per-head splits use Emerging-Optimizers' batched Newton-Schulz path."""
+    grad = torch.arange(16, dtype=torch.float32, device='cuda').view(4, 4)
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.is_qkv = True
+    param.qkv_split_shapes = [2, 2]
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=[2, 2],
+        pg_collection=None,
+    )
+    call_shapes = []
+
+    def center_rows(x, tp_group=None, partition_dim=None, tp_mode_this_group=None):
+        del tp_group, partition_dim, tp_mode_this_group
+        call_shapes.append(tuple(x.shape))
+        return x - x.mean(dim=-2, keepdim=True)
+
+    optimizer.scaled_orthogonalize_fn = center_rows
+    actual = optimizer.orthogonalize(param, grad)
+    assert call_shapes == [(2, 2, 4)]
+    expected = torch.cat(
+        [head - head.mean(dim=-2, keepdim=True) for head in torch.split(grad, [2, 2])]
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.skipif(
+    not _batched_newton_schulz_supported(),
+    reason="installed emerging-optimizers lacks batched Newton-Schulz",
+)
+def test_muon_optimizer_batched_per_head_ns_matches_individual_heads():
+    """The pinned Emerging-Optimizers 3D Newton-Schulz path matches 2D head calls."""
+    from emerging_optimizers import utils as eopt_utils
+
+    torch.manual_seed(42)
+    grad = torch.randn(8, 16, dtype=torch.float32, device='cuda')
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.is_qkv = True
+    param.qkv_split_shapes = [2] * 4
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=[2] * 4,
+        fp32_matmul_prec="highest",
+        num_ns_steps=2,
+        pg_collection=None,
+    )
+
+    # OrthogonalizedOptimizer.step() applies this context around orthogonalize().
+    with eopt_utils.fp32_matmul_precision(optimizer.fp32_matmul_prec):
+        actual = optimizer.orthogonalize(param, grad)
+        expected = torch.cat(
+            [
+                optimizer.scaled_orthogonalize_fn(head, tp_group=None, partition_dim=None)
+                for head in torch.split(grad, [2] * 4)
+            ]
+        )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_muon_optimizer_nonuniform_per_head_splits_use_unbatched_ns():
+    """Nonuniform per-head splits keep using individual Newton-Schulz calls."""
+    grad = torch.arange(12, dtype=torch.float32, device='cuda').view(3, 4)
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.is_qkv = True
+    param.qkv_split_shapes = [2, 1]
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=True,
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=[2, 1],
+        pg_collection=None,
+    )
+    call_shapes = []
+
+    def center_rows(x, tp_group=None, partition_dim=None, tp_mode_this_group=None):
+        del tp_group, partition_dim, tp_mode_this_group
+        call_shapes.append(tuple(x.shape))
+        return x - x.mean(dim=-2, keepdim=True)
+
+    optimizer.scaled_orthogonalize_fn = center_rows
+    actual = optimizer.orthogonalize(param, grad)
+    assert call_shapes == [(2, 4), (1, 4)]
+    expected = torch.cat([center_rows(head) for head in torch.split(grad, [2, 1])])
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("layout", "expects_fallback"),
+    (("local_projection", False), ("per_head", True), ("fragmented", True)),
+)
+def test_muon_qkv_distributed_mode_routing_warns_once(monkeypatch, layout, expects_fallback):
+    """Only complete local projection splits retain distributed NS."""
+    grad = torch.arange(16, dtype=torch.float32, device='cuda').view(4, 4)
+    param = torch.nn.Parameter(torch.zeros_like(grad))
+    param.partition_dim = 0
+    param.is_qkv = True
+    param.qkv_split_shapes = [2, 1, 1]
+    param.qkv_split_shapes_global = [2, 1, 1]
+    param.qkv_split_groups_are_complete = layout != "fragmented"
+    param.qkv_split_heads_are_complete = True
+
+    optimizer = TensorParallelMuon(
+        params=[param],
+        split_qkv=True,
+        split_qkv_per_head=layout == "per_head",
+        is_qkv_fn=lambda p: getattr(p, 'is_qkv', False),
+        qkv_split_shapes=[2, 1, 1],
+        pg_collection=None,
+        tp_mode="distributed",
+    )
+
+    warning_messages = []
+
+    def capture_log(logger, level, message, *args, **kwargs):
+        del logger, args, kwargs
+        if level == logging.WARNING:
+            warning_messages.append(message)
+
+    monkeypatch.setattr("megatron.core.optimizer.emerging_optimizers.log_single_rank", capture_log)
+    orthogonalize_args = []
+
+    def capture_orthogonalize(x, tp_group=None, partition_dim=None, tp_mode_this_group=None):
+        orthogonalize_args.append((tp_group, partition_dim))
+        return x
+
+    optimizer.scaled_orthogonalize_fn = capture_orthogonalize
+    optimizer.orthogonalize(param, grad)
+    optimizer.orthogonalize(param, grad)
+
+    if expects_fallback:
+        assert len(warning_messages) == 1
+        assert "falling back to non-TP Newton-Schulz" in warning_messages[0]
+        assert all(
+            tp_group is None and partition_dim is None
+            for tp_group, partition_dim in orthogonalize_args
+        )
+    else:
+        assert warning_messages == []
+        assert all(partition_dim == 0 for _, partition_dim in orthogonalize_args)
+
+
 def test_muon_optimizer_extra_scale_factor():
     """Test TensorParallelMuon optimizer with different extra_scale_factor values."""
     model = torch.nn.Linear(80, 40, bias=False, dtype=torch.float32, device='cuda')
