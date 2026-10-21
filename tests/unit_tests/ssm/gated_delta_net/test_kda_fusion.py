@@ -202,13 +202,17 @@ class TestFusedPreKDA:
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
 @pytest.mark.skipif(not HAVE_FUSED_PRE_KDA, reason="causal-conv1d backward is not installed.")
 @pytest.mark.parametrize("linear_cp_mode", ["headwise", "chunkwise"])
-def test_fused_low_rank_kda_parallel_correctness(tmp_path_dist_ckpt, linear_cp_mode):
+def test_fused_low_rank_kda_parallel_correctness(tmp_path_dist_ckpt, linear_cp_mode, run_config):
     """Cover independent low-rank tensors across both KDA CP communication modes."""
 
+    # dev's chunkwise linear CP now requires a contiguous layout (GDP CP support, #6815); the
+    # default (zigzag) is rejected. headwise is unconstrained, so only override it for chunkwise.
+    layout_override = {"linear_cp_layout": "contiguous"} if linear_cp_mode == "chunkwise" else {}
     config = replace(
         _make_config(linear_cp_mode=linear_cp_mode, f_lora_rank=8, gate_lora_rank=12),
         deterministic_mode=False,
         gdn_pre_gated_delta_rule_fusion=True,
+        **layout_override,
     )
     _test_parallel_attention_correctness(
         transformer_config=config,
