@@ -682,6 +682,22 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 **(extra_block_kwargs or {}),
             )
 
+        # When mHC + MTP, the decoder returns (contracted, multi-stream); when
+        # AttnRes + MTP, it returns (aggregated, depth-source tuple). MTP needs
+        # the extra stream; lm_head needs the first element. mHC and AttnRes are
+        # mutually exclusive, so the config disambiguates the second slot.
+        mhc_multistream = None
+        attn_res_sources = None
+        if isinstance(decoder_output, tuple):
+            if self.config.enable_attention_residuals:
+                hidden_states, attn_res_sources = decoder_output
+            else:
+                # With mHC + MTP, preserve the pre-contraction streams for MTP on
+                # the final decoder stage, including pipeline-parallel models.
+                hidden_states, mhc_multistream = decoder_output
+        else:
+            hidden_states = decoder_output
+
         return self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
@@ -702,6 +718,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
+            mhc_multistream=mhc_multistream,
+            attn_res_sources=attn_res_sources,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
         )
@@ -727,6 +745,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         runtime_gather_output=None,
         extra_block_kwargs=None,
         inference_context=None,
+        mhc_multistream=None,
+        attn_res_sources=None,
         output_processor=None,
         output_processor_context=None,
     ):
@@ -758,6 +778,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
+                mhc_multistream=mhc_multistream,
+                attn_res_sources=attn_res_sources,
                 attention_mask=attention_mask,
                 inference_params=None,  # MTP layers don't use KV cache
                 rotary_pos_emb=rotary_pos_emb,
