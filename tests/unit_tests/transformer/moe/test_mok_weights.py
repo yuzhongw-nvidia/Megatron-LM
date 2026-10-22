@@ -6,7 +6,6 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.core.activations import situlu
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.megakernel import (
     megakernel_fuses_shared_expert,
@@ -61,7 +60,11 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
     "overrides",
     [
         {},
-        {"moe_shared_expert_gate": True, "activation_func": situlu},
+        {
+            "moe_shared_expert_gate": True,
+            "activation_func_tanh_clamp_scale": 4.0,
+            "activation_func_tanh_clamp_scale_linear": 25.0,
+        },
         {"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": True, "moe_shared_expert_gate": True},
         {
             "fp8": "hybrid",
@@ -78,8 +81,13 @@ def test_mok_accepts_key_supported_configurations(overrides):
 
 
 def test_shared_execution_is_independent_of_activation_and_preserves_native_precision():
-    for activation in (F.silu, situlu):
-        assert megakernel_fuses_shared_expert(_mok_transformer_config(activation_func=activation))
+    # main expresses Kimi-K3 SiTU-GLU as silu + activation_func_tanh_clamp_scale rather than
+    # a distinct situlu activation; iterate over the plain-silu and the SiTU-GLU clamp configs.
+    for act_overrides in (
+        {},
+        {"activation_func_tanh_clamp_scale": 4.0, "activation_func_tanh_clamp_scale_linear": 25.0},
+    ):
+        assert megakernel_fuses_shared_expert(_mok_transformer_config(**act_overrides))
         for overrides in (
             {"moe_megakernel_shared_expert_mode": "native"},
             {"moe_latent_size": 64},
@@ -88,10 +96,10 @@ def test_shared_execution_is_independent_of_activation_and_preserves_native_prec
             {"tensor_model_parallel_size": 4, "sequence_parallel": True},
         ):
             config = _mok_transformer_config(
-                activation_func=activation,
                 fp8="hybrid",
                 fp8_recipe="mxfp8",
                 fp8_param=True,
+                **act_overrides,
                 **overrides,
             )
             assert not megakernel_fuses_shared_expert(config)

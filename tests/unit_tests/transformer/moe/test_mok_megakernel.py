@@ -6,7 +6,6 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.activations import situlu
 from megatron.core.transformer.moe.megakernel import parameter_bridge
 from megatron.core.transformer.moe.megakernel.mok import backend as mok_backend
 from megatron.core.transformer.moe.megakernel.mok import runtime as mok_runtime
@@ -449,9 +448,9 @@ def _mock_backend(
         moe_shared_expert_intermediate_size=12 if routed_only else 4,
         moe_router_topk=2,
         activation_func_clamp_value=None,
-        activation_func=situlu if situ else torch.nn.functional.silu,
-        situ_glu_beta1=2.0,
-        situ_glu_beta2=8.0,
+        activation_func=torch.nn.functional.silu,
+        activation_func_tanh_clamp_scale=2.0 if situ else None,
+        activation_func_tanh_clamp_scale_linear=8.0 if situ else None,
         fp8="hybrid" if mxfp8 else None,
         fp8_recipe="mxfp8",
         fp8_param=mxfp8,
