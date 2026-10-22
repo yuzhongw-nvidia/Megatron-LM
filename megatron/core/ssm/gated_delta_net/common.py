@@ -287,9 +287,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
             setattr(self.conv1d.bias, "partition_dim", 0)
 
+        gate_params_dtype = getattr(self, "gate_params_dtype", self.config.params_dtype)
         self.dt_bias = nn.Parameter(
             torch.empty(
-                self.dt_bias_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.dt_bias_dim, dtype=gate_params_dtype, device=torch.cuda.current_device()
             )
         )
         setattr(self.dt_bias, "tensor_model_parallel", True)
@@ -297,7 +298,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         self.A_log = nn.Parameter(
             torch.empty(
-                self.a_log_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.a_log_dim, dtype=gate_params_dtype, device=torch.cuda.current_device()
             )
         )
         setattr(self.A_log, "tensor_model_parallel", True)
