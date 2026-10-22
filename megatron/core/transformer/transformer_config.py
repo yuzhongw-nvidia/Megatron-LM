@@ -308,6 +308,10 @@ class TransformerConfig(ModelParallelConfig):
     attention_output_gate: bool = False
     """Whether to apply output gate to the attention layers."""
 
+    gated_attention_proj_granularity: Literal['elementwise', 'headwise'] = "elementwise"
+    """Projection granularity for ``attention_output_gate`` (MLA output gating): one gate per
+    output element (``elementwise``) or one gate per attention head (``headwise``)."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
