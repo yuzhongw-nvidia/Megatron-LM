@@ -668,7 +668,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             else nullcontext()
         )
         with backbone_context:
-            hidden_states = self.decoder(
+            decoder_output = self.decoder(
                 hidden_states=decoder_input,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
