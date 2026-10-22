@@ -232,7 +232,6 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             "in_proj_extra_dim",
             "in_proj_split_names",
             "in_proj_split_sections",
-            "feat_dim_split",
             "gated_delta_rule",
         )
         self._setup_variant_attrs()
