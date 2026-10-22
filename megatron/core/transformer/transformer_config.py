@@ -5213,8 +5213,8 @@ class MLATransformerConfig(TransformerConfig):
                 "dropout."
             )
 
-        if self.attention_output_gate:
-            raise NotImplementedError("Output gate is not supported for MLA yet.")
+        # MLA output gating is implemented (dev #8006, carried into MultiLatentAttention):
+        # gated_attention_proj_granularity selects elementwise/headwise; no blanket guard here.
 
         # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim.
         if self.experimental_attention_variant == "dsv4_hybrid":
