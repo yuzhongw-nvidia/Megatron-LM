@@ -471,6 +471,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         batch: int,
         seq_len: int,
         *gate_feats: tuple[torch.Tensor],
+        cp_size_headwise: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Prepare all gated delta rule kernel inputs.
@@ -484,10 +485,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
+        cp_size = self.cp_size if cp_size_headwise is None else cp_size_headwise
+
         # Split qkv into query_key and value
         query_key, value = torch.split(
             qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
+            [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size],
             dim=-1,
         )
 
@@ -501,7 +504,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             query_key = normalize(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
