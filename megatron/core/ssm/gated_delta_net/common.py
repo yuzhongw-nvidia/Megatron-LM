@@ -347,6 +347,17 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         return out, out_bias
 
+    def _get_in_proj_dim(self) -> int:
+        """Return the fused input-projection width for this GDN-family variant.
+
+        The shared GDN layout contains Q, K, V, the output gate, and any
+        variant-specific gate features. Variants with separately parameterized
+        projections can override this hook without encoding a negative
+        ``in_proj_extra_dim``.
+        """
+
+        return self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
+
     def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.
 
