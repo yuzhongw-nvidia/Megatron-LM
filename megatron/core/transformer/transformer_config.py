@@ -328,7 +328,7 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
+        Literal['gdn', 'gdn2', 'kda', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
     ] = None
     """Type of attention variant to use. Supports gdn, gdn2, dsa, and dsv4_hybrid.
     gdn2 selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
@@ -507,6 +507,20 @@ class TransformerConfig(ModelParallelConfig):
     gdn_gated_output_norm_fusion: bool = False
     """Fuse GatedDeltaNet output RMSNorm and SiLU gating. Unsupported configurations and
     layouts raise on every forward; see docs/developer/gdn_ew_fusion.md for requirements."""
+
+    gdn_conv_pad_alignment: Optional[int] = None
+    """Pad the GDN/KDA short causal-convolution input length up to this alignment (THD only)."""
+
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    """Context-parallel sequence partition mode for GDN-family and MLA layers: 'zigzag' (the
+    load-balanced interleaving) or 'contiguous' (chunk-per-rank). KDA chunkwise linear CP
+    requires 'contiguous'."""
+
+    kda_safe_gate: bool = False
+    """KDA (Kimi Delta Attention) safe-gate mode: clamp the gate lower bound to kda_lower_bound."""
+
+    kda_lower_bound: Optional[float] = None
+    """Lower bound for the KDA gate when kda_safe_gate=True; must be in [-5, 0)."""
 
     ####################
     # initialization

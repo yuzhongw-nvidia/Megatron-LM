@@ -43,6 +43,7 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
+    from fla.ops.cp import build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
@@ -50,6 +51,7 @@ except ImportError:
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
+    build_cp_context = None
 
     HAVE_FLA = False
 
