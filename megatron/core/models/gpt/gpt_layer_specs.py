@@ -334,7 +334,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
 @copy_signature(get_gpt_layer_with_transformer_engine_submodules)
 def get_gpt_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training)."""
-    enable_hc = kwargs.get('enable_hyper_connection', False)
+    enable_hc = kwargs.pop('enable_hyper_connection', False)
     enable_attn_res = kwargs.pop('enable_attention_residual', False)
     if enable_attn_res:
         assert not enable_hc, "attention residuals and hyper connections are mutually exclusive"
@@ -454,7 +454,7 @@ def get_gpt_layer_local_submodules(
 @copy_signature(get_gpt_layer_local_submodules)
 def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core."""
-    enable_hc = kwargs.get('enable_hyper_connection', False)
+    enable_hc = kwargs.pop('enable_hyper_connection', False)
     enable_attn_res = kwargs.pop('enable_attention_residual', False)
     if enable_attn_res:
         assert not enable_hc, "attention residuals and hyper connections are mutually exclusive"
