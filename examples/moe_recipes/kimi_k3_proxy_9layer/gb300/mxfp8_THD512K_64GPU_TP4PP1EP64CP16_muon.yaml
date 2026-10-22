@@ -91,7 +91,6 @@ ARGS:
   num_experts: 896
   moe_ffn_hidden_size: 3072
   moe_latent_size: 3584
-  moe_latent_output_norm: false
   moe_latent_up_projection_rmsnorm: true
   moe_shared_expert_intermediate_size: 6144
   moe_router_topk: 16
