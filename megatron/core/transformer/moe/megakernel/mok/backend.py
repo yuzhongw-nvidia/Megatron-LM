@@ -15,7 +15,6 @@ import torch
 from torch import nn
 from torch.distributed import ProcessGroup
 
-from megatron.core.activations import situlu
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
@@ -82,9 +81,12 @@ class MoKMegakernel(MegakernelBackend):
             )
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
+        # main represents Kimi-K3 SiTU-GLU as silu + activation_func_tanh_clamp_scale
+        # (gate scale, == dev situ_glu_beta1) and activation_func_tanh_clamp_scale_linear
+        # (linear scale, == dev situ_glu_beta2); the betas feed the megakernel's fused SiTU-GLU.
         self.situ_beta = (
-            (config.situ_glu_beta1, config.situ_glu_beta2)
-            if config.activation_func == situlu
+            (config.activation_func_tanh_clamp_scale, config.activation_func_tanh_clamp_scale_linear)
+            if config.activation_func_tanh_clamp_scale is not None
             else None
         )
         self.use_mxfp8_weights = bool(
