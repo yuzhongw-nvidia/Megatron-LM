@@ -45,6 +45,7 @@ class PackedSeqParams:
     total_tokens: int = None
     seq_idx: Tensor = None
     tokens_per_sample: int = None
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     cp_partition_route: Optional["ThdCpRoute"] = None
     tp_cp_partition_route: Optional["ThdCpRoute"] = None
     cp_scatter_cache: object = None
