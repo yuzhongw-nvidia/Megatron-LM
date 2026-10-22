@@ -357,10 +357,12 @@ class MoELayer(BaseMoELayer):
                 if self.config.moe_latent_up_projection_rmsnorm
                 else linear_cls
             )
+            # The TE GTP-remat kwargs only apply to the plain linear path; the duplicated
+            # RMSNorm wrapper takes its TP group instead and rejects gtp_remat_group.
             fc2_extra_kwargs = (
                 {"tp_group": pg_collection.tp}
                 if fc2_linear_cls is TERMSNormDuplicatedLinear
-                else {}
+                else linear_gtp_kwargs
             )
             self.fc2_latent_proj = fc2_linear_cls(
                 self.config.moe_latent_size,
@@ -373,7 +375,6 @@ class MoELayer(BaseMoELayer):
                 skip_weight_param_allocation=False,
                 is_expert=False,
                 name=(name + ".fc2_latent_proj") if name is not None else None,
-                **linear_gtp_kwargs,
                 **fc2_extra_kwargs,
             )
             if linear_cls is TELinear:
