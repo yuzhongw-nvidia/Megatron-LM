@@ -2351,7 +2351,11 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
-            if self.deterministic_mode and self.gdn_kernel_backend != "torch":
+            if (
+                self.experimental_attention_variant != "kda"
+                and self.deterministic_mode
+                and self.gdn_kernel_backend != "torch"
+            ):
                 raise ValueError(
                     "deterministic_mode=True requires gdn_kernel_backend='torch' for "
                     "Gated DeltaNet."
