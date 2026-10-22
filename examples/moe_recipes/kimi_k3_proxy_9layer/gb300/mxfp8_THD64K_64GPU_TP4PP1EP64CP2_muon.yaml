@@ -81,9 +81,11 @@ ARGS:
   attn_res_block_layers: 2
   normalization: RMSNorm
   norm_epsilon: 1.0e-05
-  situ_glu: true
-  situ_glu_beta1: 4.0
-  situ_glu_beta2: 25.0
+  # SiTU-GLU on main = silu + activation_func_tanh_clamp_scale (gate) /
+  # _linear (linear); dev situ_glu/situ_glu_beta1/2 do not exist on main.
+  swiglu: true
+  activation_func_tanh_clamp_scale: 4.0
+  activation_func_tanh_clamp_scale_linear: 25.0
   disable_bias_linear: true
   untie_embeddings_and_output_weights: true
   num_experts: 896
