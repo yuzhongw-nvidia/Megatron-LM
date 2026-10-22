@@ -360,6 +360,24 @@ class OptimizerConfig:
     arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
     that the standard distributed-optimizer path is not triggered."""
 
+    use_layer_wise_param_layout: bool = False
+    """Layer-wise (Muon) optimizer only. When True, LayerWise-managed buffers use
+    the shard-aligned padded LayerWise param layout. When False (default), the compact decoupled
+    layout is selected."""
+
+    chunked_optimizer_state_offload: bool = False
+    """Keep selected optimizer tensor states and master weights on CPU between updates."""
+
+    optimizer_state_offload_chunk_size_mb: int = 0
+    """Target GPU staging-window size for optimizer tensor state, in MiB. Zero restores all
+    selected tensor state together."""
+
+    optimizer_state_offload_fraction: float = 1.0
+    """Fraction of optimizer parameter bundles whose state and master weights are offloaded."""
+
+    offload_optimizer_states: bool = False
+    """Deprecated alias for :attr:`chunked_optimizer_state_offload`."""
+
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
         This argument is intended to have the same value as the "overlap_param_gather" argument 
