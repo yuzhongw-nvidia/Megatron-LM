@@ -318,7 +318,6 @@ def test_hybrid_delta_does_not_cancel_small_bf16_branch(pg_collection, attention
 @pytest.mark.parametrize("mtp_pattern", ["+E", "KE"])
 def test_k3_real_hybrid_mtp_optimizer_updates(pg_collection, mtp_pattern):
     """Real KDA/NoPE gated MLA/MoE: two MTP depths, real losses and updates."""
-    from megatron.core.activations import situlu
     from megatron.core.ssm.gated_delta_net import KimiDeltaAttention
     from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 
@@ -361,7 +360,9 @@ def test_k3_real_hybrid_mtp_optimizer_updates(pg_collection, mtp_pattern):
         moe_latent_up_projection_rmsnorm=True,
         moe_shared_expert_intermediate_size=1024,
         gated_linear_unit=True,
-        activation_func=situlu,
+        activation_func=F.silu,
+        activation_func_tanh_clamp_scale=4.0,
+        activation_func_tanh_clamp_scale_linear=25.0,
         hidden_dropout=0.0,
         attention_dropout=0.0,
         add_bias_linear=False,
@@ -390,7 +391,10 @@ def test_k3_real_hybrid_mtp_optimizer_updates(pg_collection, mtp_pattern):
         if isinstance(module, KimiDeltaAttention):
             assert module.act_fn is F.silu
             assert module.activation == "silu"
-            assert module.config.activation_func is situlu
+            # main expresses Kimi-K3 SiTU-GLU as silu + activation_func_tanh_clamp_scale
+            # (dev's situlu activation does not exist on main).
+            assert module.config.activation_func is F.silu
+            assert module.config.activation_func_tanh_clamp_scale == 4.0
     for depth in model.mtp.layers:
         attention = depth.mtp_model_layer.layers[0].inner_layer.self_attention
         assert attention.is_mtp_layer

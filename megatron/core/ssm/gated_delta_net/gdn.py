@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
