@@ -160,7 +160,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         is_mtp_layer: bool = False,
         name: str | None = None,
         cp_comm_type: str | None = None,
-        pp_layer_offset: int = 0,
+        pp_layer_offset: Optional[int] = None,
     ):
         """
         Args:
@@ -182,7 +182,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 than the attention CP communication schemes.
             pp_layer_offset: Offset of this pipeline stage's first global layer.
         """
-        del is_mtp_layer
+        self.is_mtp_layer = is_mtp_layer
         if not HAVE_FLA:
             raise ImportError(
                 "FLA is not installed. Please install it with "
@@ -193,7 +193,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         # Attributes from arguments
         self.layer_number = layer_number
-        self.pp_layer_offset = pp_layer_offset
+        self._pp_layer_offset = pp_layer_offset
+        self.pp_layer_offset = 0 if pp_layer_offset is None else pp_layer_offset
         self.bias = bias
         self.conv_bias = conv_bias
         self.conv_init = conv_init
@@ -311,8 +312,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         )
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
-        if self.config.recompute_granularity == "selective":
+        self.recompute_gdn = False
+        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_gdn = "gdn" in self.config.recompute_modules
 
         self.out_proj = build_module(
             submodules.out_proj,
