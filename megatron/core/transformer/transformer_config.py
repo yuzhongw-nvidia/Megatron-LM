@@ -321,6 +321,30 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
+    mla_latent_cp: bool = False
+    """Experimental. Multi-latent attention context parallelism that exchanges the latent KV
+    (kv_lora_rank + qk_pos_emb_head_dim channels) between CP ranks and recomputes the KV
+    up-projection per ring step, bypassing the Transformer Engine attention wrapper. Requires
+    multi_latent_attention, THD packed input in the zigzag CP layout (a contiguous layout for MLA
+    depends on PR #7545), cp_comm_type p2p/a2a/a2a+p2p and attention_backend fused/flash/auto (the
+    core-attention kernel can also be set per direction, see mla_latent_cp_fwd_backend)."""
+
+    mla_latent_cp_two_stream: bool = False
+    """MLAWithLatentCP only: run alternate ring steps of the forward on a second CUDA stream (TE's
+    cp_stream pattern). Off by default: measured neutral at 64K/CP4 and 512K/CP16 on GB300 (the
+    overlapped attention kernels run correspondingly slower); kept for short-sequence experiments."""
+
+    mla_latent_cp_fwd_backend: Optional[AttnBackend] = None
+    """MLAWithLatentCP only: core-attention kernel of the forward ring steps, AttnBackend.fused
+    (cuDNN through Transformer Engine) or AttnBackend.flash (FlashAttention-4); None follows
+    attention_backend. The forward and backward kernels share only the merged output and its fp32
+    log-sum-exp, so the two directions may use different backends: at MLA head dimensions cuDNN has
+    the faster forward and FlashAttention-4 the faster backward."""
+
+    mla_latent_cp_bwd_backend: Optional[AttnBackend] = None
+    """MLAWithLatentCP only: core-attention kernel of the backward ring steps, AttnBackend.fused or
+    AttnBackend.flash (see mla_latent_cp_fwd_backend); None follows attention_backend."""
+
     no_rope_freq: Optional[Union[int, List[int]]] = None
     """Controls which layers perform Rotary Position Embedding (RoPE). Accepts either:
     An integer N: Creates a pattern where RoPE is skipped every N-1 layers. For example,
@@ -380,6 +404,12 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    apply_dsa_kernel_fusion: Optional[bool] = None
+    """Opt in to the fused DSA indexer kernels when available; None auto-selects."""
+
+    dsa_cp_balance_indexer: bool = False
+    """Balance the DSA indexer workload across context-parallel ranks."""
 
     dsa_kernel_backend: (
         Literal["none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"]
@@ -1889,6 +1919,125 @@ class TransformerConfig(ModelParallelConfig):
                 "gdn_kernel_backend must be one of {'transformer_engine', 'fla', 'torch'}, "
                 f"got {self.gdn_kernel_backend!r}."
             )
+
+        if is_gated_delta_net_variant(self.experimental_attention_variant):
+            if (
+                self.experimental_attention_variant != "kda"
+                and self.deterministic_mode
+                and self.gdn_kernel_backend != "torch"
+            ):
+                raise ValueError(
+                    "deterministic_mode=True requires gdn_kernel_backend='torch' for "
+                    "Gated DeltaNet."
+                )
+
+            # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern
+            # symbol 'G', where linear_attention_freq is unused; the GPT experimental
+            # attention route raises a clear error downstream if it is missing.
+            if self.experimental_attention_variant == "gdn" and not self.is_hybrid_model:
+                assert (
+                    self.linear_attention_freq is not None
+                ), "linear_attention_freq must be set for linear gdn."
+
+        if self.experimental_attention_variant is not None:
+            self.experimental_attention_variant = normalize_experimental_attention_variant(
+                self.experimental_attention_variant
+            )
+
+        if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
+            self.moe_use_grouped_tensor = True
+
+        if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
+            raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
+
+        if self.cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+
+        if self.cp_partition_mode == "contiguous" and (
+            self.context_parallel_size > 1 or self.dynamic_context_parallel
+        ):
+            if self.sequence_packing_scheduler is None and not (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and not self.dynamic_context_parallel
+            ):
+                raise ValueError(
+                    "cp_partition_mode='contiguous' with context parallelism requires THD "
+                    "inputs from a sequence_packing_scheduler; BSHD inputs are not supported. "
+                    "The legacy non-scheduler CP batch slicing path only supports zigzag layout."
+                )
+            # Static DSv4 callers may supply THD metadata directly (main #7469).
+            # CSA validates the actual input format at runtime and still rejects SBHD CP.
+
+        has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
+        if has_context_parallelism:
+            if self.cp_partition_mode == "contiguous":
+                # MultiLatentAttention converts its input to the zigzag layout internally,
+                # like Attention, so it no longer restricts cp_partition_mode.
+                if self.experimental_attention_variant != "dsv4_hybrid" and not (
+                    is_gated_delta_net_variant(self.experimental_attention_variant)
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' with context parallelism currently "
+                        "requires experimental_attention_variant to be 'dsv4_hybrid', 'gdn', "
+                        "or 'kda'."
+                    )
+                if (
+                    is_gated_delta_net_variant(self.experimental_attention_variant)
+                    and self.linear_cp_mode == "headwise"
+                ):
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is incompatible with "
+                        "GDN-family linear_cp_mode='headwise'."
+                    )
+                if self.experimental_attention_variant == "gdn2":
+                    # GDN2 always runs headwise CP; see linear_cp_mode.
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is incompatible with "
+                        "experimental_attention_variant='gdn2', which supports only headwise CP."
+                    )
+            elif self.cp_partition_mode == "zigzag":
+                if self.experimental_attention_variant == "dsv4_hybrid":
+                    raise ValueError(
+                        "DSv4 Hybrid with context parallelism requires "
+                        "cp_partition_mode='contiguous'."
+                    )
+
+        if self.dsa_cp_balance_indexer and self.experimental_attention_variant != "dsv4_hybrid":
+            # The flag is consumed only by the CSA indexer; on any other model the
+            # data-step prebuild would burn per-microbatch host syncs for nothing.
+            raise ValueError(
+                "dsa_cp_balance_indexer requires " "experimental_attention_variant='dsv4_hybrid'."
+            )
+
+        # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
+        # selectors have been folded into experimental_attention_variant, and immediately
+        # before the centralized attention-variant validation consumes dsa_kernel_backend.
+        if self.apply_dsa_kernel_fusion is not None:
+            if self.experimental_attention_variant != "dsv4_hybrid":
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "apply_dsa_kernel_fusion is deprecated and ignored outside "
+                    "experimental_attention_variant='dsv4_hybrid'; use dsa_kernel_backend "
+                    "instead.",
+                )
+            else:
+                legacy_backend = "cudnn" if self.apply_dsa_kernel_fusion else "none"
+                if self.dsa_kernel_backend not in ("none", legacy_backend):
+                    raise ValueError(
+                        "Conflicting DSA kernel controls: "
+                        f"apply_dsa_kernel_fusion={self.apply_dsa_kernel_fusion} maps to "
+                        f"dsa_kernel_backend={legacy_backend!r}, but "
+                        f"dsa_kernel_backend={self.dsa_kernel_backend!r} was also selected. "
+                        "Remove apply_dsa_kernel_fusion and use dsa_kernel_backend only."
+                    )
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "apply_dsa_kernel_fusion is deprecated and will be removed in a future "
+                    f"release; use dsa_kernel_backend={legacy_backend!r} instead.",
+                )
+                self.dsa_kernel_backend = legacy_backend
 
         if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):
             raise ValueError(
@@ -3442,6 +3591,71 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
+
+        if self.mla_latent_cp_two_stream and not self.mla_latent_cp:
+            raise ValueError("mla_latent_cp_two_stream requires mla_latent_cp=True.")
+
+        mla_latent_cp_backends = (self.mla_latent_cp_fwd_backend, self.mla_latent_cp_bwd_backend)
+        if any(b is not None for b in mla_latent_cp_backends) and not self.mla_latent_cp:
+            raise ValueError(
+                "mla_latent_cp_fwd_backend/mla_latent_cp_bwd_backend require mla_latent_cp=True."
+            )
+
+        if self.mla_latent_cp:
+            cp_comm_types = (
+                self.cp_comm_type if isinstance(self.cp_comm_type, list) else [self.cp_comm_type]
+            )
+            a2a_modes = [t for t in cp_comm_types if t in ("a2a", "a2a+p2p")]
+            hcp = self.hierarchical_context_parallel_sizes
+            hcp_ok = bool(hcp) and len(hcp) == 2 and hcp[0] * hcp[1] == self.context_parallel_size
+            # a2a group size: the CP group for "a2a", the first hierarchical level for "a2a+p2p".
+            a2a_sizes = [
+                self.context_parallel_size if t == "a2a" else (hcp[0] if hcp_ok else 1)
+                for t in a2a_modes
+            ]
+            heads_per_tp_rank = self.num_attention_heads // self.tensor_model_parallel_size
+            unsupported = {
+                "multi_latent_attention=False": not self.multi_latent_attention,
+                "cp_comm_type other than p2p/a2a/a2a+p2p": any(
+                    t not in (None, "p2p", "a2a", "a2a+p2p") for t in cp_comm_types
+                ),
+                "a2a+p2p without two hierarchical_context_parallel_sizes whose product is "
+                "context_parallel_size": "a2a+p2p" in a2a_modes
+                and not hcp_ok,
+                "an a2a group size that does not divide the attention heads per tensor-parallel "
+                "rank": any(heads_per_tp_rank % size for size in a2a_sizes),
+                "a2a/a2a+p2p with dynamic_context_parallel": bool(a2a_modes)
+                and self.dynamic_context_parallel,
+                "a2a/a2a+p2p with mla_up_proj in recompute_modules": bool(a2a_modes)
+                and self.recompute_granularity == "selective"
+                and "mla_up_proj" in self.recompute_modules,
+                "attention_backend other than fused/flash/auto": self.attention_backend
+                not in (AttnBackend.fused, AttnBackend.flash, AttnBackend.auto),
+                "mla_latent_cp_fwd_backend/mla_latent_cp_bwd_backend other than fused/flash": any(
+                    b not in (None, AttnBackend.fused, AttnBackend.flash)
+                    for b in mla_latent_cp_backends
+                ),
+                "tensor parallelism without sequence_parallel": self.tensor_model_parallel_size > 1
+                and not self.sequence_parallel,
+                "attention_dropout > 0": self.attention_dropout != 0.0,
+                "core_attn in recompute_modules": self.recompute_granularity == "selective"
+                and "core_attn" in self.recompute_modules,
+                "qk_clip / log_max_attention_logit": self.qk_clip or self.log_max_attention_logit,
+                "window_size": self.window_size is not None,
+                "softmax_type other than vanilla": self.softmax_type != "vanilla",
+                "cuda_graph_impl other than none": self.cuda_graph_impl != "none",
+                "delay_wgrad_compute": self.delay_wgrad_compute,
+                "tp_comm_overlap": self.tp_comm_overlap,
+                "fp8_recipe=delayed": self.fp8 is not None and self.fp8_recipe == "delayed",
+                "experimental_attention_variant dsa/dsv4_hybrid": self.experimental_attention_variant
+                in ("dsa", "dsv4_hybrid"),
+                "mla_down_proj_fusion": getattr(self, "mla_down_proj_fusion", False),
+                # The overridden query up-projection would bypass the fused kernel silently.
+                "use_fused_mla_q_uproj": getattr(self, "use_fused_mla_q_uproj", False),
+            }
+            rejected = [name for name, hit in unsupported.items() if hit]
+            if rejected:
+                raise ValueError(f"mla_latent_cp does not support: {', '.join(rejected)}.")
 
         # MuP (Maximal Update Parameterization) configuration
         if self.use_mup:

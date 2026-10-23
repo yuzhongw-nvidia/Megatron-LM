@@ -17,6 +17,7 @@ except ImportError:
     HAVE_EINOPS = False
 
 from megatron.core import tensor_parallel
+from megatron.core.context_parallel_layout import convert_module_input_tensors_cp_partition_mode
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_row_copy import contiguous_rows
@@ -28,6 +29,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
     should_use_fused_mla_rope,
 )
+from megatron.core.packed_seq_params import resolve_cp_group, resolve_tp_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -546,6 +548,34 @@ class MultiLatentAttention(Attention):
         if self.config.cache_mla_latents:
             self.prepare_for_absorption()
 
+        # Set the right cp group for dynamic-cp. Mirrors Attention.forward:
+        # downstream RoPE uses self.pg_collection.cp, which must point at this
+        # microbatch's dynamic CP group. Restored before every return.
+        _orig_cp_group = self.pg_collection.cp
+        self.pg_collection.cp = resolve_cp_group(_orig_cp_group, packed_seq_params)
+        # MLA RoPE and core attention consume the zigzag CP layout. Like Attention.forward,
+        # convert the incoming layout to zigzag here and restore the input layout on the
+        # output, so callers may hand MLA any supported cp_partition_mode.
+        hidden_states, back_to_input_converter = convert_module_input_tensors_cp_partition_mode(
+            hidden_states=hidden_states,
+            key_value_states=key_value_states,
+            packed_seq_params=packed_seq_params,
+            cp_group=self.pg_collection.cp,
+            tp_group=self.pg_collection.tp,
+            tp_cp_group=resolve_tp_cp_group(
+                getattr(self.pg_collection, "tp_cp", None), packed_seq_params
+            ),
+            target_partition_mode="zigzag",
+            sequence_parallel=self.config.sequence_parallel,
+            config=self.config,
+            attention_mask=attention_mask,
+            attention_bias=attention_bias,
+        )
+
+        # The output gate is applied to core attention output, which is in the zigzag
+        # layout, so it must read the converted hidden states.
+        gate_input = hidden_states
+
         # =====================
         # Query, Key, and Value
         # =====================
@@ -700,6 +730,12 @@ class MultiLatentAttention(Attention):
             output, bias = apply_module(self.linear_proj)(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
+        if back_to_input_converter is not None:
+            output = back_to_input_converter.convert(
+                output, seq_dim=0, sequence_parallel=self.config.sequence_parallel
+            )
+
+        self.pg_collection.cp = _orig_cp_group
         return output, bias
 
     def _project_and_apply_mla_output_gate(
@@ -966,6 +1002,8 @@ class MLASelfAttention(MultiLatentAttention):
         # =========================================
         # Prepare RoPE and seqlen related params
         # =========================================
+        if not self.use_rope and inference_context is not None:
+            raise NotImplementedError("MLA no_rope_freq currently supports training only.")
         rotary_seq_len = None
         if self.use_rope:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -1247,25 +1285,14 @@ class MLASelfAttention(MultiLatentAttention):
 
             # todo add assert about fusions and caching
             if not self.use_rope:
-                # q_no_pe: [num_tokens, n, qk_head_dim]
-                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_no_pe, q_pos_emb = torch.split(
-                    q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
-                )
-
-                # k_no_pe: [num_tokens, n, qk_head_dim]
-                # value: [num_tokens, n, v_head_dim]
+                # K3 keeps the positional projection channels (and the original
+                # attention scale), but does not rotate them. Dropping those
+                # channels would change the architecture and checkpoint shapes.
+                query = q
                 k_no_pe, value = torch.split(
                     kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
                 )
-
-                query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
-                if k_pos_emb.ndim == 4:
-                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
-                else:
-                    assert k_pos_emb.ndim == 3
-                    k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
-                key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+                key = torch.cat([k_no_pe, k_pos_emb.expand(*k_no_pe.shape[:-1], -1)], dim=-1)
             elif use_fused_rope:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()
