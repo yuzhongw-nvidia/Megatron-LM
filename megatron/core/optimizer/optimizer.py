@@ -224,6 +224,18 @@ class MegatronOptimizer(ABC):
                     params.append(param)
         return params
 
+    def ensure_master_weights_for_param_sync(self) -> None:
+        """Restore master weights needed by an explicit parameter staging pass.
+
+        The chunked optimizer-state offloader (which would restore CPU-resident masters
+        before a param sync) is not wired on this branch, so this is a no-op whenever no
+        offloader is attached. Defined on the base class so every optimizer flavour
+        (Float16, DistOpt, LayerWise) satisfies ``prepare_model_params_for_param_sync``.
+        """
+        offloader = getattr(self, "_optimizer_state_offloader", None)
+        if offloader is not None:
+            offloader.ensure_master_for_param_sync()
+
     def prepare_model_params_for_param_sync(self) -> None:
         """Stage optimizer-owned model params before an explicit DDP param sync.
 
