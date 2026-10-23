@@ -335,8 +335,23 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.reset_parameters()
 
     def supports_two_stage_attention(self) -> bool:
-        """Output-norm recomputation requires the original atomic forward path."""
-        return not self.recompute_norm_out
+        """Use the split path only when the variant exposes a compatible static stage.
+
+        GDN-family recompute (``recompute_gdn``), dynamic CP, non-head-wise CP and the
+        channel-wise KDA variant (which does not override
+        ``forward_pre_attn_and_core_attn``) all require the original atomic forward path,
+        so the two-stage split must be disabled for them. Keeping only
+        ``not self.recompute_norm_out`` here silently routes recompute-GDN/KDA layers
+        through the generic two-stage path and perturbs their numerics.
+        """
+        return (
+            not self.recompute_norm_out
+            and not self.recompute_gdn
+            and not self.config.dynamic_context_parallel
+            and (self.config.linear_cp_mode == "headwise" or self.cp_size == 1)
+            and type(self).forward_pre_attn_and_core_attn
+            is not TwoStageAttentionLayer.forward_pre_attn_and_core_attn
+        )
 
     def forward_post_core_attn(
         self, norm_out: torch.Tensor
