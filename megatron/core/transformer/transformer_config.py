@@ -332,7 +332,7 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
+        Literal['gdn', 'gdn2', 'kda', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
     ] = None
     """Type of attention variant to use. Supports gdn, gdn2, dsa, and dsv4_hybrid.
     gdn2 selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
@@ -505,12 +505,36 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    kda_f_lora_rank: Optional[int] = None
+    """Rank of KDA's bias-free low-rank F-decay projection; None keeps it full-rank."""
+
+    kda_gate_lora_rank: Optional[int] = None
+    """Rank of KDA's bias-free low-rank output gate; None keeps it full-rank.
+
+    When both KDA ranks are None, KDA uses its legacy fused input projection.
+    """
+
     gdn_pre_gated_delta_rule_fusion: bool = False
-    """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+    """Whether to use streamed Triton pre-GDR preprocessing for GDN-family attention."""
 
     gdn_gated_output_norm_fusion: bool = False
-    """Fuse GatedDeltaNet output RMSNorm and SiLU gating. Unsupported configurations and
-    layouts raise on every forward; see docs/developer/gdn_ew_fusion.md for requirements."""
+    """Fuse GDN-family output RMSNorm with SiLU gating for GDN or sigmoid gating for KDA.
+    Unsupported configurations and layouts raise on every forward; see
+    docs/developer/gdn_ew_fusion.md for requirements."""
+
+    gdn_conv_pad_alignment: Optional[int] = None
+    """Pad the GDN/KDA short causal-convolution input length up to this alignment (THD only)."""
+
+    cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
+    """Context-parallel sequence partition mode for GDN-family and MLA layers: 'zigzag' (the
+    load-balanced interleaving) or 'contiguous' (chunk-per-rank). KDA chunkwise linear CP
+    requires 'contiguous'."""
+
+    kda_safe_gate: bool = False
+    """KDA (Kimi Delta Attention) safe-gate mode: clamp the gate lower bound to kda_lower_bound."""
+
+    kda_lower_bound: Optional[float] = None
+    """Lower bound for the KDA gate when kda_safe_gate=True; must be in [-5, 0)."""
 
     ####################
     # initialization
@@ -1893,7 +1917,11 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
-            if self.deterministic_mode and self.gdn_kernel_backend != "torch":
+            if (
+                self.experimental_attention_variant != "kda"
+                and self.deterministic_mode
+                and self.gdn_kernel_backend != "torch"
+            ):
                 raise ValueError(
                     "deterministic_mode=True requires gdn_kernel_backend='torch' for "
                     "Gated DeltaNet."
@@ -1922,7 +1950,36 @@ class TransformerConfig(ModelParallelConfig):
             ), "linear_num_key_heads must be set for gated delta net."
             assert (
                 self.linear_num_value_heads is not None
-            ), "linear_num_value_heads must be set for gated delta net."
+            ), "linear_num_value_heads must be set for a GDN-family layer."
+
+            if self.experimental_attention_variant == "kda":
+                if self.linear_num_key_heads != self.linear_num_value_heads:
+                    raise ValueError("KDA requires equal key and value head counts.")
+                if self.linear_key_head_dim != self.linear_value_head_dim:
+                    raise ValueError("KDA requires equal key and value head dimensions.")
+                if self.kda_f_lora_rank is not None and self.kda_f_lora_rank <= 0:
+                    raise ValueError(
+                        f"KDA requires kda_f_lora_rank > 0, got {self.kda_f_lora_rank}."
+                    )
+                if self.kda_gate_lora_rank is not None and self.kda_gate_lora_rank <= 0:
+                    raise ValueError(
+                        "KDA requires kda_gate_lora_rank > 0, " f"got {self.kda_gate_lora_rank}."
+                    )
+                if self.kda_safe_gate:
+                    if self.kda_lower_bound is None:
+                        raise ValueError("KDA requires kda_lower_bound when kda_safe_gate=True.")
+                    if not (-5.0 <= self.kda_lower_bound < 0.0):
+                        raise ValueError(
+                            "KDA requires kda_lower_bound to be in [-5, 0) "
+                            "when kda_safe_gate=True."
+                        )
+
+            if (
+                self.experimental_attention_variant == "gdn2"
+                and has_context_parallelism
+                and self.linear_cp_mode != "headwise"
+            ):
+                raise ValueError("GDN2 context parallelism requires linear_cp_mode='headwise'.")
             assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
                 f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
@@ -2027,19 +2084,79 @@ class TransformerConfig(ModelParallelConfig):
                         "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
                         "this path. Use sparse indexer loss or set dsa_kernel_backend='none'."
                     )
-            self.hetereogenous_dist_checkpoint = True
 
-        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
+                from cudnn import DSA
+
+                if sm[0] >= 10 and uses_ratio4_indexer:
+                    compact_wrapper = getattr(DSA, "indexer_forward_top_k_wrapper", None)
+                    required_parameters = {"deterministic"}
+                    if uses_mxfp8_indexer:
+                        required_parameters.update(
+                            {
+                                "precision",
+                                "q_scale",
+                                "k_scale",
+                                "cu_seqlens_q_scale_padded",
+                                "cu_seqlens_k_scale_padded",
+                                "sf_vec_size",
+                            }
+                        )
+                    wrapper_parameters = (
+                        set(inspect.signature(compact_wrapper).parameters)
+                        if callable(compact_wrapper)
+                        else set()
+                    )
+                    missing_parameters = required_parameters - wrapper_parameters
+                    if missing_parameters:
+                        raise ValueError(
+                            "Fused DSA indexer requires a compatible cuDNN Frontend compact "
+                            "wrapper; "
+                            f"missing parameters: {', '.join(sorted(missing_parameters))}"
+                        )
+
+                if (
+                    self.context_parallel_size > 1 or self.dynamic_context_parallel
+                ) and uses_ratio4_indexer:
+                    required_wrappers = [DSA.indexer_forward_wrapper]
+                    if indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss:
+                        required_wrappers.extend(
+                            [
+                                DSA.dense_indexer_score_recompute_wrapper,
+                                DSA.dense_attn_score_recompute_wrapper,
+                                DSA.dense_indexer_backward_wrapper,
+                            ]
+                        )
+                    missing_offsets = [
+                        wrapper.__name__
+                        for wrapper in required_wrappers
+                        if "q_causal_offsets" not in inspect.signature(wrapper).parameters
+                    ]
+                    if missing_offsets:
+                        raise ValueError(
+                            "DSv4 CP with ratio-4 fused DSA requires cuDNN Frontend wrappers "
+                            "with q_causal_offsets support; missing from: "
+                            f"{', '.join(missing_offsets)}. Install a compatible cuDNN Frontend "
+                            "build or set dsa_kernel_backend='none'."
+                        )
+
+        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant not in (
+            "gdn",
+            "kda",
+        ):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
-                "experimental_attention_variant='gdn' "
-                "or deprecated alias experimental_attention_variant='gated_delta_net'."
+                "experimental_attention_variant='gdn' or 'kda'."
             )
-
-        if self.gdn_gated_output_norm_fusion and self.experimental_attention_variant != "gdn":
+        # Explicit allow-list: GDN_ATTENTION_VARIANTS also contains "gdn2", which has no
+        # fused gated output norm. The deprecated "gated_delta_net" alias is already
+        # normalized to "gdn" above.
+        if self.gdn_gated_output_norm_fusion and self.experimental_attention_variant not in (
+            "gdn",
+            "kda",
+        ):
             raise ValueError(
                 "gdn_gated_output_norm_fusion is only supported with "
-                "experimental_attention_variant='gdn' "
+                "experimental_attention_variant='gdn' or 'kda' "
                 "or deprecated alias experimental_attention_variant='gated_delta_net'."
             )
 
@@ -2627,6 +2744,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "gdn",
                     "gdn_norm_out",
                     "gdp_in_proj",
                     "gdp_qkv",

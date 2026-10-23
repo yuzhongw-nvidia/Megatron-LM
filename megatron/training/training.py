@@ -995,23 +995,183 @@ def num_floating_point_operations(
             )
         )
 
-    def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
-                     num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
-                     gdp_num_householder,
-                     num_gdn_layers=0,
-                     mamba_state_dim=128, mamba_head_dim=64,
-                     mamba_num_groups=8, mamba_num_heads=128,
-                     num_attn_heads=32, gqa=True,
-                     gqa_groups=8, kv_channels=None,
-                     mlp_expansion=4.0, swiglu=False,
-                     moe_latent_size=None,
-                     moe_ffn_hidden_size=2048, shared_expert_ffn_hidden_size=2048, num_experts_routed_to=1,
-                     use_gated_delta_product=False,
-                     gdn_qk_head_dim=128, gdn_v_head_dim=128,
-                     gdn_num_qk_heads=16, gdn_num_v_heads=32,
-                     gdn_conv_kernel_dim=4, gdn_use_gdn2=False,
-                     vocab_size=256000, mtp_num_layers=0):
+    def kda_layer_flops(
+        total_tokens,
+        hidden_size,
+        qk_head_dim=128,
+        v_head_dim=128,
+        num_qk_heads=16,
+        num_v_heads=16,
+        conv_kernel_dim=4,
+        f_lora_rank=None,
+        gate_lora_rank=None,
+    ):
+        """Calculate projection FLOPs for a Kimi Delta Attention layer."""
+        if num_qk_heads != num_v_heads or qk_head_dim != v_head_dim:
+            raise ValueError(
+                "KDA FLOPs require the equal K/V head layout enforced by KimiDeltaAttention."
+            )
+        qk_dim = qk_head_dim * num_qk_heads
+        v_dim = v_head_dim * num_v_heads
+        f_projection_flops = hidden_size * qk_dim
+        if f_lora_rank is not None:
+            if f_lora_rank <= 0:
+                raise ValueError(
+                    f"KDA F-decay projection rank must be positive, got {f_lora_rank=}."
+                )
+            f_projection_flops = hidden_size * f_lora_rank + f_lora_rank * qk_dim
+        gate_projection_flops = hidden_size * v_dim
+        if gate_lora_rank is not None:
+            if gate_lora_rank <= 0:
+                raise ValueError(
+                    f"KDA output-gate projection rank must be positive, got {gate_lora_rank=}."
+                )
+            gate_projection_flops = hidden_size * gate_lora_rank + gate_lora_rank * v_dim
+        projection_flops = (
+            hidden_size * (2 * qk_dim + v_dim + num_qk_heads)
+            + f_projection_flops
+            + gate_projection_flops
+            + hidden_size * v_dim
+        )
+        non_core_flops = (
+            2 * total_tokens * (projection_flops + conv_kernel_dim * (2 * qk_dim + v_dim))
+        )
+        state_update_flops = num_v_heads * (qk_head_dim**2 + 3 * qk_head_dim * v_head_dim)
+        core_flops = 2 * total_tokens * state_update_flops
+        return non_core_flops + core_flops
+
+    def hybrid_flops(
+        total_tokens,
+        seqlen_squared_sum,
+        hidden_size,
+        num_attn_layers,
+        num_mla_layers,
+        num_kda_layers,
+        num_mamba_layers,
+        num_mlp_layers,
+        num_moe_layers,
+        gdp_num_householder,
+        num_gdn_layers=0,
+        mamba_state_dim=128,
+        mamba_head_dim=64,
+        mamba_num_groups=8,
+        mamba_num_heads=128,
+        num_attn_heads=32,
+        gqa=True,
+        gqa_groups=8,
+        kv_channels=None,
+        mlp_expansion=4.0,
+        swiglu=False,
+        moe_latent_size=None,
+        moe_ffn_hidden_size=2048,
+        shared_expert_ffn_hidden_size=2048,
+        num_experts_routed_to=1,
+        use_gated_delta_product=False,
+        gdn_qk_head_dim=128,
+        gdn_v_head_dim=128,
+        gdn_num_qk_heads=16,
+        gdn_num_v_heads=32,
+        gdn_conv_kernel_dim=4,
+        gdn_use_gdn2=False,
+        kda_qk_head_dim=128,
+        kda_v_head_dim=128,
+        kda_num_qk_heads=16,
+        kda_num_v_heads=16,
+        kda_conv_kernel_dim=4,
+        kda_f_lora_rank=None,
+        kda_gate_lora_rank=None,
+        vocab_size=256000,
+        mtp_num_layers=0,
+        mtp_loss_type="cross_entropy",
+        mtp_detach_heads=False,
+        q_lora_rank=None,
+        kv_lora_rank=0,
+        qk_head_dim=0,
+        qk_pos_emb_head_dim=0,
+        v_head_dim=0,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
+        experimental_attention_variant=None,
+        dsv4_n_layers_r0=0,
+        dsv4_n_layers_r4=0,
+        dsv4_n_layers_r128=0,
+        o_groups=None,
+        o_lora_rank=None,
+        csa_window_size=None,
+        seq_length=None,
+        dsa_indexer_n_heads=None,
+        dsa_indexer_head_dim=None,
+        dsa_indexer_topk=None,
+    ):
         """Calculate total FLOPs for the hybrid model."""
+        # Self-attention (already summed over all attention layers, fwd-equivalent
+        # with the FMA factor baked in; the global ``* 3`` below adds fwd+bwd).
+        if experimental_attention_variant == "dsv4_hybrid":
+            # DSv4 uses sparse MLA attention. Keep the shared helper as the
+            # single source of truth for both HybridModel and GPTModel.
+            dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
+                hidden_size=hidden_size,
+                num_attention_heads=num_attn_heads,
+                v_head_dim=v_head_dim,
+                q_lora_rank=q_lora_rank,
+                o_groups=o_groups,
+                o_lora_rank=o_lora_rank,
+                csa_window_size=csa_window_size,
+                seq_length=seq_length,
+                n_layers_r0=dsv4_n_layers_r0,
+                n_layers_r4=dsv4_n_layers_r4,
+                n_layers_r128=dsv4_n_layers_r128,
+                dsa_indexer_n_heads=dsa_indexer_n_heads,
+                dsa_indexer_head_dim=dsa_indexer_head_dim,
+                dsa_indexer_topk=dsa_indexer_topk,
+            )
+            attn_flops_total = 2 * (
+                dsv4_token_term * total_tokens + dsv4_core_term * seqlen_squared_sum
+            )
+        else:
+            # HybridStack assigns '*' to regular attention and '+' to MLA independently of the
+            # model-wide multi_latent_attention flag.
+            plain_attn_layer_flops = attn_layer_flops(
+                total_tokens,
+                seqlen_squared_sum,
+                hidden_size,
+                num_attn_heads,
+                gqa,
+                gqa_groups,
+                kv_channels,
+                attention_output_gate,
+                gated_attention_proj_granularity,
+            )
+            attn_flops_total = num_attn_layers * plain_attn_layer_flops
+            if num_mla_layers:
+                attn_flops_total += num_mla_layers * mla_attn_layer_flops(
+                    total_tokens,
+                    seqlen_squared_sum,
+                    hidden_size,
+                    num_attn_heads,
+                    q_lora_rank,
+                    kv_lora_rank,
+                    qk_head_dim,
+                    qk_pos_emb_head_dim,
+                    v_head_dim,
+                    attention_output_gate,
+                    gated_attention_proj_granularity,
+                )
+
+        kda_flops_total = 0
+        if num_kda_layers:
+            kda_flops_total = num_kda_layers * kda_layer_flops(
+                total_tokens,
+                hidden_size,
+                kda_qk_head_dim,
+                kda_v_head_dim,
+                kda_num_qk_heads,
+                kda_num_v_heads,
+                kda_conv_kernel_dim,
+                kda_f_lora_rank,
+                kda_gate_lora_rank,
+            )
+
         mamba_flops = (
             gated_delta_product_layer_flops(total_tokens, hidden_size,
                                             gdp_num_householder,
@@ -1236,7 +1396,19 @@ def num_floating_point_operations(
             )
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if is_gated_delta_net_variant(args.experimental_attention_variant):
+            if args.experimental_attention_variant == "kda":
+                linear_self_attn_term = forward_backward_expansion_factor * kda_layer_flops(
+                    total_tokens=1,
+                    hidden_size=args.hidden_size,
+                    f_lora_rank=getattr(args, "kda_f_lora_rank", None),
+                    gate_lora_rank=getattr(args, "kda_gate_lora_rank", None),
+                    qk_head_dim=args.linear_key_head_dim,
+                    v_head_dim=args.linear_value_head_dim,
+                    num_qk_heads=args.linear_num_key_heads,
+                    num_v_heads=args.linear_num_value_heads,
+                    conv_kernel_dim=args.linear_conv_kernel_dim,
+                )
+            elif is_gated_delta_net_variant(args.experimental_attention_variant):
                 # Calculate the FLOPs for the gated delta net attention.
                 qk_head_dim = args.linear_key_head_dim
                 v_head_dim = args.linear_value_head_dim
@@ -1417,6 +1589,8 @@ def num_floating_point_operations(
             gdn_num_v_heads=args.linear_num_value_heads or 32,
             gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
             gdn_use_gdn2=(args.experimental_attention_variant == "gdn2"),
+            kda_f_lora_rank=getattr(args, "kda_f_lora_rank", None),
+            kda_gate_lora_rank=getattr(args, "kda_gate_lora_rank", None),
             vocab_size=args.padded_vocab_size,
             mtp_num_layers=mtp_num_layers,
         ))
