@@ -1464,12 +1464,12 @@ def initialize_model_parallel(
             _DYNAMIC_TP_DP_CP_GROUPS = dict(_DYNAMIC_DP_CP_GROUPS)
         else:
             tp_ranks_by_rank = {}
-            for tp_ranks in decoder_rank_generator.get_ranks('tp'):
+            for tp_ranks in token_rank_generator.get_ranks('tp'):
                 for tp_member in tp_ranks:
                     tp_ranks_by_rank[tp_member] = tuple(tp_ranks)
             _DYNAMIC_TP_DP_CP_GROUPS = create_dynamic_tp_dp_cp_groups(
                 rank,
-                decoder_rank_generator.get_ranks('dp-cp'),
+                token_rank_generator.get_ranks('dp-cp'),
                 tp_ranks_by_rank,
                 get_nccl_options("tp_dp_cp", nccl_comm_cfgs),
                 min_cp_size=min_dynamic_context_parallel_size,
@@ -1486,7 +1486,7 @@ def initialize_model_parallel(
                 torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
                 torch.cuda.synchronize()
 
-    for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-dp'):
+    for ranks in token_rank_generator.get_ranks('tp-gtp_remat-dp'):
         group = create_group(
             ranks,
             timeout=timeout,
