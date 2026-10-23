@@ -1004,8 +1004,15 @@ def num_floating_point_operations(
         return routed_flops + shared_flops
 
     def attn_layer_flops(
-        total_tokens, seqlen_squared_sum, hidden_size, num_heads, gqa=True,
-        gqa_groups=8, kv_channels=None,
+        total_tokens,
+        seqlen_squared_sum,
+        hidden_size,
+        num_heads,
+        gqa=True,
+        gqa_groups=8,
+        kv_channels=None,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
     ):
         """Calculate FLOPs for an attention layer.
 
@@ -1018,13 +1025,78 @@ def num_floating_point_operations(
         """
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
+        gate_projection_size = 0
+        if attention_output_gate:
+            if gated_attention_proj_granularity == "elementwise":
+                gate_projection_size = hidden_size * p
+            elif gated_attention_proj_granularity == "headwise":
+                gate_projection_size = num_heads
+            else:
+                raise ValueError(
+                    "gated_attention_proj_granularity must be either 'elementwise' or "
+                    f"'headwise', got {gated_attention_proj_granularity!r}."
+                )
         # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
+        # The output gate contributes one additional hidden_size -> gate_size projection.
         # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
         return (
             4 * total_tokens * hidden_size * p
             * (hidden_size + hidden_size * (g / num_heads))
+            + 2 * total_tokens * hidden_size * gate_projection_size
             + 2 * seqlen_squared_sum * hidden_size * p
         )
+
+    def mla_attn_layer_flops(
+        total_tokens,
+        seqlen_squared_sum,
+        hidden_size,
+        num_heads,
+        q_lora_rank,
+        kv_lora_rank,
+        qk_head_dim,
+        qk_pos_emb_head_dim,
+        v_head_dim,
+        attention_output_gate=False,
+        gated_attention_proj_granularity="elementwise",
+    ):
+        """Calculate FLOPs for a Multi-Latent Attention (MLA) layer.
+
+        The generic ``attn_layer_flops`` above assumes dense MHA/GQA QKV
+        projections and badly overcounts MLA, whose Q/KV go through low-rank
+        ``lora`` ranks. Returns a forward-equivalent value (FMA factor 2 baked
+        in, no forward/backward factor): hybrid_flops applies the global factor 3.
+        """
+        fma = 2
+        if q_lora_rank is None:
+            q_term = hidden_size * num_heads * (qk_head_dim + qk_pos_emb_head_dim)
+        else:
+            q_term = q_lora_rank * (
+                hidden_size + num_heads * (qk_head_dim + qk_pos_emb_head_dim) + 1
+            )
+        gate_projection_size = 0
+        if attention_output_gate:
+            if gated_attention_proj_granularity == "elementwise":
+                gate_projection_size = num_heads * v_head_dim
+            elif gated_attention_proj_granularity == "headwise":
+                gate_projection_size = num_heads
+            else:
+                raise ValueError(
+                    "gated_attention_proj_granularity must be either 'elementwise' or "
+                    f"'headwise', got {gated_attention_proj_granularity!r}."
+                )
+        # Token-linear part (q lora+rope+norm, kv lora+rope+norm, output proj).
+        token_linear = fma * (
+            q_term
+            + kv_lora_rank * (hidden_size + num_heads * (qk_head_dim + v_head_dim) + 1)
+            + hidden_size * qk_pos_emb_head_dim
+            + (num_heads * v_head_dim) * hidden_size
+            + hidden_size * gate_projection_size
+        )
+        # Core attention (L^2) part: QK^T and (softmax(QK^T))V. /2 (causal) cancels *2 (FMA).
+        core = fma * (
+            num_heads * (qk_head_dim + qk_pos_emb_head_dim) / 2 + num_heads * v_head_dim / 2
+        )
+        return token_linear * total_tokens + core * seqlen_squared_sum
 
     def mamba_layer_flops(total_tokens, hidden_size, state_dim=16,
                           head_dim=64, num_groups=1, num_heads=128):
@@ -1370,9 +1442,11 @@ def num_floating_point_operations(
                                    mamba_num_groups, mamba_num_heads)
         )
         flops_fwd = (
-                num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
-                                                   hidden_size, num_attn_heads, gqa,
-                                                   gqa_groups, kv_channels) +
+                # Attention (plain '*' + MLA '+'), KDA and attention-residual terms,
+                # computed above with the correct per-variant estimates.
+                attn_flops_total +
+                kda_flops_total +
+                attn_res_flops_total +
                 num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size,
                                                  mlp_expansion, swiglu) +
                 num_mamba_layers * mamba_flops +
@@ -1746,11 +1820,16 @@ def num_floating_point_operations(
             Symbols,
             get_hybrid_layer_counts,
         )
+        layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
             itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
-                get_hybrid_layer_counts(args.hybrid_layer_pattern)
+                layer_counts
             )
         )
+        # MLA ('+') and KDA ('K') are counted separately so hybrid_flops can use the MLA and KDA
+        # per-layer FLOPs instead of the plain-attention estimate.
+        num_mla_layers = layer_counts[Symbols.MLA]
+        num_kda_layers = layer_counts[Symbols.KDA]
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
@@ -1761,6 +1840,8 @@ def num_floating_point_operations(
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
             num_attn_layers=num_attn_layers,
+            num_mla_layers=num_mla_layers,
+            num_kda_layers=num_kda_layers,
             num_mamba_layers=num_mamba_layers,
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
