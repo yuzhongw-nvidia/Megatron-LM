@@ -263,6 +263,18 @@ def roll_tensor(
     if tensor is None:
         return None, None
 
+    # Legacy single-knob CP: contiguous packed shards (cp_partition_mode="contiguous") are
+    # rolled on the contiguous-shard path even though the layout name stays "zigzag" (the
+    # attention module converts its own input). attention_cp_layout="contiguous" (dsv4)
+    # already selects the branch below; the default zigzag/zigzag case is unaffected.
+    if (
+        cp_layout != "contiguous"
+        and shifts == -1
+        and packed_seq_params is not None
+        and getattr(packed_seq_params, "cp_partition_mode", "zigzag") == "contiguous"
+    ):
+        cp_layout = "contiguous"
+
     if cp_layout == "contiguous":
         if shifts != -1:
             raise ValueError("Contiguous CP roll supports shifts=-1.")
@@ -573,6 +585,30 @@ def _packed_seq_params_for_local_hsm_roll(
     if cu_seqlens is None:
         return None
     padded = packed_seq_params.cu_seqlens_q_padded
+    if getattr(packed_seq_params, "cp_partition_mode", "zigzag") == "contiguous":
+        # Contiguous packed-THD CP: each rank owns one equal contiguous slice, so the local
+        # roll boundaries are the global boundaries clamped into this (CP x TP) shard window.
+        physical = cu_seqlens if padded is None else padded
+        cp_local_length = local_seq_length * get_pg_size(tp_group)
+        window_start = (
+            get_pg_rank(cp_group) * cp_local_length + get_pg_rank(tp_group) * local_seq_length
+        )
+        valid_ends = physical[:-1] + (cu_seqlens[1:] - cu_seqlens[:-1])
+        boundaries = torch.cat([physical, valid_ends]).sort().values.unique_consecutive()
+        shard_local = (
+            boundaries.clamp(window_start, window_start + local_seq_length) - window_start
+        )
+        return replace(
+            packed_seq_params,
+            cu_seqlens_q=shard_local,
+            cu_seqlens_kv=shard_local,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_kv_padded=None,
+            total_tokens=None,
+            seq_idx=None,
+            cp_group=None,
+            local_cp_size=None,
+        )
     if padded is not None and padded is not cu_seqlens:
         cp_size = get_pg_size(cp_group)
         cp_rank = get_pg_rank(cp_group)
@@ -1226,7 +1262,10 @@ def process_mtp_loss(
                 sequence_dim=0,
                 batch_dim=1,
             )
-        if config.attention_cp_layout == "contiguous":
+        if config.attention_cp_layout == "contiguous" or (
+            packed_seq_params is not None
+            and getattr(packed_seq_params, "cp_partition_mode", "zigzag") == "contiguous"
+        ):
             mtp_labels, loss_mask, mtp_input_mask = roll_contiguous_fields(
                 (mtp_labels, loss_mask, mtp_input_mask), cp_group, packed_seq_params
             )
@@ -1640,7 +1679,10 @@ class MultiTokenPredictionLayer(MegatronModule):
                 tensor_parallel_output_grad=False,
                 group=self.tp_group,
             ).transpose(0, 1)
-        if self.config.attention_cp_layout == "contiguous":
+        if self.config.attention_cp_layout == "contiguous" or (
+            packed_seq_params is not None
+            and getattr(packed_seq_params, "cp_partition_mode", "zigzag") == "contiguous"
+        ):
             input_ids, position_ids, padding_mask, mtp_input_mask = roll_contiguous_fields(
                 (input_ids, position_ids, padding_mask, mtp_input_mask),
                 self.cp_group,

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Literal, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import Tensor
 
 if TYPE_CHECKING:
@@ -48,6 +49,9 @@ class PackedSeqParams:
     total_tokens: int = None
     seq_idx: Tensor = None
     tokens_per_sample: int = None
+    # Whether packed THD sequences are padded between sub-sequences (contiguous CP
+    # slicing / THD alignment). Default None keeps the zigzag path unchanged.
+    pad_between_seqs: Optional[bool] = None
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     cp_partition_route: Optional["ThdCpRoute"] = None
     tp_cp_partition_route: Optional["ThdCpRoute"] = None
