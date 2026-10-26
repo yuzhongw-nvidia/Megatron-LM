@@ -11,6 +11,23 @@ the full model on 256 GB300 GPUs and 902 TFLOP/s/GPU for the 9L proxy on 64
 GPUs. A separate 9L 64K real-data check qualified the pure-a2a attention
 path; see the validation scope below.**
 
+## Known limitations on this main-based branch
+
+- **Context-parallel layout.** These recipes drive CP through the single-knob
+  `cp_partition_mode` (the attention module converts its own input to zigzag)
+  and deliberately leave `linear_cp_layout` unset, which keeps the legacy path
+  and lets Attention Residuals run with CP>1. Do not set `linear_cp_layout` /
+  `attention_cp_layout` here — doing so opts into the per-layer CP layout
+  manager, which is mutually exclusive with Attention Residuals.
+- **Chunked optimizer-state offload is not available yet.** The config fields
+  `chunked_optimizer_state_offload`, `optimizer_state_offload_chunk_size_mb` and
+  `optimizer_state_offload_fraction` exist, but this branch ships no CLI flags,
+  no `cpu_offloading/chunked_optimizer_state_offload.py` and no LayerWise hooks
+  for them, so they are omitted from the recipes above (fp32 master weights and
+  Muon momentum stay resident on device). The full-model 512K/1M memory budget
+  assumes this offload; carrying it is a follow-up before those runs fit without
+  it.
+
 ## Configurations
 
 | Recipe | GPUs | TP/PP/EP/CP/ETP | MBS/GBS/SL | MLA CP communication | Decoder blocks / HybridModel entries | AttnRes block entries |
