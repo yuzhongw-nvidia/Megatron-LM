@@ -1343,11 +1343,16 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
-    linear_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
-    """Context-parallel algorithm for recurrent and linear-attention layers."""
+    linear_cp_mode: Optional[Literal["headwise", "chunkwise"]] = None
+    """Context-parallel algorithm for recurrent and linear-attention layers. ``None``
+    resolves during normalization to ``"chunkwise"`` for GDN/KDA (and non-GDN2 hybrid)
+    stacks and ``"headwise"`` otherwise."""
 
-    linear_cp_layout: CPLayout = "zigzag"
-    """CP layout for linear-attention layers."""
+    linear_cp_layout: Optional[CPLayout] = None
+    """CP layout for linear-attention layers. ``None`` keeps the legacy single-knob
+    ``cp_partition_mode`` path (no per-layer CP layout manager; the attention module
+    converts its own input to zigzag). Set it explicitly to opt into the per-layer
+    context-parallel layout manager; it is normalized to ``"zigzag"`` afterwards."""
 
     attention_cp_layout: CPLayout = "zigzag"
     """CP layout for softmax-attention layers."""
@@ -1835,7 +1840,11 @@ class TransformerConfig(ModelParallelConfig):
 
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""
-        if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
+        if (
+            self.linear_cp_mode == "chunkwise"
+            and self.linear_cp_layout != "contiguous"
+            and self._linear_cp_layout_explicit
+        ):
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
         if (
             self.context_parallel_size > 1
@@ -1845,7 +1854,11 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
             )
-        if self.linear_cp_layout == "contiguous" and self.hybrid_context_parallel:
+        if (
+            self._linear_cp_layout_explicit
+            and self.linear_cp_layout == "contiguous"
+            and self.hybrid_context_parallel
+        ):
             raise ValueError(
                 "hybrid_context_parallel is not supported with linear_cp_layout='contiguous'."
             )
@@ -2075,6 +2088,33 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        # Reconcile the legacy single-knob CP layout (cp_partition_mode, where the
+        # attention module converts its own input to zigzag) with the per-layer CP
+        # layout manager added on main. A recipe that leaves linear_cp_layout unset
+        # (None) keeps the legacy path: no per-layer manager is built and the hybrid
+        # stack's boundary layout follows cp_partition_mode. Setting linear_cp_layout
+        # explicitly opts into the per-layer manager. DSv4 keeps main's per-layer path.
+        # Must run before _validate_cp_layouts() (and the GDN2/packing checks below),
+        # which read linear_cp_layout / linear_cp_mode and would misfire on a transient
+        # None. linear_cp_mode defaults to chunkwise for GDN/KDA (and non-GDN2 hybrid)
+        # stacks, matching dev's single-knob behavior; recipes may still set it.
+        if self.linear_cp_mode is None:
+            variant = self.experimental_attention_variant
+            self.linear_cp_mode = (
+                "headwise"
+                if self.moe_shortcut_connection
+                else (
+                    "chunkwise"
+                    if variant in ("gdn", "gated_delta_net", "kda")
+                    or (self.is_hybrid_model and variant != "gdn2")
+                    else "headwise"
+                )
+            )
+        self._linear_cp_layout_explicit = self.linear_cp_layout is not None
+        if self.experimental_attention_variant == "dsv4_hybrid":
+            self._linear_cp_layout_explicit = True
+        if self.linear_cp_layout is None:
+            self.linear_cp_layout = "zigzag"
         self._validate_cp_layouts()
 
         if self.attn_logit_softcapping is not None and not (
@@ -2435,6 +2475,13 @@ class TransformerConfig(ModelParallelConfig):
                 f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
             )
+            if (
+                self.experimental_attention_variant == "kda" or has_context_parallelism
+            ) and self.linear_cp_mode not in ("headwise", "chunkwise"):
+                raise ValueError(
+                    "linear_cp_mode must be either 'headwise' or 'chunkwise', "
+                    f"got {self.linear_cp_mode!r}."
+                )
 
             # Check tensor parallelism compatibility
             tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
