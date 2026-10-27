@@ -3688,6 +3688,49 @@ def dummy_train_step(data_iterator):
             )
 
 
+def _debug_install_gc_trace():
+    """DEBUG (local patch): log every garbage collection with the stack that triggered it.
+
+    With --manual-gc the interpreter's collector is disabled, so any collection seen here is an
+    explicit gc.collect() from library code (e.g. torch._dynamo's gc.collect(1) after a frame
+    compile). Rank 0 prints one line per collection: generation, objects collected, duration,
+    whether automatic gc is enabled, and the innermost frames of the caller.
+    """
+    import sys as _sys
+    import time as _time
+    import traceback as _traceback
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    state = {"n": 0, "t0": None}
+
+    def _cb(phase, info):
+        if phase == "start":
+            state["t0"] = _time.perf_counter()
+            return
+        state["n"] += 1
+        if rank != 0:
+            return
+        try:
+            stack = _traceback.extract_stack(_sys._getframe(1), limit=16)
+            desc = " < ".join(
+                f"{fr.filename.split('/')[-1]}:{fr.lineno}:{fr.name}" for fr in reversed(stack)
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            desc = f"<stack unavailable: {type(exc).__name__}>"
+        dt_ms = (_time.perf_counter() - state["t0"]) * 1e3 if state["t0"] else -1.0
+        print(
+            f"[rank 0] GC-TRACE #{state['n']} gen={info.get('generation')} "
+            f"collected={info.get('collected')} uncollectable={info.get('uncollectable')} "
+            f"{dt_ms:.1f} ms enabled={gc.isenabled()} | {desc}",
+            flush=True,
+        )
+
+    gc.callbacks.append(_cb)
+    if rank == 0:
+        print(f"[rank 0] GC-TRACE installed: enabled={gc.isenabled()} count={gc.get_count()} "
+              f"stats={gc.get_stats()}", flush=True)
+
+
 def _debug_report_gc_garbage(iteration):
     """DEBUG (local patch): force a collection and describe what pins the CUDA tensors in it.
 
@@ -3749,6 +3792,8 @@ def _debug_report_gc_garbage(iteration):
         except Exception:  # pylint: disable=broad-except
             return f"<unreadable {_type_name(obj)}>"
 
+    gc_state = (f"gc.isenabled()={gc.isenabled()} get_count()={gc.get_count()} "
+                f"get_stats()={gc.get_stats()}")
     gc.set_debug(gc.DEBUG_SAVEALL)
     n_unreachable = gc.collect()
     garbage = list(gc.garbage)
@@ -3769,7 +3814,7 @@ def _debug_report_gc_garbage(iteration):
         lines.append(
             f"[rank {rank}] DEBUG gc after iteration {iteration}: {n_unreachable} unreachable objects, "
             f"{len(tensors)} CUDA tensors ({len(unique)} unique storages, {total_gib:.2f} GiB); "
-            f"top types: {by_type.most_common(14)}"
+            f"top types: {by_type.most_common(14)}; {gc_state}"
         )
         # Objects that pin frames: exceptions (via __traceback__), tracebacks, suspended generators,
         # and frames themselves. These are what turn a finished call stack into a cycle.
@@ -5325,6 +5370,9 @@ def train(
         ), 'Manual garbage collection interval should be larger than or equal to 0'
         gc.disable()
         gc.collect()
+    # DEBUG (local patch): trace every collection that happens while manual gc is active.
+    if os.environ.get("MEGATRON_DEBUG_GC_TRACE"):
+        _debug_install_gc_trace()
 
     # Singleton initialization of straggler detector.
     if args.log_straggler:
