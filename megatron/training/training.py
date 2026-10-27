@@ -3720,6 +3720,130 @@ def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
     return samples_seen_in_iteration
 
 
+def _debug_report_gc_garbage(iteration):
+    """DEBUG (local patch): force a collection and describe the CUDA tensors it found unreachable.
+
+    gc.garbage can contain dead weakref proxies and other objects whose attribute access,
+    isinstance() or repr() raises, so every touch of a garbage object is guarded.
+    """
+    import collections
+    import types
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    def _safe(fn, default):
+        try:
+            return fn()
+        except Exception:  # pylint: disable=broad-except
+            return default
+
+    def _is(obj, cls):
+        return _safe(lambda: isinstance(obj, cls), False)
+
+    def _type_name(obj):
+        return _safe(lambda: type(obj).__name__, "<unreadable>")
+
+    def _nbytes(t):
+        return _safe(lambda: t.untyped_storage().nbytes(), 0)
+
+    def _is_cuda_tensor(o):
+        return _safe(lambda: isinstance(o, torch.Tensor) and o.is_cuda, False)
+
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    n_unreachable = gc.collect()
+    garbage = list(gc.garbage)
+    lines = []
+    try:
+        tensors = [o for o in garbage if _is_cuda_tensor(o)]
+        seen = set()
+        unique = []
+        for t in tensors:
+            key = _safe(lambda: (t.untyped_storage().data_ptr(), t.untyped_storage().nbytes()), None)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            unique.append(t)
+        total_gib = sum(k[1] for k in seen) / 2**30
+        by_type = collections.Counter(_type_name(o) for o in garbage)
+        ids = {id(o) for o in garbage}
+
+        def describe(obj):
+            try:
+                if isinstance(obj, types.FrameType):
+                    return (f"frame {obj.f_code.co_filename.split('/')[-1]}:{obj.f_lineno}:"
+                            f"{obj.f_code.co_name}")
+                if isinstance(obj, types.TracebackType):
+                    f = obj.tb_frame
+                    return (f"traceback@{f.f_code.co_filename.split('/')[-1]}:{obj.tb_lineno}:"
+                            f"{f.f_code.co_name}")
+                if isinstance(obj, dict):
+                    keys = [_safe(lambda k=k: str(k)[:40], "?") for k in list(obj.keys())[:6]]
+                    return f"dict(len={len(obj)}, keys={keys})"
+                if isinstance(obj, (list, tuple, set)):
+                    return f"{type(obj).__name__}(len={len(obj)})"
+                if isinstance(obj, types.FunctionType):
+                    return f"function {obj.__qualname__}"
+                if isinstance(obj, types.CellType):
+                    return "cell"
+                if isinstance(obj, torch.Tensor):
+                    return f"Tensor{tuple(obj.shape)}/{obj.dtype}"
+                if isinstance(obj, BaseException):
+                    return f"exception {type(obj).__name__}: {str(obj)[:80]}"
+                return type(obj).__name__
+            except Exception:  # pylint: disable=broad-except
+                return f"<unreadable {_type_name(obj)}>"
+
+        lines.append(
+            f"[rank {rank}] DEBUG gc after iteration {iteration}: {n_unreachable} unreachable objects, "
+            f"{len(tensors)} CUDA tensors ({len(unique)} unique storages, {total_gib:.2f} GiB); "
+            f"allocated before collect {before / 2**30:.2f} GiB; top types: {by_type.most_common(12)}"
+        )
+        for t in sorted(unique, key=lambda x: -_nbytes(x))[:12]:
+            try:
+                shape = _safe(lambda: tuple(t.shape), "?")
+                dtype = _safe(lambda: t.dtype, "?")
+                grad_fn = _safe(lambda: type(t.grad_fn).__name__ if t.grad_fn is not None else None, "?")
+                lines.append(f"  tensor {shape} {dtype} {_nbytes(t) / 2**20:.0f} MiB grad_fn={grad_fn}")
+                frontier = [t]
+                visited = {id(t)}
+                for depth in range(1, 4):
+                    nxt = []
+                    for obj in frontier:
+                        for r in _safe(lambda: gc.get_referrers(obj), []):
+                            if (id(r) in visited or r is garbage or r is tensors or r is unique
+                                    or r is frontier or r is nxt or r is lines):
+                                continue
+                            if _is(r, types.FrameType) and _safe(
+                                lambda: r.f_code.co_name == '_debug_report_gc_garbage', False
+                            ):
+                                continue
+                            visited.add(id(r))
+                            lines.append(f"    {'  ' * depth}<- {describe(r)}"
+                                         f"{' [in garbage]' if id(r) in ids else ''}")
+                            nxt.append(r)
+                            if len(nxt) >= 6:
+                                break
+                        if len(nxt) >= 6:
+                            break
+                    frontier = nxt
+            except Exception as chain_exc:  # pylint: disable=broad-except
+                lines.append(f"  <referrer walk failed: {type(chain_exc).__name__}: {chain_exc}>")
+    finally:
+        if rank == 0:
+            print("\n".join(lines), flush=True)
+        del garbage
+        gc.garbage.clear()
+        gc.set_debug(0)
+        gc.collect()
+        torch.cuda.synchronize()
+        after = torch.cuda.memory_allocated()
+        if rank == 0:
+            print(f"[rank {rank}] DEBUG gc after iteration {iteration}: allocated {before / 2**30:.2f} -> "
+                  f"{after / 2**30:.2f} GiB (freed {(before - after) / 2**30:.2f} GiB)", flush=True)
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None, p2p_communicator: Optional[P2PCommunicator] = None):
     """Single training step.
 
@@ -4981,6 +5105,17 @@ def post_training_step_callbacks(
         if cfg.train.manual_gc_interval != 0 and iteration % cfg.train.manual_gc_interval == 0:
             with _otel_managed_span('step', 'megatron.train.gc_collect', is_goodput_span=True):
                 gc.collect()
+    # DEBUG (local patch, not for commit): report what a forced gc.collect() frees after a
+    # chosen iteration, with referrer chains for the largest CUDA tensors in gc.garbage.
+    # Never let the diagnostic itself kill the run.
+    if os.environ.get("MEGATRON_DEBUG_GC_GARBAGE_ITER") and iteration == int(
+        os.environ["MEGATRON_DEBUG_GC_GARBAGE_ITER"]
+    ):
+        try:
+            _debug_report_gc_garbage(iteration)
+        except Exception as debug_exc:  # pylint: disable=broad-except
+            print(f"[rank {torch.distributed.get_rank()}] DEBUG gc report failed: "
+                  f"{type(debug_exc).__name__}: {debug_exc}", flush=True)
 
     # Return updated FLOPs accumulator so caller can persist the reset
     return num_floating_point_operations_since_last_log_event
