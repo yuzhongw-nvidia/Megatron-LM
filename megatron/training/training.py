@@ -4307,7 +4307,14 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        if args.calculate_per_token_loss:
+            # The tracker reduces raw loss sums and token counts into a per-token loss
+            # (sum(loss) / sum(tokens) over ranks and microbatches), matching the main loss.
+            mtp_loss_scale = 1.0
+        else:
+            # Legacy mode accumulates microbatch-normalized losses, so average by the
+            # scheduled microbatch count.
+            mtp_loss_scale = 1 / get_num_microbatches()
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
