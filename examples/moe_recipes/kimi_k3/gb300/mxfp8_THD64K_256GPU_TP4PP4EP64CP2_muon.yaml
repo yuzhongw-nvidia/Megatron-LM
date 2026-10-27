@@ -80,11 +80,9 @@ ARGS:
   attn_res_block_layers: 24
   normalization: RMSNorm
   norm_epsilon: 1.0e-05
-  # SiTU-GLU on main = silu + activation_func_tanh_clamp_scale (gate) /
-  # _linear (linear); dev situ_glu/situ_glu_beta1/2 do not exist on main.
-  swiglu: true
-  activation_func_tanh_clamp_scale: 4.0
-  activation_func_tanh_clamp_scale_linear: 25.0
+  situ_glu: true
+  situ_glu_beta1: 4.0
+  situ_glu_beta2: 25.0
   disable_bias_linear: true
   untie_embeddings_and_output_weights: true
   num_experts: 896
@@ -196,12 +194,10 @@ ARGS:
   optimizer_cpu_offload: false
   optimizer_offload_fraction: 0.0
   overlap_cpu_optimizer_d2h_h2d: false
-  # NOTE: chunked optimizer-state offload (chunked_optimizer_state_offload /
-  # optimizer_state_offload_chunk_size_mb / optimizer_state_offload_fraction) is not
-  # carried onto this based-on-main branch yet (the config fields exist but there are
-  # no CLI flags, no cpu_offloading/chunked_optimizer_state_offload.py, and no
-  # LayerWise hooks). Full-model 512K/1M optimizer-state memory offload is out of
-  # scope here; re-add these keys once the offload path is carried.
+  # Run optimizer computation on GPU; offload states in bounded chunks.
+  chunked_optimizer_state_offload: true
+  optimizer_state_offload_chunk_size_mb: 256
+  optimizer_state_offload_fraction: 1.0
   overlap_grad_reduce: true
   overlap_param_gather: true
   no_create_attention_mask_in_dataloader: true

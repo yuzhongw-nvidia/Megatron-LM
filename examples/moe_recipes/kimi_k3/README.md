@@ -19,14 +19,6 @@ path; see the validation scope below.**
   and lets Attention Residuals run with CP>1. Do not set `linear_cp_layout` /
   `attention_cp_layout` here — doing so opts into the per-layer CP layout
   manager, which is mutually exclusive with Attention Residuals.
-- **Chunked optimizer-state offload is not available yet.** The config fields
-  `chunked_optimizer_state_offload`, `optimizer_state_offload_chunk_size_mb` and
-  `optimizer_state_offload_fraction` exist, but this branch ships no CLI flags,
-  no `cpu_offloading/chunked_optimizer_state_offload.py` and no LayerWise hooks
-  for them, so they are omitted from the recipes above (fp32 master weights and
-  Muon momentum stay resident on device). The full-model 512K/1M memory budget
-  assumes this offload; carrying it is a follow-up before those runs fit without
-  it.
 
 ## Configurations
 
