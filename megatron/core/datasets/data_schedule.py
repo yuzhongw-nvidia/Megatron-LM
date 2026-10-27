@@ -789,10 +789,10 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # data_iterator should return a batch including the following keys.
     batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen']
-    if is_first_stage:
+    if is_first_stage or mtp_on_this_rank:
         batch_keys.append('tokens')
         batch_keys.append('position_ids')
-    if is_last_stage:
+    if is_last_stage or mtp_on_this_rank:
         batch_keys.append('labels')
         batch_keys.append('loss_mask')
 
@@ -876,7 +876,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     # TE path; "contiguous" splits the (optionally padded) rows into equal per-rank blocks.
     if is_tp_rank_0:
         cp_slice_keys = ['padding_mask']
-        if is_first_or_last_stage:
+        if is_first_or_last_stage or mtp_on_this_rank:
             cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
         if non_dummy_global_target_len is not None:
             partition_total_tokens = non_dummy_global_target_len
@@ -901,7 +901,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     )
     cu_seqlen_size, total_tokens = broadcast_scalars(shapes, tp_group, dev, dtype=torch.int32)
 
-    # Step1: Prepare "tokens", "position_ids" on all ranks.
+    # Step1: Prepare "tokens", "position_ids" for the first stage and MTP stages on all TP ranks.
     if is_first_stage or mtp_on_this_rank:
         if is_tp_rank_0:
             assert batch['tokens'].dtype == torch.int64
@@ -912,12 +912,12 @@ def get_batch_on_this_rank_for_sequence_packing(
             batch['tokens'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
             batch['position_ids'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
     else:
-        # Non first stage rank doesn't need tokens and position_ids.
+        # Ranks without the embedding or MTP layers don't need tokens and position_ids.
         batch['tokens'] = None
         batch['position_ids'] = None
 
-    # Step2: Prepare "labels", "loss_mask" on all ranks.
-    if is_last_stage:
+    # Step2: Prepare "labels", "loss_mask" for the last stage and MTP stages on all TP ranks.
+    if is_last_stage or mtp_on_this_rank:
         if is_tp_rank_0:
             assert batch['labels'].dtype == torch.int64
             assert batch['loss_mask'].dtype == torch.float32
@@ -927,7 +927,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             batch['labels'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
             batch['loss_mask'] = torch.empty([1, total_tokens], dtype=torch.float32, device=dev)
     else:
-        # Non last stage rank doesn't need labels and loss_mask.
+        # Ranks without the loss head or MTP layers don't need labels and loss_mask.
         batch['labels'] = None
         batch['loss_mask'] = None
 
