@@ -1138,11 +1138,12 @@ class TopKRouter(Router):
                 and torch.is_grad_enabled()
                 and not self.frozen_expert_bias
             )
-            if accumulate_qb_histogram and padding_mask is not None:
-                raise RuntimeError(
-                    "Quantile Balancing does not yet support padding masks because the "
-                    "histogram APIs do not accept a valid-token mask."
-                )
+            # Padded packed-sequence slots carry no real tokens, so they stay out of the
+            # K3 Quantile Balancing margin histogram (padded SBHD validation has no mask
+            # and keeps counting its padded positions, as before).
+            qb_valid_mask = (
+                ~padding_mask if accumulate_qb_histogram and padding_mask is not None else None
+            )
             # TE capability controls the implementation, not the requested output format. The fused
             # TE kernel does not accumulate the QB histogram, so histogram QB forces the unfused path.
             fused = (
@@ -1172,6 +1173,7 @@ class TopKRouter(Router):
                 dense_output=dense_output and not fused,
                 qb_histogram=self.qb_histogram if accumulate_qb_histogram else None,
                 qb_bin_bounds=self.qb_bin_bounds if accumulate_qb_histogram else None,
+                qb_valid_mask=qb_valid_mask,
             )
             if self.config.moe_virtual_expert_load_balance and fused:
                 # TE returns compact IDs but full-width probabilities; normalize the pair.
