@@ -3688,6 +3688,157 @@ def dummy_train_step(data_iterator):
             )
 
 
+def _debug_report_gc_garbage(iteration):
+    """DEBUG (local patch): force a collection and describe what pins the CUDA tensors in it.
+
+    gc.garbage can contain dead weakref proxies and other objects whose attribute access,
+    isinstance() or repr() raises, so every touch of a garbage object is guarded.
+    """
+    import collections
+    import types
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+    def _safe(fn, default):
+        try:
+            return fn()
+        except Exception:  # pylint: disable=broad-except
+            return default
+
+    def _is(obj, cls):
+        return _safe(lambda: isinstance(obj, cls), False)
+
+    def _type_name(obj):
+        return _safe(lambda: type(obj).__name__, "<unreadable>")
+
+    def _nbytes(t):
+        return _safe(lambda: t.untyped_storage().nbytes(), 0)
+
+    def _is_cuda_tensor(o):
+        return _safe(lambda: isinstance(o, torch.Tensor) and o.is_cuda, False)
+
+    def _frame_desc(f):
+        return _safe(
+            lambda: f"{f.f_code.co_filename.split('/')[-1]}:{f.f_lineno}:{f.f_code.co_name}", "?"
+        )
+
+    def describe(obj):
+        try:
+            if isinstance(obj, types.FrameType):
+                return f"frame {_frame_desc(obj)}"
+            if isinstance(obj, types.TracebackType):
+                return f"traceback@{_frame_desc(obj.tb_frame)}"
+            if isinstance(obj, types.GeneratorType):
+                return f"generator {obj.gi_code.co_name} (running={obj.gi_running}, frame={_frame_desc(obj.gi_frame) if obj.gi_frame else None})"
+            if isinstance(obj, dict):
+                keys = [_safe(lambda k=k: str(k)[:40], "?") for k in list(obj.keys())[:6]]
+                return f"dict(len={len(obj)}, keys={keys})"
+            if isinstance(obj, (list, tuple, set)):
+                return f"{type(obj).__name__}(len={len(obj)})"
+            if isinstance(obj, types.FunctionType):
+                return f"function {obj.__qualname__}"
+            if isinstance(obj, types.MethodType):
+                return f"method {obj.__qualname__} of {_type_name(obj.__self__)}"
+            if isinstance(obj, types.CellType):
+                return f"cell({_type_name(_safe(lambda: obj.cell_contents, None))})"
+            if isinstance(obj, torch.Tensor):
+                return f"Tensor{tuple(obj.shape)}/{obj.dtype}"
+            if isinstance(obj, BaseException):
+                return f"exception {type(obj).__name__}: {str(obj)[:100]}"
+            return type(obj).__name__
+        except Exception:  # pylint: disable=broad-except
+            return f"<unreadable {_type_name(obj)}>"
+
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    n_unreachable = gc.collect()
+    garbage = list(gc.garbage)
+    lines = []
+    try:
+        tensors = [o for o in garbage if _is_cuda_tensor(o)]
+        seen = set()
+        unique = []
+        for t in tensors:
+            key = _safe(lambda: (t.untyped_storage().data_ptr(), t.untyped_storage().nbytes()), None)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            unique.append(t)
+        total_gib = sum(k[1] for k in seen) / 2**30
+        by_type = collections.Counter(_type_name(o) for o in garbage)
+        ids = {id(o) for o in garbage}
+        lines.append(
+            f"[rank {rank}] DEBUG gc after iteration {iteration}: {n_unreachable} unreachable objects, "
+            f"{len(tensors)} CUDA tensors ({len(unique)} unique storages, {total_gib:.2f} GiB); "
+            f"top types: {by_type.most_common(14)}"
+        )
+        # Objects that pin frames: exceptions (via __traceback__), tracebacks, suspended generators,
+        # and frames themselves. These are what turn a finished call stack into a cycle.
+        excs = [o for o in garbage if _is(o, BaseException)]
+        tbs = [o for o in garbage if _is(o, types.TracebackType)]
+        gens = [o for o in garbage if _is(o, types.GeneratorType)]
+        frames = [o for o in garbage if _is(o, types.FrameType)]
+        lines.append(f"  pinning objects in garbage: {len(excs)} exceptions, {len(tbs)} tracebacks, "
+                     f"{len(gens)} generators, {len(frames)} frames")
+        for e in excs[:8]:
+            chain = []
+            tb = _safe(lambda: e.__traceback__, None)
+            hops = 0
+            while tb is not None and hops < 12:
+                chain.append(_frame_desc(_safe(lambda: tb.tb_frame, None)))
+                tb = _safe(lambda: tb.tb_next, None)
+                hops += 1
+            lines.append(f"    {describe(e)} | traceback: {' > '.join(chain)}")
+            # who holds the exception?
+            for r in _safe(lambda: gc.get_referrers(e), [])[:6]:
+                if r is garbage or r is excs:
+                    continue
+                lines.append(f"      held by {describe(r)}{' [in garbage]' if id(r) in ids else ''}")
+        for g in gens[:8]:
+            lines.append(f"    {describe(g)}")
+        frame_names = collections.Counter(_frame_desc(f) for f in frames)
+        lines.append(f"  frames in garbage (top 25): {frame_names.most_common(25)}")
+        for t in sorted(unique, key=lambda x: -_nbytes(x))[:10]:
+            try:
+                shape = _safe(lambda: tuple(t.shape), "?")
+                dtype = _safe(lambda: t.dtype, "?")
+                grad_fn = _safe(lambda: type(t.grad_fn).__name__ if t.grad_fn is not None else None, "?")
+                lines.append(f"  tensor {shape} {dtype} {_nbytes(t) / 2**20:.0f} MiB grad_fn={grad_fn}")
+                frontier = [t]
+                visited = {id(t)}
+                for depth in range(1, 4):
+                    nxt = []
+                    for obj in frontier:
+                        for r in _safe(lambda: gc.get_referrers(obj), []):
+                            if (id(r) in visited or r is garbage or r is tensors or r is unique
+                                    or r is frontier or r is nxt or r is lines):
+                                continue
+                            if _is(r, types.FrameType) and _safe(
+                                lambda: r.f_code.co_name == '_debug_report_gc_garbage', False
+                            ):
+                                continue
+                            visited.add(id(r))
+                            extra = ""
+                            if _is(r, types.FrameType):
+                                # which local variable names point at the object
+                                names = _safe(lambda: [k for k, v in r.f_locals.items() if v is obj][:4], [])
+                                extra = f" locals={names}"
+                            lines.append(f"    {'  ' * depth}<- {describe(r)}{extra}"
+                                         f"{' [in garbage]' if id(r) in ids else ''}")
+                            nxt.append(r)
+                            if len(nxt) >= 6:
+                                break
+                        if len(nxt) >= 6:
+                            break
+                    frontier = nxt
+            except Exception as chain_exc:  # pylint: disable=broad-except
+                lines.append(f"  <referrer walk failed: {type(chain_exc).__name__}: {chain_exc}>")
+    finally:
+        if rank == 0:
+            print("\n".join(lines), flush=True)
+        gc.garbage.clear()
+        gc.set_debug(0)
+
+
 def train_step(
     forward_step_func,
     data_iterator,
@@ -4789,6 +4940,28 @@ def post_training_step_callbacks(
     if args.manual_gc:
         if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
             gc.collect()
+    # DEBUG (local patch, not for commit): report what a forced gc.collect() frees after a
+    # chosen iteration (gc.garbage contents, exceptions/tracebacks/generators that pin frames,
+    # referrer chains of the largest CUDA tensors). The freed amount is measured here, after the
+    # report function and all of its locals are gone.
+    if os.environ.get("MEGATRON_DEBUG_GC_GARBAGE_ITER") and iteration == int(
+        os.environ["MEGATRON_DEBUG_GC_GARBAGE_ITER"]
+    ):
+        _dbg_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        torch.cuda.synchronize()
+        _dbg_before = torch.cuda.memory_allocated()
+        try:
+            _debug_report_gc_garbage(iteration)
+        except Exception as debug_exc:  # pylint: disable=broad-except
+            print(f"[rank {_dbg_rank}] DEBUG gc report failed: {type(debug_exc).__name__}: {debug_exc}",
+                  flush=True)
+        gc.collect()
+        torch.cuda.synchronize()
+        _dbg_after = torch.cuda.memory_allocated()
+        if _dbg_rank == 0:
+            print(f"[rank {_dbg_rank}] DEBUG gc after iteration {iteration}: allocated "
+                  f"{_dbg_before / 2**30:.2f} -> {_dbg_after / 2**30:.2f} GiB "
+                  f"(freed {(_dbg_before - _dbg_after) / 2**30:.2f} GiB)", flush=True)
 
     # Return updated FLOPs accumulator so caller can persist the reset
     return num_floating_point_operations_since_last_log_event
