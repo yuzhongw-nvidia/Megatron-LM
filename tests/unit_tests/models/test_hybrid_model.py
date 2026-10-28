@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from datetime import timedelta
@@ -55,6 +55,98 @@ def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tenso
     don't ship the upstream library.
     """
     return x * scale
+
+
+def _is_dataclass_instance(value):
+    return dataclasses.is_dataclass(value) and not isinstance(value, type)
+
+
+def _assert_equal_with_partial_contents(left, right, path="root"):
+    """Assert recursive equality while comparing `partial` objects structurally."""
+    if isinstance(left, functools.partial) or isinstance(right, functools.partial):
+        assert isinstance(left, functools.partial), f"{path}: left is not `partial`"
+        assert isinstance(right, functools.partial), f"{path}: right is not `partial`"
+        _assert_equal_with_partial_contents(left.func, right.func, f"{path}.func")
+        _assert_equal_with_partial_contents(left.args, right.args, f"{path}.args")
+        _assert_equal_with_partial_contents(
+            left.keywords or {}, right.keywords or {}, f"{path}.keywords"
+        )
+        return
+
+    if _is_dataclass_instance(left) or _is_dataclass_instance(right):
+        assert _is_dataclass_instance(left), f"{path}: left is not a dataclass"
+        assert _is_dataclass_instance(right), f"{path}: right is not a dataclass"
+        assert type(left) is type(right), f"{path}: dataclass types differ"
+        for field in dataclasses.fields(left):
+            if field.compare:
+                _assert_equal_with_partial_contents(
+                    getattr(left, field.name), getattr(right, field.name), f"{path}.{field.name}"
+                )
+        return
+
+    if isinstance(left, dict) or isinstance(right, dict):
+        assert isinstance(left, dict), f"{path}: left is not a dict"
+        assert isinstance(right, dict), f"{path}: right is not a dict"
+        assert left.keys() == right.keys(), f"{path}: dict keys differ"
+        for key in left:
+            _assert_equal_with_partial_contents(left[key], right[key], f"{path}[{key!r}]")
+        return
+
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        assert type(left) is type(right), f"{path}: sequence types differ"
+        assert len(left) == len(right), f"{path}: sequence lengths differ"
+        for index, (left_item, right_item) in enumerate(zip(left, right)):
+            _assert_equal_with_partial_contents(left_item, right_item, f"{path}[{index}]")
+        return
+
+    assert left == right, f"{path}: values differ"
+
+
+class _DummyHybridLayer(MegatronModule):
+    """Minimal same-shape layer used to test HybridModel/mHC plumbing."""
+
+    supports_strict_runtime_validation = True
+
+    def __init__(self, config: TransformerConfig, layer_number: int, **_kwargs):
+        super().__init__(config=config)
+        self.layer_number = layer_number
+        self.proj = torch.nn.Linear(
+            config.hidden_size, config.hidden_size, bias=False, dtype=config.params_dtype
+        )
+        self.seen_hidden_shapes = []
+        self.seen_strict_runtime_validation = []
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        inference_context=None,
+        packed_seq_params=None,
+        **_kwargs,
+    ):
+        self.seen_hidden_shapes.append(tuple(hidden_states.shape))
+        if "strict_runtime_validation" in _kwargs:
+            self.seen_strict_runtime_validation.append(_kwargs["strict_runtime_validation"])
+
+        return hidden_states + 0.125 * self.proj(hidden_states)
+
+
+def _get_dummy_hybrid_stack_spec() -> ModuleSpec:
+    """Build a HybridStack spec whose layer symbols all resolve to dummy layers."""
+    dummy_layer_spec = ModuleSpec(module=_DummyHybridLayer)
+    return ModuleSpec(
+        module=HybridStack,
+        params={"post_layer_norm": False},
+        submodules=HybridStackSubmodules(
+            mamba_layer=dummy_layer_spec,
+            gdn_layer=dummy_layer_spec,
+            kda_layer=dummy_layer_spec,
+            attention_layer=dummy_layer_spec,
+            dsa_layer=dummy_layer_spec,
+            mlp_layer=dummy_layer_spec,
+            moe_layer=dummy_layer_spec,
+        ),
+    )
 
 
 def test_hybrid_logging_process_groups_are_paired():
@@ -439,6 +531,78 @@ class TestHybridModel:
         assert self.model.mtp.mtp_input_mask is mtp_input_mask
         assert captured_loss_args["mtp_input_mask"] is mtp_input_mask
         assert captured_loss_args["metric_avg_group"] is self.model.pg_collection.dp_cp
+
+    @pytest.mark.parametrize(
+        "frequency, expected",
+        [
+            ("always", [True, True, True, True]),
+            ("once_per_microbatch", [True, False, True, False]),
+            ("never", [False, False, False, False]),
+        ],
+    )
+    def test_hybrid_runtime_validation_frequency(self, frequency, expected):
+        config_kwargs = dict(
+            num_layers=4,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            strict_runtime_validation_frequency=frequency,
+        )
+        if frequency == "never":
+            with pytest.warns(UserWarning, match="Strict runtime validation is disabled"):
+                model_config = TransformerConfig(**config_kwargs)
+        else:
+            model_config = TransformerConfig(**config_kwargs)
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=_get_dummy_hybrid_stack_spec(),
+            vocab_size=64,
+            max_sequence_length=8,
+            hybrid_layer_pattern="GGKK",
+            parallel_output=False,
+        )
+        decoder = model.decoder.cuda()
+        hidden_states = torch.randn(8, 2, model_config.hidden_size, device="cuda")
+
+        decoder(hidden_states, attention_mask=None)
+        decoder(hidden_states, attention_mask=None)
+
+        assert [layer.seen_strict_runtime_validation[0] for layer in decoder.layers] == expected
+        assert [layer.seen_strict_runtime_validation[1] for layer in decoder.layers] == expected
+
+    def test_hybrid_runtime_validation_is_not_repeated_during_recompute(self):
+        model_config = TransformerConfig(
+            num_layers=4,
+            hidden_size=32,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            strict_runtime_validation_frequency="once_per_microbatch",
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=4,
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=_get_dummy_hybrid_stack_spec(),
+            vocab_size=64,
+            max_sequence_length=8,
+            hybrid_layer_pattern="GGKK",
+            parallel_output=False,
+        )
+        decoder = model.decoder.cuda()
+        hidden_states = torch.randn(
+            8, 2, model_config.hidden_size, device="cuda", requires_grad=True
+        )
+
+        decoder(hidden_states, attention_mask=None).sum().backward()
+
+        assert [layer.seen_strict_runtime_validation for layer in decoder.layers] == [
+            [True, False],
+            [False, False],
+            [True, False],
+            [False, False],
+        ]
 
     def test_set_input_tensor(self):
         config: TransformerConfig = self.model.config

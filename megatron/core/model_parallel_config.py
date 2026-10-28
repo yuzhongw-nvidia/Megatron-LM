@@ -2,7 +2,7 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, ContextManager, Literal, Optional
+from typing import Callable, ContextManager, Literal, Optional, Union
 
 import torch
 
@@ -44,6 +44,21 @@ def resolve_tensor_parallel_weight_shards(
             )
         gtp_weight_remat_size = tensor_parallel_num_weight_shards // tp
     return tensor_parallel_num_weight_shards, gtp_weight_remat_size
+
+
+def _parse_pad_packed_seq_alignment(value):
+    """Parse THD packed-sequence padding alignment.
+
+    Accepts ``"max"`` or a positive integer alignment.
+    """
+    if value == "max":
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "pad_packed_seq_alignment must be 'max' or a positive integer alignment."
+        ) from exc
 
 
 @dataclass
@@ -280,6 +295,16 @@ class ModelParallelConfig:
     """If true, code that has deterministic execution will be chosen. This usually
        means slower execution, but is good for debugging and testing. Defaults to False."""
 
+    strict_runtime_validation_frequency: Literal["never", "once_per_microbatch", "always"] = (
+        "always"
+    )
+    """Controls how often supported modules run strict runtime validation.
+
+    ``always`` preserves the default behavior. ``once_per_microbatch`` validates the first
+    instance of each supported layer type in every microbatch. ``never`` skips these checks and
+    may allow invalid runtime inputs to produce incorrect results.
+    """
+
     enable_autocast: bool = False
     """If true runs the forward step function inside torch.autocast context."""
 
@@ -426,6 +451,10 @@ class ModelParallelConfig:
     ###################
     pipeline_dtype: torch.dtype = None
     """dtype used in p2p communication, usually params_dtype"""
+
+    pipeline_p2p_fixed_shape: bool = False
+    """Skip the pipeline-parallel per-microbatch shape exchange when packed tensors are padded to a
+    fixed local size (e.g. pad_packed_seq_alignment='max'), avoiding the variable-shape handshake."""
 
     variable_seq_lengths: bool = False
     """Support for variable sequence lengths across microbatches. Setting this communicates the size
