@@ -43,6 +43,7 @@ from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
+    from fla.ops.cp import build_cp_context
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     HAVE_FLA = True
@@ -50,6 +51,7 @@ except ImportError:
     causal_conv1d = None
     l2norm = None
     chunk_gated_delta_rule = None
+    build_cp_context = None
 
     HAVE_FLA = False
 
@@ -156,7 +158,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         is_mtp_layer: bool = False,
         name: str | None = None,
         cp_comm_type: str | None = None,
-        pp_layer_offset: int = 0,
+        pp_layer_offset: Optional[int] = None,
     ):
         """
         Args:
@@ -178,7 +180,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 than the attention CP communication schemes.
             pp_layer_offset: Offset of this pipeline stage's first global layer.
         """
-        del is_mtp_layer
+        self.is_mtp_layer = is_mtp_layer
         if not HAVE_FLA:
             raise ImportError(
                 "FLA is not installed. Please install it with "
@@ -189,7 +191,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         # Attributes from arguments
         self.layer_number = layer_number
-        self.pp_layer_offset = pp_layer_offset
+        self._pp_layer_offset = pp_layer_offset
+        self.pp_layer_offset = 0 if pp_layer_offset is None else pp_layer_offset
         self.bias = bias
         self.conv_bias = conv_bias
         self.conv_init = conv_init
@@ -206,7 +209,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         # Attributes from config
         self.config = config
         self.hidden_size = config.hidden_size
-        self.act_fn = config.activation_func
+        # GDN-family convolution and output gates use SiLU independently of the FFN activation.
+        self.act_fn = nn.functional.silu
         self.activation = self.act_fn.__name__
         self.conv_kernel_dim = config.linear_conv_kernel_dim
         self.key_head_dim = config.linear_key_head_dim
@@ -227,15 +231,18 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             "in_proj_extra_dim",
             "in_proj_split_names",
             "in_proj_split_sections",
-            "feat_dim_split",
             "gated_delta_rule",
         )
         self._setup_variant_attrs()
         for attr in attrs_to_check:
-            assert getattr(self, attr, None) is not None, f"Attribute {attr} for GDN is not set"
-        # QK, V, gate, shared across all variants
+            assert hasattr(self, attr), f"Attribute {attr} for the GDN-family variant is not set"
+            assert (
+                getattr(self, attr) is not None
+            ), f"Attribute {attr} for the GDN-family variant is not set"
+        # Shared q, k, v, output-gate width; the full input projection width also carries
+        # variant-specific gate features and is resolved through the variant hook.
         self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
-        self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
+        self.in_proj_dim = self._get_in_proj_dim()
 
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
@@ -278,9 +285,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             setattr(self.conv1d.bias, "tensor_model_parallel", True)
             setattr(self.conv1d.bias, "partition_dim", 0)
 
+        gate_params_dtype = getattr(self, "gate_params_dtype", self.config.params_dtype)
         self.dt_bias = nn.Parameter(
             torch.empty(
-                self.dt_bias_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.dt_bias_dim, dtype=gate_params_dtype, device=torch.cuda.current_device()
             )
         )
         setattr(self.dt_bias, "tensor_model_parallel", True)
@@ -288,7 +296,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         self.A_log = nn.Parameter(
             torch.empty(
-                self.a_log_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.a_log_dim, dtype=gate_params_dtype, device=torch.cuda.current_device()
             )
         )
         setattr(self.A_log, "tensor_model_parallel", True)
@@ -303,8 +311,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         )
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
-        if self.config.recompute_granularity == "selective":
+        self.recompute_gdn = False
+        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_gdn = "gdn" in self.config.recompute_modules
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -323,8 +333,23 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.reset_parameters()
 
     def supports_two_stage_attention(self) -> bool:
-        """Output-norm recomputation requires the original atomic forward path."""
-        return not self.recompute_norm_out
+        """Use the split path only when the variant exposes a compatible static stage.
+
+        GDN-family recompute (``recompute_gdn``), dynamic CP, non-head-wise CP and the
+        channel-wise KDA variant (which does not override
+        ``forward_pre_attn_and_core_attn``) all require the original atomic forward path,
+        so the two-stage split must be disabled for them. Keeping only
+        ``not self.recompute_norm_out`` here silently routes recompute-GDN/KDA layers
+        through the generic two-stage path and perturbs their numerics.
+        """
+        return (
+            not self.recompute_norm_out
+            and not self.recompute_gdn
+            and not self.config.dynamic_context_parallel
+            and (self.config.linear_cp_mode == "headwise" or self.cp_size == 1)
+            and type(self).forward_pre_attn_and_core_attn
+            is not TwoStageAttentionLayer.forward_pre_attn_and_core_attn
+        )
 
     def forward_post_core_attn(
         self, norm_out: torch.Tensor
@@ -338,6 +363,17 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
+
+    def _get_in_proj_dim(self) -> int:
+        """Return the fused input-projection width for this GDN-family variant.
+
+        The shared GDN layout contains Q, K, V, the output gate, and any
+        variant-specific gate features. Variants with separately parameterized
+        projections can override this hook without encoding a negative
+        ``in_proj_extra_dim``.
+        """
+
+        return self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
 
     def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.
@@ -449,6 +485,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         batch: int,
         seq_len: int,
         *gate_feats: tuple[torch.Tensor],
+        cp_size_headwise: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Prepare all gated delta rule kernel inputs.
@@ -462,10 +499,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
+        cp_size = self.cp_size if cp_size_headwise is None else cp_size_headwise
+
         # Split qkv into query_key and value
         query_key, value = torch.split(
             qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
+            [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size],
             dim=-1,
         )
 
@@ -479,7 +518,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             query_key = normalize(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
@@ -636,6 +675,32 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         return sharded_state_dict
 
+    def _projections_reading_hidden_states(self) -> list[nn.Module]:
+        """Linear projections whose input is the layer's hidden states.
+
+        These modules consume the input-layernorm output directly; variants with additional
+        projections (KDA) extend the list.
+        """
+        return [self.in_proj]
+
+    def set_for_recompute_input_layernorm(self) -> None:
+        """Prepare the layer for recomputing the input layernorm (needed under FP8/FP4).
+
+        With "layernorm" in ``recompute_modules`` the TransformerLayer discards the
+        input-layernorm output after the forward and recomputes it in the backward. Under
+        FP8/FP4 the Transformer Engine linears would otherwise keep their own quantized copy of
+        that output, so every projection that reads the hidden states is told to save its
+        original input instead (mirrors ``SelfAttention.set_for_recompute_input_layernorm``).
+        Projections that fuse the normalization themselves (a TE LayerNormLinear in_proj, the
+        default for GatedDeltaNet) read the residual stream rather than a separate layernorm
+        output and have no ``save_original_input`` switch; they are left alone.
+        """
+        from megatron.core.extensions.transformer_engine import set_save_original_input
+
+        for module in self._projections_reading_hidden_states():
+            if hasattr(module, "save_original_input"):
+                set_save_original_input(module)
+
     def backward_dw(self):
         """Execute weight gradient computation for all linear layers."""
         self._backward_in_proj()
@@ -732,12 +797,14 @@ def get_parameter_local_cp(
         torch.Tensor: The local parameter for the current context parallel rank.
     """
 
-    cp_size = cp_group.size()
-    cp_rank = cp_group.rank()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to split if CP size is 1.
     if cp_size == 1:
         return param
+
+    assert cp_group is not None
+    cp_rank = cp_group.rank()
 
     # Split first if needed.
     if split_sections is not None:
@@ -781,11 +848,13 @@ def tensor_a2a_cp2hp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
         return tensor
+
+    assert cp_group is not None
 
     # Limitations of mamba_context_parallel._all_to_all_cp2hp.
     assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
@@ -844,11 +913,13 @@ def tensor_a2a_hp2cp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
         return tensor
+
+    assert cp_group is not None
 
     # Limitations of mamba_context_parallel._all_to_all_hp2cp.
     assert seq_dim == 0, f"tensor_a2a_hp2cp only supports seq_dim == 0 for now, but got {seq_dim=}"
