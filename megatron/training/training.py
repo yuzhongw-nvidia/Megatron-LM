@@ -1227,6 +1227,64 @@ def num_floating_point_operations(
         core_flops = 2 * total_tokens * state_update_flops
         return non_core_flops + core_flops
 
+    def attention_residual_flops(
+        total_tokens,
+        hidden_size,
+        num_layers,
+        block_layers,
+        transformer_layer_layout=False,
+        mtp_num_layers=0,
+        mtp_num_sublayers=2,
+    ):
+        """Calculate forward-equivalent FLOPs for Attention Residual aggregations.
+
+        The FLOPs estimator follows the same convention as core attention: it
+        counts the two hidden-width contractions for every depth
+        source (query-key scoring and weighted value accumulation), with the
+        FMA factor baked in. RMSNorm and depth softmax are omitted by convention,
+        like the softmax in ``attn_layer_flops``. This is a nominal model-FLOPs
+        estimate, independent of backend fusion or the single-source identity
+        shortcut. The caller adds the global forward/backward factor.
+
+        ``block_layers`` counts Transformer layers in the standard GPT layout,
+        where each layer has attention and MLP aggregations. In the hybrid
+        layout it counts pattern entries, each of which has one aggregation.
+        ``num_layers`` counts only the trunk. Each MTP depth has
+        ``mtp_num_sublayers`` aggregations plus its own output aggregation.
+        """
+        if not isinstance(block_layers, int) or isinstance(block_layers, bool) or block_layers < 1:
+            raise ValueError(
+                "Attention Residual FLOPs require attn_res_block_layers to be a "
+                f"positive integer, got {block_layers!r}."
+            )
+
+        total_source_arity = 0
+        for layer_number in range(1, num_layers + 1):
+            completed_sources = (layer_number - 1) // block_layers + 1
+            is_block_start = (layer_number - 1) % block_layers == 0
+
+            # A block-start aggregation consumes completed block sources only;
+            # all other aggregations also consume the running partial block.
+            total_source_arity += completed_sources + (not is_block_start)
+            if transformer_layer_layout:
+                # The MLP aggregation always follows the attention output, so a
+                # non-empty running partial block is present at every layer.
+                total_source_arity += completed_sources + 1
+
+        # The trunk output aggregates every completed source and its trailing
+        # partial block before the final norm.
+        final_source_arity = (num_layers - 1) // block_layers + 2
+        total_source_arity += final_source_arity
+
+        # Every MTP aggregation sees the fixed trunk history plus that depth's
+        # fresh partial. MTP entries never open new residual blocks, even when
+        # their count exceeds block_layers. GPT has two sublayers per depth;
+        # hybrid MTP has one per nested pattern entry. Both add an output head.
+        total_source_arity += mtp_num_layers * (mtp_num_sublayers + 1) * (final_source_arity + 1)
+
+        # Two contractions per source, each counted as one multiply-add.
+        return 4 * total_tokens * hidden_size * total_source_arity
+
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
                      num_dsa_layers, gdp_num_householder,
@@ -1245,8 +1303,23 @@ def num_floating_point_operations(
                      kda_qk_head_dim=128, kda_v_head_dim=128,
                      kda_num_qk_heads=16, kda_num_v_heads=16,
                      kda_conv_kernel_dim=4, kda_f_lora_rank=None, kda_gate_lora_rank=None,
+                     enable_attention_residuals=False, attn_res_block_layers=None,
                      vocab_size=256000, mtp_num_layers=0):
         """Calculate total training FLOPs for the hybrid model, including DSA."""
+        attn_res_flops_total = 0
+        if enable_attention_residuals:
+            from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+
+            # Only trunk entries grow the depth history; preserve trunk/MTP split.
+            parsed_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
+            attn_res_flops_total = attention_residual_flops(
+                total_tokens=total_tokens,
+                hidden_size=hidden_size,
+                num_layers=len((parsed_pattern.main_pattern or "").replace("|", "")),
+                block_layers=attn_res_block_layers,
+                mtp_num_layers=parsed_pattern.mtp_num_depths,
+                mtp_num_sublayers=len(parsed_pattern.mtp_pattern or ""),
+            )
         mamba_flops = (
             gated_delta_product_layer_flops(total_tokens, hidden_size,
                                             gdp_num_householder,
@@ -1290,6 +1363,7 @@ def num_floating_point_operations(
                                                  kda_num_qk_heads, kda_num_v_heads,
                                                  kda_conv_kernel_dim, kda_f_lora_rank,
                                                  kda_gate_lora_rank) +
+                attn_res_flops_total +
                 num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size,
                                                  mlp_expansion, swiglu) +
                 num_mamba_layers * mamba_flops +
@@ -1587,6 +1661,17 @@ def num_floating_point_operations(
         # Core attention (L^2) FLOPs per standard-attention layer.
         self_attn_core_term = standard_self_attn_core_term * num_standard_attention_layers
 
+        attention_residual_term = 0
+        if getattr(args, "enable_attention_residuals", False):
+            attention_residual_term = forward_backward_expansion_factor * attention_residual_flops(
+                total_tokens=1,
+                hidden_size=args.hidden_size,
+                num_layers=args.num_layers,
+                block_layers=args.attn_res_block_layers,
+                transformer_layer_layout=True,
+                mtp_num_layers=mtp_num_layers,
+            )
+
         # Token-linear FLOPs scale with the real (unpadded) token count.
         # For BSHD this falls back to ``batch_size * seq_length`` (no padding).
         total_floating_point_operations = (
@@ -1622,6 +1707,8 @@ def num_floating_point_operations(
                 )
                 # Self Attention (token-linear part).
                 + self_attn_term
+                # Attention Residual depth scoring and value aggregation.
+                + attention_residual_term
                 # MTP norms and proj
                 + forward_backward_expansion_factor
                 * fma_expansion_factor
