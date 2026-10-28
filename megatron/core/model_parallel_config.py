@@ -2,7 +2,7 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, ContextManager, Literal, Optional
+from typing import Callable, ContextManager, Literal, Optional, Union
 
 import torch
 
@@ -44,6 +44,21 @@ def resolve_tensor_parallel_weight_shards(
             )
         gtp_weight_remat_size = tensor_parallel_num_weight_shards // tp
     return tensor_parallel_num_weight_shards, gtp_weight_remat_size
+
+
+def _parse_pad_packed_seq_alignment(value):
+    """Parse THD packed-sequence padding alignment.
+
+    Accepts ``"max"`` or a positive integer alignment.
+    """
+    if value == "max":
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "pad_packed_seq_alignment must be 'max' or a positive integer alignment."
+        ) from exc
 
 
 @dataclass
@@ -148,10 +163,36 @@ class ModelParallelConfig:
 
     hybrid_context_parallel: bool = False
     """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
+    If true, enables hybrid context parallel. This is used to balance the workload of
     each CP rank when we use packed samples with variable sequence lengths.
     Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
     """
+
+    dynamic_context_parallel: bool = False
+    """
+    If true, enables dynamic context parallel (per-microbatch CP group sizing). Carried onto
+    this main-based branch as a flag for the GDN/KDA and MLA paths that query it; the full
+    dynamic-CP runtime is not yet brought over, so leave this False (the production recipes do).
+    """
+
+    min_dynamic_context_parallel_size: int = 1
+    """Minimum CP group size for dynamic context parallel. Default 1 (no CP)."""
+
+    thd_tail_padding_policy: Optional[Literal["append_dummy_seq", "extend_last"]] = None
+    """Policy for representing the THD packed-sequence padding tail: 'append_dummy_seq' (default
+    behavior) or 'extend_last'. Carried for the GDN/KDA/MLA packed-sequence paths."""
+
+    pad_packed_seq_alignment: Optional[Union[int, Literal["max"]]] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {
+                "arg_names": ["--pad-packed-seq-alignment"],
+                "type": _parse_pad_packed_seq_alignment,
+            }
+        },
+    )
+    """THD packed-sequence padding alignment: 'max' (pad every DP x CP rank to
+    max_seqlen_per_dp_cp_rank) or a positive integer alignment; None disables padding."""
 
     sequence_packing_scheduler: Optional[Literal['dp_balanced']] = None
     """
@@ -264,6 +305,16 @@ class ModelParallelConfig:
     deterministic_mode: bool = False
     """If true, code that has deterministic execution will be chosen. This usually
        means slower execution, but is good for debugging and testing. Defaults to False."""
+
+    strict_runtime_validation_frequency: Literal["never", "once_per_microbatch", "always"] = (
+        "always"
+    )
+    """Controls how often supported modules run strict runtime validation.
+
+    ``always`` preserves the default behavior. ``once_per_microbatch`` validates the first
+    instance of each supported layer type in every microbatch. ``never`` skips these checks and
+    may allow invalid runtime inputs to produce incorrect results.
+    """
 
     enable_autocast: bool = False
     """If true runs the forward step function inside torch.autocast context."""
@@ -412,6 +463,10 @@ class ModelParallelConfig:
     pipeline_dtype: torch.dtype = None
     """dtype used in p2p communication, usually params_dtype"""
 
+    pipeline_p2p_fixed_shape: bool = False
+    """Skip the pipeline-parallel per-microbatch shape exchange when packed tensors are padded to a
+    fixed local size (e.g. pad_packed_seq_alignment='max'), avoiding the variable-shape handshake."""
+
     variable_seq_lengths: bool = False
     """Support for variable sequence lengths across microbatches. Setting this communicates the size
         of tensors during pipeline parallelism communication, because of this extra overhead it
@@ -545,6 +600,122 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.strict_runtime_validation_frequency not in (
+            "never",
+            "once_per_microbatch",
+            "always",
+        ):
+            raise ValueError(
+                "strict_runtime_validation_frequency must be 'never', "
+                "'once_per_microbatch', or 'always', got "
+                f"{self.strict_runtime_validation_frequency!r}."
+            )
+        if self.strict_runtime_validation_frequency == "never":
+            warnings.warn(
+                "Strict runtime validation is disabled. Invalid runtime inputs may produce "
+                "incorrect results; use this mode at your own risk.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "hybrid_context_parallel is deprecated and will be removed in a future release. "
+                "Use dynamic_context_parallel instead.",
+                DeprecationWarning,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel. "
+                    "Please use dynamic_context_parallel only."
+                )
+            self.dynamic_context_parallel = True
+
+        if self.dynamic_context_parallel:
+            if self.sequence_packing_scheduler is None:
+                self.sequence_packing_scheduler = 'default_dynamic_cp'
+            if self.sequence_packing_scheduler != 'default_dynamic_cp':
+                raise ValueError(
+                    'Dynamic context parallelism requires '
+                    'sequence_packing_scheduler=default_dynamic_cp'
+                )
+
+            if self.min_dynamic_context_parallel_size < 1:
+                raise ValueError(
+                    f"min_dynamic_context_parallel_size must be >= 1, "
+                    f"got {self.min_dynamic_context_parallel_size}"
+                )
+
+        if self.thd_tail_padding_policy not in (None, "append_dummy_seq", "extend_last"):
+            raise ValueError(
+                "thd_tail_padding_policy must be 'append_dummy_seq', 'extend_last', or None, "
+                f"got {self.thd_tail_padding_policy!r}."
+            )
+
+        if self.pad_packed_seq_alignment is not None:
+            self.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
+                self.pad_packed_seq_alignment
+            )
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "max_seqlen_per_dp_cp_rank must be set when pad_packed_seq_alignment "
+                    "is enabled."
+                )
+            if self.pad_packed_seq_alignment != "max":
+                if self.pad_packed_seq_alignment <= 0:
+                    raise ValueError(
+                        "pad_packed_seq_alignment must be 'max' or a positive integer " "alignment."
+                    )
+                if self.pad_packed_seq_alignment > self.max_seqlen_per_dp_cp_rank:
+                    raise ValueError(
+                        "pad_packed_seq_alignment must not exceed "
+                        "max_seqlen_per_dp_cp_rank "
+                        f"({self.max_seqlen_per_dp_cp_rank}), got "
+                        f"{self.pad_packed_seq_alignment}."
+                    )
+
+        if self.pipeline_p2p_fixed_shape:
+            if self.sequence_packing_scheduler is None:
+                raise ValueError("pipeline_p2p_fixed_shape requires a sequence_packing_scheduler.")
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape is not supported with dynamic_context_parallel."
+                )
+            # Must precede the alignment comparison below: when both fields are unset that
+            # comparison is `None not in ("max", None)` -> False, so validation would pass and
+            # get_tensor_shapes() would then derive the pipeline buffer from a None sequence
+            # length. Checking here turns that into a clear configuration error rather than a
+            # fixed-size buffer receiving genuinely variable-length sends.
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape requires max_seqlen_per_dp_cp_rank to be set; it "
+                    "defines the fixed pipeline receive-buffer sequence length."
+                )
+            # `is not None`, not `> 1`: get_forward_backward_func() selects the interleaved
+            # schedule on `vp_size is not None`, so a size of 1 already routes there even
+            # though it looks degenerate. arguments.py normalizes 1 -> None for the training
+            # entrypoints, but a config built directly against mcore does not get that.
+            if (
+                self.sequence_parallel
+                and self.max_seqlen_per_dp_cp_rank % self.tensor_model_parallel_size != 0
+            ):
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape with sequence_parallel requires "
+                    "max_seqlen_per_dp_cp_rank "
+                    f"({self.max_seqlen_per_dp_cp_rank}) to be divisible by "
+                    f"tensor_model_parallel_size ({self.tensor_model_parallel_size}); the "
+                    "pipeline buffer is scattered along the sequence dimension and floor "
+                    "division would under-allocate it."
+                )
+            self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
+            if self.pad_packed_seq_alignment not in ("max", self.max_seqlen_per_dp_cp_rank):
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape requires pad_packed_seq_alignment='max' or "
+                    "pad_packed_seq_alignment equal to max_seqlen_per_dp_cp_rank "
+                    f"({self.max_seqlen_per_dp_cp_rank}), got "
+                    f"{self.pad_packed_seq_alignment}."
+                )
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")
