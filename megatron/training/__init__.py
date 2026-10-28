@@ -16,3 +16,6 @@ from .training import pretrain, get_model, get_train_valid_test_num_samples, set
 from .utils import (print_rank_0,
                     is_last_rank,
                     print_rank_last)
+
+# Local debugging aid (inert unless MCORE_HOSTMEM_PROBE=1): host-memory probe, see hostmem_probe.py.
+from . import hostmem_probe  # noqa: E402,F401  # isort:skip
