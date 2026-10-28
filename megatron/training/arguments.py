@@ -2669,89 +2669,182 @@ def _add_regularization_args(parser):
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
 
-    group.add_argument('--weight-decay', type=float, default=0.01,
-                       help='Weight decay coefficient for L2 regularization.')
-    group.add_argument('--apply-wd-to-qk-layernorm', action='store_true',
-                       help='Apply weight decay to qk layernorm as a special case.')
-    group.add_argument('--clip-grad', type=float, default=1.0,
-                       help='Gradient clipping based on global L2 norm.')
-    group.add_argument('--adam-beta1', type=float, default=0.9,
-                       help='First coefficient for computing running averages '
-                       'of gradient and its square')
-    group.add_argument('--adam-beta2', type=float, default=0.999,
-                       help='Second coefficient for computing running averages '
-                       'of gradient and its square')
-    group.add_argument('--adam-eps', type=float, default=1e-08,
-                       help='Term added to the denominator to improve'
-                       'numerical stability')
-    group.add_argument('--sgd-momentum', type=float, default=0.9,
-                       help='Momentum factor for sgd')
-    group.add_argument('--muon-momentum', type=float, default=0.9,
-                       help='Momentum factor for Muon optimizer')
-    group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
-                       dest='muon_split_qkv',
-                       help='Whether to split QKV parameters for Muon optimizer')
-    group.add_argument('--muon-nesterov', action='store_true',
-                       help='Whether to use Nesterov-style momentum in the internal SGD')
-    group.add_argument('--muon-scale-mode', type=str, default='spectral',
-                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
-                       help='Scale mode for Muon optimizer. With MuP, set '
-                       '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
-                       'or set --muon-scale-mode spectral to keep spectral scaling.')
-    group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
-                       choices=['low', 'medium', 'high'],
-                       help='FP32 matmul precision for Newton-Schulz iteration')
-    group.add_argument('--muon-coefficient-type', type=str, default='quintic',
-                       help='Newton-Schulz coefficient type for the Muon optimizer. '
-                       'Valid types are discovered from the installed emerging_optimizers '
-                       'package (e.g. simple, quintic, polar_express, aol). '
-                       'Validated at optimizer creation time.')
-    group.add_argument('--muon-num-ns-steps', type=int, default=5,
-                       help='Number of Newton-Schulz steps for Muon optimizer')
-    group.add_argument('--muon-tp-mode', type=str, default='duplicated',
-                       choices=['blockwise', 'duplicated', 'distributed', 'auto',
-                                'layer_sharded'],
-                       help='How to perform NS calculation for tensor model parallel weights. '
-                       'blockwise orthogonalizes each shard on its own, so the update rule '
-                       'depends on the parallelism config; duplicated and distributed both '
-                       'orthogonalize the whole matrix and give TP-invariant results; auto '
-                       'select between duplicated and distributed mode per-weight for '
-                       'dense weights; layer_sharded assigns each 2D weight one NS home '
-                       'rank in the (gtp_remat x tp) domain and routes the shards there '
-                       'with all_to_all (same math as duplicated, no redundant NS); '
-                       'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
-                       'OptimizerConfig.muon_tp_mode.')
-    group.add_argument('--muon-ns-batch-size', type=int, default=1,
-                       help='Max number of same-shape matrices fused into one batched '
-                       'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
-                       'The default of 1 keeps the bit-exact per-matrix path; raise '
-                       '(e.g. to 32) to cut kernel launches on MoE expert homes at '
-                       'the cost of bitwise parity (baddbmm vs addmm rounding).')
-    group.add_argument('--muon-use-syrk', action='store_true',
-                       help='Use the Triton SYRK kernel for the symmetric-output '
-                       'Newton-Schulz GEMMs in Muon (~1/3 off '
-                       'NS FLOPs for near-square matrices). Takes effect only with '
-                       '--muon-fp32-matmul-prec medium. Under --muon-tp-mode '
-                       'layer_sharded, unmet Triton/SM/emerging-optimizers '
-                       'requirements are rejected at startup.')
-    group.add_argument('--muon-no-concurrent-groups', action='store_false',
-                       dest='muon_concurrent_groups',
-                       help='Serialize param groups on one CUDA stream under '
-                       '--muon-tp-mode layer_sharded instead of overlapping one group\'s '
-                       'Newton-Schulz with another\'s all_to_all. Bitwise-neutral; use '
-                       'when the concurrent transient buffers push peak memory too high.')
-    group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
-                       help='Additional scale factor for the muon update')
-    group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
-                       choices=['adam', 'lion'],
-                       help='Optimizer for scalar parameters (embeddings, biases, norms) '
-                       'when using muon. Defaults to adam.')
-    group.add_argument('--lion-beta1', type=float, default=0.95,
-                       help='First beta coefficient for Lion optimizer '
-                       '(used in sign update). Default: 0.95.')
-    group.add_argument('--lion-beta2', type=float, default=0.98,
-                       help='Second beta coefficient for Lion optimizer '
-                       '(used in momentum EMA update). Default: 0.98.')
+    group.add_argument(
+        '--weight-decay',
+        type=float,
+        default=0.01,
+        help='Weight decay coefficient for L2 regularization.',
+    )
+    group.add_argument(
+        '--apply-wd-to-qk-layernorm',
+        action='store_true',
+        help='Apply weight decay to qk layernorm as a special case.',
+    )
+    group.add_argument(
+        '--clip-grad', type=float, default=1.0, help='Gradient clipping based on global L2 norm.'
+    )
+    group.add_argument(
+        '--adam-beta1',
+        type=float,
+        default=0.9,
+        help='First coefficient for computing running averages ' 'of gradient and its square',
+    )
+    group.add_argument(
+        '--adam-beta2',
+        type=float,
+        default=0.999,
+        help='Second coefficient for computing running averages ' 'of gradient and its square',
+    )
+    group.add_argument(
+        '--adam-eps',
+        type=float,
+        default=1e-08,
+        help='Term added to the denominator to improve' 'numerical stability',
+    )
+    group.add_argument('--sgd-momentum', type=float, default=0.9, help='Momentum factor for sgd')
+    group.add_argument(
+        '--muon-momentum', type=float, default=0.9, help='Momentum factor for Muon optimizer'
+    )
+    group.add_argument(
+        '--muon-no-split-qkv',
+        action='store_false',
+        default=True,
+        dest='muon_split_qkv',
+        help='Whether to split QKV parameters for Muon optimizer',
+    )
+    group.add_argument(
+        '--muon-split-qkv-per-head',
+        action='store_true',
+        help='Orthogonalize each Q, gate, K, and V head independently. '
+        'Uniform head sizes use batched Newton-Schulz. '
+        'MLA up-projections additionally require --muon-split-mla-qkv.',
+    )
+    group.add_argument(
+        '--muon-split-mla-qkv',
+        action='store_true',
+        help='Split MLA up-projection weights into their per-head projection slices for Muon. '
+        'Combine with --muon-split-qkv-per-head to orthogonalize each MLA head independently.',
+    )
+    group.add_argument(
+        '--muon-nesterov',
+        action='store_true',
+        help='Whether to use Nesterov-style momentum in the internal SGD',
+    )
+    group.add_argument(
+        '--muon-scale-mode',
+        type=str,
+        default='spectral',
+        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+        help='Scale mode for Muon optimizer. With MuP, set '
+        '--muon-scale-mode unit_rms_norm to use unit_rms_norm scaling, '
+        'or set --muon-scale-mode spectral to keep spectral scaling.',
+    )
+    group.add_argument(
+        '--muon-fp32-matmul-prec',
+        type=str,
+        default='medium',
+        choices=['medium', 'high', 'highest'],
+        help='PyTorch FP32 matmul precision for Newton-Schulz iteration. '
+        'Use highest to retain full FP32 arithmetic.',
+    )
+    group.add_argument(
+        '--muon-coefficient-type',
+        type=str,
+        default='quintic',
+        help='Newton-Schulz coefficient type for the Muon optimizer. '
+        'Valid types are discovered from the installed emerging_optimizers '
+        'package (e.g. simple, quintic, polar_express, aol). '
+        'Validated at optimizer creation time.',
+    )
+    group.add_argument(
+        '--muon-num-ns-steps',
+        type=int,
+        default=5,
+        help='Number of Newton-Schulz steps for Muon optimizer',
+    )
+    group.add_argument(
+        '--muon-tp-mode',
+        type=str,
+        default='duplicated',
+        choices=['blockwise', 'duplicated', 'distributed', 'auto', 'layer_sharded'],
+        help='How to perform NS calculation for tensor model parallel weights. '
+        'blockwise orthogonalizes each shard on its own, so the update rule '
+        'depends on the parallelism config; duplicated and distributed both '
+        'orthogonalize the whole matrix and give TP-invariant results; auto '
+        'select between duplicated and distributed mode per-weight for '
+        'dense weights; layer_sharded assigns each 2D weight one NS home '
+        'rank in the (gtp_remat x tp) domain and routes the shards there '
+        'with all_to_all (same math as duplicated, no redundant NS); '
+        'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
+        'OptimizerConfig.muon_tp_mode.',
+    )
+    group.add_argument(
+        '--muon-ns-batch-size',
+        type=int,
+        default=1,
+        help='Max number of same-shape matrices fused into one batched '
+        'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
+        'The default of 1 keeps the bit-exact per-matrix path; raise '
+        '(e.g. to 32) to cut kernel launches on MoE expert homes at '
+        'the cost of bitwise parity (baddbmm vs addmm rounding).',
+    )
+    group.add_argument(
+        '--muon-use-syrk',
+        action='store_true',
+        help='Use the Triton SYRK kernel for the symmetric-output '
+        'Newton-Schulz GEMMs in Muon (~1/3 off '
+        'NS FLOPs for near-square matrices). Takes effect only with '
+        '--muon-fp32-matmul-prec medium. Under --muon-tp-mode '
+        'layer_sharded, unmet Triton/SM/emerging-optimizers '
+        'requirements are rejected at startup.',
+    )
+    group.add_argument(
+        '--muon-no-concurrent-groups',
+        action='store_false',
+        dest='muon_concurrent_groups',
+        help='Serialize param groups on one CUDA stream under '
+        '--muon-tp-mode layer_sharded instead of overlapping one group\'s '
+        'Newton-Schulz with another\'s all_to_all. Bitwise-neutral; use '
+        'when the concurrent transient buffers push peak memory too high.',
+    )
+    group.add_argument(
+        '--muon-extra-scale-factor',
+        type=float,
+        default=1.0,
+        help='Additional scale factor for the muon update',
+    )
+    group.add_argument(
+        '--muon-scalar-optimizer',
+        type=str,
+        default='adam',
+        choices=['adam', 'lion'],
+        help='Optimizer for scalar parameters (embeddings, biases, norms) '
+        'when using muon. Defaults to adam.',
+    )
+    group.add_argument(
+        '--lion-beta1',
+        type=float,
+        default=0.95,
+        help='First beta coefficient for Lion optimizer ' '(used in sign update). Default: 0.95.',
+    )
+    group.add_argument(
+        '--lion-beta2',
+        type=float,
+        default=0.98,
+        help='Second beta coefficient for Lion optimizer '
+        '(used in momentum EMA update). Default: 0.98.',
+    )
+
+    group.add_argument(
+        '--no-weight-decay-cond-type',
+        type=str,
+        choices=['apply_wd_to_qk_layernorm'],
+        help='Type of no weight decay condition. Choices: '
+        'None (default): apply weight decay to 1D weights and biases.'
+        '"apply_wd_to_qk_layernorm": additionally apply weight decay to '
+        'qk layernorm as a special case.'
+        'DEPRECATED. Please use --apply-wd-to-qk-layernorm instead. ',
+    )
     return parser
 
 
