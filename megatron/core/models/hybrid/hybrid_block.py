@@ -80,6 +80,7 @@ class HybridStackSubmodules:
     mamba_layer: Union[ModuleSpec, type] = IdentityOp
     gdn_layer: Union[ModuleSpec, type] = IdentityOp
     gdn2_layer: ModuleSpec | None = None
+    kda_layer: Union[ModuleSpec, type] = IdentityOp
     attention_layer: Union[ModuleSpec, type] = IdentityOp
     dsa_layer: Union[ModuleSpec, type] = IdentityOp
     csa_layer: ModuleSpec | type | None = None
@@ -329,6 +330,16 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         hash_moe_layer_threshold=hash_moe_layer_threshold,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif type(layer_config) is layer_utils.KDALayerConfig:
+                    layer = build_module(
+                        submodules.kda_layer,
+                        config=layer_config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
