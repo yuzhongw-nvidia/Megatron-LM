@@ -21,6 +21,7 @@ Check Levels
 """
 
 import os
+import warnings
 from dataclasses import dataclass
 from typing import List
 
@@ -29,8 +30,20 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
+import megatron.core.context_parallel_layout.conversion as cp_layout_conversion
+import megatron.core.context_parallel_layout.routes as cp_layout_routes
 from megatron.core import parallel_state
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.context_parallel_layout import finalize_packed_seq_params
+from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+    get_transformer_block_with_experimental_attention_variant_spec,
+)
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -647,3 +660,774 @@ def test_thd_format(tc: TestCase):
     if tc.forward_bitwise or tc.backward_bitwise:
         torch.use_deterministic_algorithms(False)
         os.environ.pop("NVTE_ALLOW_NONDETERMINISTIC_ALGO", None)
+
+
+# =============================================================================
+# Dynamic CP Test Infrastructure
+# =============================================================================
+
+
+@dataclass
+class DynamicCPAssignment:
+    """Per-rank assignment in the dynamic CP configuration.
+
+    local_cp_size: number of ranks in this rank's CP communicator.
+    seq_indices: indices into the test case's seqlens list that this rank processes.
+
+    Ranks sharing the same CP sub-group have identical DynamicCPAssignment values.
+    """
+
+    local_cp_size: int
+    seq_indices: List[int]
+
+
+@dataclass
+class DynamicCPTestCase:
+    """Test case for dynamic CP correctness.
+
+    Compares fixed CP (baseline) against dynamic CP where sub-groups of ranks
+    can process different sequences with different CP sizes.
+
+    dcp_assignments: one entry per DP×CP rank (len == dp_cp_world_size).
+    Ranks in the same sub-group share the same local_cp_size and seq_indices.
+    """
+
+    name: str
+    hidden_size: int
+    num_heads: int
+    num_kv_heads: int
+    ffn_hidden_size: int
+    seqlens: List[int]
+    tp_size: int
+    cp_size: int
+    sp_enabled: bool
+    dcp_assignments: List[DynamicCPAssignment]
+
+
+# Dynamic CP Test Cases
+# ---------------------
+# Each test runs two paths through the *same* TransformerLayer and compares
+# forward outputs + backward gradients (similarity check with TE attention).
+#
+# Parameters:
+#   cp_size — the CP size used for the *baseline* (fixed CP) path.  It also
+#   determines dp_size = world_size // (tp_size * cp_size), which controls how
+#   sequences are split across DP ranks in the baseline.  The dynamic CP path
+#   ignores this cp_size and instead uses the local_cp_size from each
+#   DynamicCPAssignment.
+#
+# Baseline (fixed CP):
+#   Sequences are evenly split across DP ranks (seqs_per_dp = len(seqlens) //
+#   dp_size).  Each DP rank runs standard CP (cp_size) on its subset:
+#   pad → zigzag shard → forward → gather → backward.
+#
+# Dynamic CP:
+#   dcp_assignments has one entry per DP×CP rank.  Ranks sharing a CP sub-group
+#   have identical (local_cp_size, seq_indices).  Each sub-group forms its own
+#   CP communicator and independently shards / gathers only the sequences
+#   assigned to it.
+#
+# Sequence lengths are intentionally non-powers-of-two (mostly primes) so
+# that padding to cp_divisor is always exercised.
+#
+# fmt: off
+_A = DynamicCPAssignment
+DYNAMIC_CP_TEST_CASES = [
+    # -------------------------------------------------------------------------
+    # Uniform: all dp_cp ranks share all seqs with larger local_cp_size.
+    # All 4 ranks form one sub-group → equivalent to fixed CP but via the
+    # dynamic CP code path.
+    # -------------------------------------------------------------------------
+    # tp=2, cp=2, world_size=8 → dp_cp_size=4, all ranks get same assignment
+    DynamicCPTestCase(
+        "dcp_uniform_tp2_cp2_sp",
+        4096, 32, 8, 14336,
+        [3947, 1999, 1037, 4091, 2111, 503],
+        tp_size=2, cp_size=2, sp_enabled=True,
+        dcp_assignments=[
+            _A(4, [0, 1, 2, 3, 4, 5]),  # dp_cp_rank 0
+            _A(4, [0, 1, 2, 3, 4, 5]),  # dp_cp_rank 1
+            _A(4, [0, 1, 2, 3, 4, 5]),  # dp_cp_rank 2
+            _A(4, [0, 1, 2, 3, 4, 5]),  # dp_cp_rank 3
+        ],
+    ),
+    # tp=1, cp=2, world_size=8 → dp_cp_size=8, all ranks get same assignment
+    DynamicCPTestCase(
+        "dcp_uniform_tp1_cp2",
+        1024, 16, 4, 4096,
+        [4001, 2039, 997, 511, 3967, 2053, 1009, 499],
+        tp_size=1, cp_size=2, sp_enabled=False,
+        dcp_assignments=[
+            _A(8, [0, 1, 2, 3, 4, 5, 6, 7]),  # dp_cp_rank 0
+            _A(8, [0, 1, 2, 3, 4, 5, 6, 7]),  # dp_cp_rank 1
+            _A(8, [0, 1, 2, 3, 4, 5, 6, 7]),  # dp_cp_rank 2
+            _A(8, [0, 1, 2, 3, 4, 5, 6, 7]),  # dp_cp_rank 3
+            _A(8, [0, 1, 2, 3, 4, 5, 6, 7]),  # dp_cp_rank 4
+            _A(8, [0, 1, 2, 3, 4, 5, 6, 7]),  # dp_cp_rank 5
+            _A(8, [0, 1, 2, 3, 4, 5, 6, 7]),  # dp_cp_rank 6
+            _A(8, [0, 1, 2, 3, 4, 5, 6, 7]),  # dp_cp_rank 7
+        ],
+    ),
+    # -------------------------------------------------------------------------
+    # Heterogeneous: sub-groups with different local_cp_size.
+    # Ranks are split into multiple CP sub-groups; some ranks process
+    # sequences alone (local_cp_size=1) while others cooperate (local_cp_size=2+).
+    # -------------------------------------------------------------------------
+    # tp=2, cp=4, world_size=8 → dp_cp_size=4
+    #   rank 0: alone (cp=1), rank 1: alone (cp=1), ranks 2-3: pair (cp=2)
+    DynamicCPTestCase(
+        "dcp_hetero_tp2_cp4_sp",
+        4096, 32, 8, 14336,
+        [4093, 2017, 3989, 2111, 1013, 509],
+        tp_size=2, cp_size=4, sp_enabled=True,
+        dcp_assignments=[
+            _A(1, [0]),              # dp_cp_rank 0: solo
+            _A(1, [1]),              # dp_cp_rank 1: solo
+            _A(2, [2, 3, 4, 5]),     # dp_cp_rank 2: pair with rank 3
+            _A(2, [2, 3, 4, 5]),     # dp_cp_rank 3: pair with rank 2
+        ],
+    ),
+    # tp=1, cp=4, world_size=8 → dp_cp_size=8
+    #   ranks 0,1: solo; ranks 2-3: pair; ranks 4,5: solo; ranks 6-7: pair
+    DynamicCPTestCase(
+        "dcp_hetero_tp1_cp4",
+        1024, 16, 4, 4096,
+        [4007, 2003, 3989, 2053, 4091, 2017, 1013, 503],
+        tp_size=1, cp_size=4, sp_enabled=False,
+        dcp_assignments=[
+            _A(1, [0]),          # dp_cp_rank 0: solo
+            _A(1, [1]),          # dp_cp_rank 1: solo
+            _A(2, [2, 3]),       # dp_cp_rank 2: pair with rank 3
+            _A(2, [2, 3]),       # dp_cp_rank 3: pair with rank 2
+            _A(1, [4]),          # dp_cp_rank 4: solo
+            _A(1, [5]),          # dp_cp_rank 5: solo
+            _A(2, [6, 7]),       # dp_cp_rank 6: pair with rank 7
+            _A(2, [6, 7]),       # dp_cp_rank 7: pair with rank 6
+        ],
+    ),
+    # -------------------------------------------------------------------------
+    # Mixed: cp4 + cp2 + cp1 + cp1, baseline fixed cp=2.
+    # tp=1, cp=2, world_size=8 → dp_cp_size=8, dp_size=4
+    #   ranks 0-3: quad (cp=4), ranks 4-5: pair (cp=2), rank 6: solo, rank 7: solo
+    # -------------------------------------------------------------------------
+    DynamicCPTestCase(
+        "dcp_mixed_tp1_cp2",
+        1024, 16, 4, 4096,
+        [4007, 2003, 3989, 2053, 4091, 2017, 1013, 503],
+        tp_size=1, cp_size=2, sp_enabled=False,
+        dcp_assignments=[
+            _A(4, [0, 1, 2, 3]),     # dp_cp_rank 0: quad with ranks 1,2,3
+            _A(4, [0, 1, 2, 3]),     # dp_cp_rank 1: quad with ranks 0,2,3
+            _A(4, [0, 1, 2, 3]),     # dp_cp_rank 2: quad with ranks 0,1,3
+            _A(4, [0, 1, 2, 3]),     # dp_cp_rank 3: quad with ranks 0,1,2
+            _A(2, [4, 5]),           # dp_cp_rank 4: pair with rank 5
+            _A(2, [4, 5]),           # dp_cp_rank 5: pair with rank 4
+            _A(1, [6]),              # dp_cp_rank 6: solo
+            _A(1, [7]),              # dp_cp_rank 7: solo
+        ],
+    ),
+]
+# fmt: on
+
+
+# =============================================================================
+# Dynamic CP Gather (with explicit cp_group)
+# =============================================================================
+
+
+class _GatherTHDDynamic(torch.autograd.Function):
+    """Gather THD outputs from an explicit CP group with gradient support."""
+
+    @staticmethod
+    def forward(ctx, local, seqlens, cp_size, tp_size, sp_enabled, H, cp_group, cp_rank):
+        ctx.seqlens, ctx.cp_size, ctx.tp_size, ctx.sp_enabled, ctx.H = (
+            seqlens,
+            cp_size,
+            tp_size,
+            sp_enabled,
+            H,
+        )
+        ctx.cp_rank = cp_rank
+        ctx.tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        ctx.padded = compute_thd_padded_seqlens(
+            seqlens, cp_size, tp_size, sp_enabled, False, dynamic_cp=True
+        )
+
+        out = local
+        if sp_enabled:
+            gathered = [torch.empty_like(out) for _ in range(tp_size)]
+            dist.all_gather(
+                gathered, out.contiguous(), group=parallel_state.get_tensor_model_parallel_group()
+            )
+            out = torch.cat(gathered, dim=0)
+
+        if cp_size > 1:
+            local_lens = [p // cp_size for p in ctx.padded]
+            offset, seqs = 0, []
+            for i, ll in enumerate(local_lens):
+                chunk = out[offset : offset + ll]
+                gathered = [torch.empty_like(chunk) for _ in range(cp_size)]
+                dist.all_gather(gathered, chunk.contiguous(), group=cp_group)
+                seqs.append(_zigzag_merge(gathered, cp_size)[: seqlens[i]])
+                offset += ll
+            out = torch.cat(seqs, dim=0)
+        else:
+            out = _strip_thd_padding(out, seqlens, ctx.padded)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        offset, chunks = 0, []
+        for sl, psl in zip(ctx.seqlens, ctx.padded):
+            g = grad[offset : offset + sl, 0, :]
+            if psl > sl:
+                g = torch.cat([g, torch.zeros(psl - sl, ctx.H, dtype=g.dtype, device=g.device)])
+            chunks.append(_zigzag_split(g, ctx.cp_rank, ctx.cp_size))
+            offset += sl
+
+        packed = torch.cat(chunks, dim=0)
+        if ctx.sp_enabled:
+            seg = packed.shape[0] // ctx.tp_size
+            packed = packed[ctx.tp_rank * seg : (ctx.tp_rank + 1) * seg]
+        return packed.unsqueeze(1).contiguous(), None, None, None, None, None, None, None
+
+
+def gather_thd_dynamic(local, seqlens, cp_size, tp_size, sp_enabled, H, cp_group, cp_rank):
+    return _GatherTHDDynamic.apply(
+        local, seqlens, cp_size, tp_size, sp_enabled, H, cp_group, cp_rank
+    )
+
+
+# =============================================================================
+# Dynamic CP Test Function
+# =============================================================================
+
+
+@pytest.mark.parametrize("tc", DYNAMIC_CP_TEST_CASES, ids=lambda tc: tc.name)
+def test_dynamic_cp_format(tc: DynamicCPTestCase):
+    """Compare fixed CP THD vs dynamic CP THD format outputs and gradients."""
+    H, seqlens = tc.hidden_size, tc.seqlens
+    tp_size, cp_size, sp = tc.tp_size, tc.cp_size, tc.sp_enabled
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        dynamic_context_parallel=True,
+    )
+    model_parallel_cuda_manual_seed(42)
+
+    layer = build_gpt_layer(
+        H,
+        tc.num_heads,
+        tc.num_kv_heads,
+        tc.ffn_hidden_size,
+        tp_size,
+        cp_size,
+        sp,
+        use_mock_attention=False,
+        deterministic=False,
+    )
+    kv_channels = H // tc.num_heads
+    rope = RotaryEmbedding(kv_channels=kv_channels, rotary_percent=1.0).cuda()
+
+    cp_rank = parallel_state.get_context_parallel_rank()
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    dp_rank = parallel_state.get_data_parallel_rank()
+    dp_size = parallel_state.get_data_parallel_world_size()
+
+    # All ranks generate identical full data (same seed, no dp_rank offset)
+    torch.manual_seed(42)
+    all_seq_data = [torch.randn(sl, H, dtype=torch.bfloat16).cuda() for sl in seqlens]
+    torch.manual_seed(142)
+    all_grad_data = [torch.randn(sl, H, dtype=torch.bfloat16).cuda() for sl in seqlens]
+
+    # === Baseline: fixed CP, THD format ===
+    assert (
+        len(seqlens) % dp_size == 0
+    ), f"Need len(seqlens)={len(seqlens)} divisible by dp_size={dp_size}"
+    seqs_per_dp = len(seqlens) // dp_size
+    base_indices = list(range(dp_rank * seqs_per_dp, (dp_rank + 1) * seqs_per_dp))
+    base_seqlens = [seqlens[i] for i in base_indices]
+    base_seq_data = [all_seq_data[i] for i in base_indices]
+    base_grad_data = [all_grad_data[i] for i in base_indices]
+
+    local_thd_base = shard_thd(
+        base_seq_data, base_seqlens, cp_rank, cp_size, tp_rank, tp_size, sp, H, dynamic_cp=True
+    )
+    packed_base = make_packed_seq_params(base_seqlens, cp_size, tp_size, sp, dynamic_cp=True)
+    rotary_pos_emb_base = rope(packed_base.max_seqlen_q, packed_seq=True)
+    input_base = local_thd_base.detach().clone().requires_grad_(True)
+    out_base, _ = layer(
+        hidden_states=input_base, packed_seq_params=packed_base, rotary_pos_emb=rotary_pos_emb_base
+    )
+    gathered_base = gather_thd(out_base, base_seqlens, cp_size, tp_size, sp, H, dynamic_cp=True)
+    grad_base = torch.cat(base_grad_data, dim=0).unsqueeze(1)
+    gathered_base.backward(grad_base)
+    baseline_grads = {n: p.grad.clone() for n, p in layer.named_parameters()}
+    layer.zero_grad()
+
+    # === Dynamic CP ===
+    dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    dp_cp_rank = dist.get_rank(group=dp_cp_group)
+
+    assert dp_cp_rank < len(
+        tc.dcp_assignments
+    ), f"dp_cp_rank={dp_cp_rank} out of range (len={len(tc.dcp_assignments)})"
+    my_assignment = tc.dcp_assignments[dp_cp_rank]
+    local_cp_size = my_assignment.local_cp_size
+    dcp_indices = my_assignment.seq_indices
+    dcp_seqlens = [seqlens[i] for i in dcp_indices]
+    dcp_seq_data = [all_seq_data[i] for i in dcp_indices]
+    dcp_grad_data = [all_grad_data[i] for i in dcp_indices]
+
+    dcp_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(group_size=local_cp_size)
+    dcp_cp_rank = dist.get_rank(group=dcp_cp_group)
+
+    local_thd_dcp = shard_thd(
+        dcp_seq_data,
+        dcp_seqlens,
+        dcp_cp_rank,
+        local_cp_size,
+        tp_rank,
+        tp_size,
+        sp,
+        H,
+        dynamic_cp=True,
+    )
+    packed_dcp = make_packed_seq_params(dcp_seqlens, local_cp_size, tp_size, sp, dynamic_cp=True)
+    packed_dcp.local_cp_size = local_cp_size
+    packed_dcp.cp_group = dcp_cp_group
+    rotary_pos_emb_dcp = rope(packed_dcp.max_seqlen_q, packed_seq=True)
+
+    input_dcp = local_thd_dcp.detach().clone().requires_grad_(True)
+    out_dcp, _ = layer(
+        hidden_states=input_dcp, packed_seq_params=packed_dcp, rotary_pos_emb=rotary_pos_emb_dcp
+    )
+    gathered_dcp = gather_thd_dynamic(
+        out_dcp, dcp_seqlens, local_cp_size, tp_size, sp, H, dcp_cp_group, dcp_cp_rank
+    )
+    grad_dcp = torch.cat(dcp_grad_data, dim=0).unsqueeze(1)
+    gathered_dcp.backward(grad_dcp)
+    dcp_grads = {n: p.grad.clone() for n, p in layer.named_parameters()}
+
+    # === Gradient sync: reduce across all DP×CP ranks ===
+    for n in baseline_grads:
+        dist.all_reduce(baseline_grads[n], group=dp_cp_group)
+        dist.all_reduce(dcp_grads[n], group=dp_cp_group)
+    if sp:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        for n, p in layer.named_parameters():
+            if getattr(p, "sequence_parallel", False):
+                dist.all_reduce(baseline_grads[n], group=tp_group)
+                dist.all_reduce(dcp_grads[n], group=tp_group)
+
+    # === Forward comparison (per-sequence, on ranks that have both) ===
+    common_indices = sorted(set(base_indices) & set(dcp_indices))
+    for seq_idx in common_indices:
+        sl = seqlens[seq_idx]
+        base_pos = base_indices.index(seq_idx)
+        base_offset = sum(base_seqlens[:base_pos])
+        dcp_pos = dcp_indices.index(seq_idx)
+        dcp_offset = sum(dcp_seqlens[:dcp_pos])
+        assert_close(
+            f"seq[{seq_idx}] output",
+            gathered_base[base_offset : base_offset + sl, 0].detach(),
+            gathered_dcp[dcp_offset : dcp_offset + sl, 0].detach(),
+            False,
+        )
+
+    # === Backward comparison ===
+    for n in baseline_grads:
+        if n in dcp_grads:
+            assert_close(f"grad[{n}]", baseline_grads[n], dcp_grads[n], False)
+
+    # === Cleanup ===
+    Utils.destroy_model_parallel()
+
+
+# =============================================================================
+# Mixed GDN/GQA Model Correctness
+# =============================================================================
+
+
+def _make_mixed_model_config(
+    *,
+    linear_cp_mode: str,
+    cp_partition_mode: str,
+    dynamic_context_parallel: bool,
+    context_parallel_size: int,
+    tensor_model_parallel_size: int = 1,
+    sequence_parallel: bool = False,
+    mtp_num_layers: int = 1,
+) -> TransformerConfig:
+    layer_pattern = [1, 1, 0, 1, 0]
+    return TransformerConfig(
+        num_layers=len(layer_pattern),
+        hidden_size=128,
+        ffn_hidden_size=256,
+        num_attention_heads=8,
+        num_query_groups=2,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=8,
+        activation_func=torch.nn.functional.silu,
+        experimental_attention_variant="gated_delta_net",
+        linear_attention_freq=layer_pattern,
+        linear_cp_mode=linear_cp_mode,
+        cp_partition_mode=cp_partition_mode,
+        context_parallel_size=context_parallel_size,
+        dynamic_context_parallel=dynamic_context_parallel,
+        tensor_model_parallel_size=tensor_model_parallel_size,
+        sequence_parallel=sequence_parallel,
+        cp_comm_type="p2p",
+        sequence_packing_scheduler=(
+            "default_dynamic_cp" if dynamic_context_parallel else "dp_balanced"
+        ),
+        pad_packed_seq_alignment="max",
+        max_seqlen_per_dp_cp_rank=128,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        calculate_per_token_loss=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        mtp_num_layers=mtp_num_layers,
+    )
+
+
+def _build_mixed_model(model_type: str, config: TransformerConfig):
+    model_kwargs = {
+        "config": config,
+        "vocab_size": 512,
+        "max_sequence_length": config.max_seqlen_per_dp_cp_rank,
+        "position_embedding_type": "rope",
+    }
+    if model_type == "gpt":
+        transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+            config=config
+        )
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=transformer_layer_spec, use_transformer_engine=True
+        )
+        model = GPTModel(
+            transformer_layer_spec=transformer_layer_spec,
+            mtp_block_spec=mtp_block_spec,
+            **model_kwargs,
+        )
+    elif model_type == "hybrid":
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+        from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+        hybrid_layer_pattern = "GG*G*/*" if config.mtp_num_layers else "GG*G*"
+        model = HybridModel(
+            hybrid_stack_spec=hybrid_stack_spec,
+            hybrid_layer_pattern=hybrid_layer_pattern,
+            **model_kwargs,
+        )
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+
+    return model.cuda()
+
+
+def _prepare_mixed_model_batch(seq_indices, cp_group, config, vocab_size):
+    all_sequence_lengths = (37, 53, 61, 71, 43, 59, 67, 79)
+    sequence_lengths = [all_sequence_lengths[i] for i in seq_indices]
+    padded_lengths = [_round_up(sequence_length, 16) for sequence_length in sequence_lengths]
+    total_tokens = sum(padded_lengths)
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    tokens = torch.zeros(total_tokens, device=device, dtype=torch.long)
+    labels = torch.zeros_like(tokens)
+    loss_mask = torch.zeros(total_tokens, device=device, dtype=torch.float32)
+    padding_mask = torch.ones(total_tokens, device=device, dtype=torch.bool)
+    position_ids = torch.zeros_like(tokens)
+    cu_seqlens = [0]
+    cu_seqlens_padded = [0]
+
+    offset = 0
+    for sequence_index, sequence_length, padded_length in zip(
+        seq_indices, sequence_lengths, padded_lengths
+    ):
+        valid_end = offset + sequence_length
+        sequence_tokens = (
+            torch.arange(sequence_length, device=device, dtype=torch.long) + 17 * sequence_index + 3
+        ) % vocab_size
+        tokens[offset:valid_end] = sequence_tokens
+        labels[offset:valid_end] = (sequence_tokens + 11) % vocab_size
+        loss_mask[offset:valid_end] = 1.0
+        padding_mask[offset:valid_end] = False
+        position_ids[offset:valid_end] = torch.arange(
+            sequence_length, device=device, dtype=torch.long
+        )
+        cu_seqlens.append(cu_seqlens[-1] + sequence_length)
+        offset += padded_length
+        cu_seqlens_padded.append(offset)
+
+    cu_seqlens = torch.tensor(cu_seqlens, device=device, dtype=torch.int32)
+    cu_seqlens_padded = torch.tensor(cu_seqlens_padded, device=device, dtype=torch.int32)
+    sequence_keys = ("tokens", "labels", "loss_mask", "padding_mask", "position_ids")
+    batch = {
+        "tokens": tokens,
+        "labels": labels,
+        "loss_mask": loss_mask,
+        "padding_mask": padding_mask,
+        "position_ids": position_ids,
+        "cu_seqlens_padded": cu_seqlens_padded,
+    }
+    get_cp_slice_for_thd(
+        batch, cp_group, keys=sequence_keys, cp_partition_mode=config.cp_partition_mode
+    )
+    batch = {name: batch[name].view(1, -1) for name in sequence_keys}
+
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=max(padded_lengths),
+        max_seqlen_kv=max(padded_lengths),
+        local_cp_size=cp_group.size() if config.dynamic_context_parallel else None,
+        cp_group=cp_group,
+        cp_partition_mode=config.cp_partition_mode,
+        pad_between_seqs=True,
+    )
+    # Mirror batch construction: resolve the CP and TP x CP groups of this microbatch
+    # (the TP x sub-group under dynamic CP) and prebuild the layout routes, including
+    # the fused TP x CP route under sequence parallelism.
+    finalize_packed_seq_params(packed_seq_params, sequence_parallel=config.sequence_parallel)
+    return batch, packed_seq_params
+
+
+def _run_mixed_model(model, batch, packed_seq_params, dp_cp_group):
+    MTPLossLoggingHelper.tracker = {}
+    MTPLossLoggingHelper.configure_acceptance_collection(enabled=False)
+    has_mtp = bool(getattr(model.config, "mtp_num_layers", 0))
+
+    loss = model(
+        input_ids=batch["tokens"],
+        position_ids=batch["position_ids"],
+        attention_mask=None,
+        labels=batch["labels"],
+        loss_mask=batch["loss_mask"],
+        packed_seq_params=packed_seq_params,
+        padding_mask=batch["padding_mask"],
+    )
+    local_numerator = (loss.float() * batch["loss_mask"]).sum()
+    local_denominator = batch["loss_mask"].sum()
+    global_stats = torch.stack([local_numerator.detach(), local_denominator.detach()])
+    dist.all_reduce(global_stats, group=dp_cp_group)
+    global_denominator = global_stats[1].clamp(min=1)
+
+    MTPLossAutoScaler.set_loss_scale(global_denominator.reciprocal())
+    (local_numerator / global_denominator).backward()
+
+    mtp_loss = None
+    if has_mtp:
+        MTPLossLoggingHelper.reduce_loss_in_tracker()
+        assert "values" in MTPLossLoggingHelper.tracker
+        mtp_loss = MTPLossLoggingHelper.tracker["values"].detach().float().clone()
+
+    grads = [(name, param) for name, param in model.named_parameters() if param.grad is not None]
+    assert grads, "Mixed GDN/GQA model did not produce parameter gradients."
+    grad_names, params = zip(*grads)
+    grad_tensors = [param.grad.detach().float().reshape(-1) for param in params]
+    # Sequence-parallel parameters (norms) only see their TP rank's shard of tokens;
+    # reduce them over TP so runs with different CP layouts are comparable per rank.
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    if tp_group.size() > 1:
+        for param, grad in zip(params, grad_tensors):
+            if getattr(param, "sequence_parallel", False):
+                dist.all_reduce(grad, group=tp_group)
+    grad_vector = torch.cat(grad_tensors)
+    dist.all_reduce(grad_vector, group=dp_cp_group)
+    return global_stats[0] / global_denominator, mtp_loss, grad_names, grad_vector
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.parametrize("model_type", ("gpt", "hybrid"))
+@pytest.mark.parametrize("dynamic_context_parallel", (False, True), ids=("thd_cp", "dcp"))
+@pytest.mark.parametrize("tp_size", (1, 2), ids=("tp1", "tp2_sp"))
+def test_mixed_gdn_gqa_model_cp_correctness(
+    monkeypatch, model_type, dynamic_context_parallel, tp_size
+):
+    """Compare mixed GDN/GQA/MTP models against a THD CP=1 baseline.
+
+    Each of the {fixed THD CP, DCP} x {GPTModel, HybridModel} x {TP1, TP2+SP} cases
+    uses a no-CP reference with the same TP layout that processes one complete
+    packed sequence per DPxCP rank. The candidate runs the contiguous CP layout, so
+    its attention layers convert to zigzag internally: with TP2+SP that is the
+    fused TP x CP all-to-all, over the static TP x CP group or, under dynamic CP,
+    over the TP x sub-group process group.
+    """
+    if not torch.cuda.is_available() or Utils.world_size != 8:
+        pytest.skip("Mixed GDN/GQA model CP correctness requires exactly 8 CUDA ranks.")
+
+    seed = 1234
+    sequence_parallel = tp_size > 1
+    # MTP runs in every case, including TP2+SP with the contiguous layout: MTP rolls the
+    # padding mask in the CP-local layout of its other token-side fields.
+    mtp_num_layers = 1
+    reference_config = _make_mixed_model_config(
+        linear_cp_mode="chunkwise",
+        cp_partition_mode="zigzag",
+        dynamic_context_parallel=False,
+        context_parallel_size=1,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=sequence_parallel,
+        mtp_num_layers=mtp_num_layers,
+    )
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size, context_parallel_size=1)
+    try:
+        reference_dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        reference_cp_group = parallel_state.get_context_parallel_group()
+        reference_seq_indices = [dist.get_rank(group=reference_dp_cp_group)]
+
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        reference_model = _build_mixed_model(model_type, reference_config)
+        reference_batch, reference_packed_seq_params = _prepare_mixed_model_batch(
+            reference_seq_indices, reference_cp_group, reference_config, reference_model.vocab_size
+        )
+        reference_stats = _run_mixed_model(
+            reference_model, reference_batch, reference_packed_seq_params, reference_dp_cp_group
+        )
+        reference_state_dict = {
+            name: value.detach().cpu().clone() if torch.is_tensor(value) else value
+            for name, value in reference_model.state_dict().items()
+        }
+
+        assert reference_cp_group.size() == 1
+        assert reference_packed_seq_params.qkv_format == "thd"
+        assert reference_packed_seq_params.cp_partition_mode == "zigzag"
+    finally:
+        MTPLossLoggingHelper.tracker = {}
+        Utils.destroy_model_parallel()
+
+    del reference_model, reference_batch, reference_packed_seq_params
+
+    candidate_config = _make_mixed_model_config(
+        linear_cp_mode="chunkwise",
+        cp_partition_mode="contiguous",
+        dynamic_context_parallel=dynamic_context_parallel,
+        context_parallel_size=2,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=sequence_parallel,
+        mtp_num_layers=mtp_num_layers,
+    )
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=2,
+        dynamic_context_parallel=dynamic_context_parallel,
+    )
+    try:
+        candidate_dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        if dynamic_context_parallel:
+            dp_cp_rank = dist.get_rank(group=candidate_dp_cp_group)
+            if dp_cp_rank < 4:
+                local_cp_size, candidate_seq_indices = 4, range(4)
+            elif dp_cp_rank < 6:
+                local_cp_size, candidate_seq_indices = 2, range(4, 6)
+            else:
+                local_cp_size, candidate_seq_indices = 1, [dp_cp_rank]
+            candidate_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
+                group_size=local_cp_size
+            )
+        else:
+            dp_rank = parallel_state.get_data_parallel_rank()
+            candidate_seq_indices = range(2 * dp_rank, 2 * dp_rank + 2)
+            candidate_cp_group = parallel_state.get_context_parallel_group()
+
+        torch.manual_seed(seed)
+        model_parallel_cuda_manual_seed(seed)
+        candidate_model = _build_mixed_model(model_type, candidate_config)
+        candidate_model.load_state_dict(reference_state_dict)
+        candidate_batch, candidate_packed_seq_params = _prepare_mixed_model_batch(
+            candidate_seq_indices, candidate_cp_group, candidate_config, candidate_model.vocab_size
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            candidate_stats = _run_mixed_model(
+                candidate_model, candidate_batch, candidate_packed_seq_params, candidate_dp_cp_group
+            )
+        used_composed_fallback = any(
+            issubclass(w.category, RuntimeWarning) and "naive TP gather" in str(w.message)
+            for w in caught
+        )
+        # Static and dynamic CP both take the fused route (dynamic CP through the
+        # TP x sub-group process groups); the composed fallback is only for groups that
+        # cannot be fused.
+        assert not used_composed_fallback
+
+        reference_loss, reference_mtp_loss, reference_grad_names, reference_grads = reference_stats
+        candidate_loss, candidate_mtp_loss, candidate_grad_names, candidate_grads = candidate_stats
+
+        assert reference_grad_names == candidate_grad_names
+        assert candidate_packed_seq_params.cp_partition_mode == "contiguous"
+        # A microbatch always carries the CP-only route and, under sequence parallelism,
+        # the fused TP x CP route for its sequence-parallel shards next to it. Ranks that
+        # process their sequences alone under dynamic CP (a CP group of size 1, which
+        # finalize_packed_seq_params stores as cp_singleton_group) convert nothing and
+        # carry no route at all.
+        candidate_runtime_cp_group = (
+            candidate_packed_seq_params.cp_group or candidate_packed_seq_params.cp_singleton_group
+        )
+        if candidate_runtime_cp_group.size() == 1:
+            assert candidate_packed_seq_params.tp_cp_partition_route is None
+            assert candidate_packed_seq_params.cp_partition_route is None
+        else:
+            assert (
+                candidate_packed_seq_params.tp_cp_partition_route is not None
+            ) == sequence_parallel
+            assert candidate_packed_seq_params.cp_partition_route is not None
+        torch.testing.assert_close(candidate_loss, reference_loss, atol=5e-3, rtol=0.0)
+        torch.testing.assert_close(candidate_mtp_loss, reference_mtp_loss, atol=5e-3, rtol=0.0)
+        assert_close("aggregated parameter gradients", candidate_grads, reference_grads, False)
+
+        if sequence_parallel:
+            # Model-level check that the fused TP x CP all-to-all and the composed
+            # TP gather -> CP all-to-all -> TP scatter path agree: force the fallback
+            # and rerun the same model on the same batch. The metadata is prepared
+            # afresh under the patch so that only the CP-only route the composed
+            # fallback needs is present and no stale fused route can be picked up.
+            candidate_model.zero_grad(set_to_none=True)
+            for module in (cp_layout_conversion, cp_layout_routes):
+                monkeypatch.setattr(
+                    module,
+                    "resolve_tp_cp_group_rank_by_logical_rank",
+                    lambda cp_group, tp_group, tp_cp_group: None,
+                )
+            fallback_batch, fallback_packed_seq_params = _prepare_mixed_model_batch(
+                candidate_seq_indices,
+                candidate_cp_group,
+                candidate_config,
+                candidate_model.vocab_size,
+            )
+            fallback_runtime_cp_group = (
+                fallback_packed_seq_params.cp_group or fallback_packed_seq_params.cp_singleton_group
+            )
+            assert fallback_packed_seq_params.tp_cp_partition_route is None
+            assert (fallback_packed_seq_params.cp_partition_route is not None) == (
+                fallback_runtime_cp_group.size() > 1
+            )
+            with pytest.warns(RuntimeWarning, match="naive TP gather"):
+                fallback_stats = _run_mixed_model(
+                    candidate_model,
+                    fallback_batch,
+                    fallback_packed_seq_params,
+                    candidate_dp_cp_group,
+                )
+            fallback_loss, _, fallback_grad_names, fallback_grads = fallback_stats
+            assert fallback_grad_names == candidate_grad_names
+            torch.testing.assert_close(fallback_loss, candidate_loss, atol=1e-3, rtol=0.0)
+            assert_close(
+                "fused vs composed TP x CP conversion gradients",
+                fallback_grads,
+                candidate_grads,
+                False,
+            )
+    finally:
+        MTPLossLoggingHelper.tracker = {}
+        Utils.destroy_model_parallel()

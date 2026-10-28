@@ -1012,8 +1012,10 @@ class TestAttnResConfigValidation:
     def test_mutually_exclusive_with_mhc(self):
         from megatron.core.transformer.transformer_config import TransformerConfig
 
+        # main unified mHC on enable_mhc_connections (the dev-only enable_hyper_connections
+        # field was dropped); AttnRes stays mutually exclusive with it.
         with pytest.raises(ValueError, match="mutually"):
-            TransformerConfig(**self._base_kwargs(enable_hyper_connections=True))
+            TransformerConfig(**self._base_kwargs(enable_mhc_connections=True))
 
     def test_attn_res_recompute_requires_enable(self):
         from megatron.core.transformer.transformer_config import TransformerConfig

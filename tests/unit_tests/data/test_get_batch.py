@@ -169,6 +169,320 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
     return iter([batch]), num_real_tokens
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeypatch, enabled):
+    """The Hybrid scheduler hook follows normalized TransformerConfig values."""
+    args = SimpleNamespace(
+        context_parallel_size=4,
+        sft=False,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=False,
+        dynamic_context_parallel=False,
+        sequence_packing_scheduler="dp_balanced",
+        # Deliberately disagree with config: the hook must not read raw args.
+        dsa_cp_balance_indexer=not enabled,
+        pad_packed_seq_alignment=8,
+        cuda_graph_impl="none",
+    )
+    config = SimpleNamespace(
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=0,
+        virtual_pipeline_model_parallel_size=None,
+        linear_cp_layout="contiguous",
+        dsa_cp_balance_indexer=enabled,
+        dsa_cp_balance_indexer_graph_dynamic_packs=enabled,
+        pad_packed_seq_alignment="max",
+        cuda_graph_impl="transformer_engine",
+        max_seqlen_per_dp_cp_rank=1024,
+        context_parallel_size=4,
+    )
+    packed_seq_params = PackedSeqParams(cp_group=object())
+    scheduler_batch = (
+        object(),  # tokens
+        object(),  # labels
+        object(),  # loss_mask
+        object(),  # attention_mask
+        object(),  # position_ids
+        packed_seq_params,
+        object(),  # padding_mask
+    )
+
+    monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
+    monkeypatch.setattr(pretrain_hybrid, "core_transformer_config_from_args", lambda _args: config)
+    monkeypatch.setattr(pretrain_hybrid.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(pretrain_hybrid, "mtp_on_this_rank_func", lambda **_kwargs: False)
+    scheduler = MagicMock(return_value=scheduler_batch)
+    finalize = MagicMock(return_value=packed_seq_params)
+    prebuild = MagicMock()
+    monkeypatch.setattr(pretrain_hybrid, "get_batch_on_this_rank_for_sequence_packing", scheduler)
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
+    monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
+
+    result = pretrain_hybrid.get_batch(None)
+
+    assert result.get_packed_seq_params() is packed_seq_params
+    assert result.get_batch()["tokens"] is scheduler_batch[0]
+    scheduler.assert_called_once()
+    assert scheduler.call_args.kwargs["config"] is config
+    finalize.assert_called_once_with(packed_seq_params, sequence_parallel=False)
+    if enabled:
+        prebuild.assert_called_once_with(
+            packed_seq_params,
+            cp_group=packed_seq_params.cp_group,
+            pad_alignment="max",
+            capacity=4096,
+            graphs_enabled=True,
+            graph_dynamic_packs=True,
+        )
+    else:
+        prebuild.assert_not_called()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeypatch, enabled):
+    """The GPT scheduler hook follows normalized TransformerConfig values."""
+    args = SimpleNamespace(
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=False,
+        # Deliberately disagree with config: the hook must not read raw args.
+        dsa_cp_balance_indexer=not enabled,
+        pad_packed_seq_alignment=8,
+        cuda_graph_impl="none",
+    )
+    config = SimpleNamespace(
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=0,
+        virtual_pipeline_model_parallel_size=None,
+        dsa_cp_balance_indexer=enabled,
+        dsa_cp_balance_indexer_graph_dynamic_packs=enabled,
+        pad_packed_seq_alignment="max",
+        cuda_graph_impl="transformer_engine",
+        max_seqlen_per_dp_cp_rank=1024,
+        context_parallel_size=4,
+    )
+    packed_seq_params = PackedSeqParams(cp_group=object())
+    scheduler_batch = (
+        object(),  # tokens
+        object(),  # labels
+        object(),  # loss_mask
+        object(),  # attention_mask
+        object(),  # position_ids
+        packed_seq_params,
+        object(),  # padding_mask
+    )
+
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
+    monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _args: config)
+    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *_args, **_kwargs: False)
+    scheduler = MagicMock(return_value=scheduler_batch)
+    finalize = MagicMock(return_value=packed_seq_params)
+    prebuild = MagicMock()
+    monkeypatch.setattr(pretrain_gpt, "get_batch_on_this_rank_for_sequence_packing", scheduler)
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
+    monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
+
+    result = pretrain_gpt.get_batch(None)
+
+    assert result is scheduler_batch
+    scheduler.assert_called_once()
+    finalize.assert_called_once_with(packed_seq_params, sequence_parallel=False)
+    if enabled:
+        prebuild.assert_called_once_with(
+            packed_seq_params,
+            cp_group=packed_seq_params.cp_group,
+            pad_alignment="max",
+            capacity=4096,
+            graphs_enabled=True,
+            graph_dynamic_packs=True,
+        )
+    else:
+        prebuild.assert_not_called()
+
+
+@pytest.mark.parametrize("frontend", ["gpt", "hybrid"])
+def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, frontend):
+    """An MLP-only graph must not pin the eager indexer's pack composition."""
+    module = pretrain_gpt if frontend == "gpt" else pretrain_hybrid
+    args = SimpleNamespace(
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=False,
+        context_parallel_size=4,
+        sft=False,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=False,
+    )
+    config = SimpleNamespace(
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=0,
+        virtual_pipeline_model_parallel_size=None,
+        linear_cp_layout="contiguous",
+        dsa_cp_balance_indexer=True,
+        dsa_cp_balance_indexer_graph_dynamic_packs=False,
+        pad_packed_seq_alignment="max",
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=["mlp"],
+        max_seqlen_per_dp_cp_rank=1024,
+        context_parallel_size=4,
+    )
+    packed_seq_params = PackedSeqParams(cp_group=object())
+    scheduler_batch = (
+        object(),
+        object(),
+        object(),
+        object(),
+        object(),
+        packed_seq_params,
+        object(),
+    )
+
+    monkeypatch.setattr(module, "get_args", lambda: args)
+    monkeypatch.setattr(module, "core_transformer_config_from_args", lambda _args: config)
+    monkeypatch.setattr(
+        module,
+        "get_batch_on_this_rank_for_sequence_packing",
+        MagicMock(return_value=scheduler_batch),
+    )
+    finalize = MagicMock(return_value=packed_seq_params)
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
+    prebuild = MagicMock()
+    monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
+    if frontend == "gpt":
+        monkeypatch.setattr(module, "mtp_on_this_rank", lambda *_args, **_kwargs: False)
+        result = module.get_batch(None)
+        assert result is scheduler_batch
+    else:
+        monkeypatch.setattr(module.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(module, "mtp_on_this_rank_func", lambda **_kwargs: False)
+        result = module.get_batch(None)
+        assert result.get_packed_seq_params() is packed_seq_params
+
+    finalize.assert_called_once_with(packed_seq_params, sequence_parallel=False)
+    prebuild.assert_called_once_with(
+        packed_seq_params,
+        cp_group=packed_seq_params.cp_group,
+        pad_alignment="max",
+        capacity=None,
+        graphs_enabled=False,
+        graph_dynamic_packs=False,
+    )
+
+
+def test_hybrid_thd_forward_prebuilds_batch_metadata_once(monkeypatch):
+    """Prepare the real metadata from the Hybrid batch interface before model execution."""
+    config = SimpleNamespace(
+        dsa_cp_balance_indexer=True,
+        dsa_cp_balance_indexer_graph_dynamic_packs=False,
+        pad_packed_seq_alignment=12,
+        cuda_graph_impl="local",
+    )
+    args = SimpleNamespace(seq_length=4096)
+    cu_seqlens = torch.tensor([[0, 1024, 4096]], dtype=torch.int32)
+    loss_mask = torch.ones(4096)
+    tokens = torch.zeros(4096, dtype=torch.long)
+    batch = {
+        "attention_mask": None,
+        "cu_seqlens": cu_seqlens,
+        "hybrid_cp_group": object(),
+        "labels": torch.zeros_like(tokens),
+        "local_cp_size": torch.tensor(4),
+        "loss_mask": loss_mask,
+        "max_seqlen": torch.tensor(3072),
+        "position_ids": torch.arange(4096),
+        "tokens": tokens,
+        "padding_mask": None,
+    }
+    expected_params = _build_packed_seq_params(batch, "contiguous", 4, tokens_per_sample=None)
+    cp_batch = ContextParallelBatch.from_single_layout("contiguous", batch, expected_params)
+
+    monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
+    monkeypatch.setattr(pretrain_hybrid, "get_timers", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(pretrain_hybrid, "get_batch", MagicMock(return_value=cp_batch))
+    finalize = MagicMock(side_effect=lambda params, **kwargs: params)
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", finalize)
+    monkeypatch.setattr(pretrain_hybrid, "update_seqlen_stats_from_cu_seqlens", MagicMock())
+    monkeypatch.setattr(pretrain_hybrid, "stimer", MagicMock())
+
+    def get_model_attr(_model, attr):
+        return {"vp_stage": None, "config": config}[attr]
+
+    monkeypatch.setattr(pretrain_hybrid, "get_attr_wrapped_model", get_model_attr)
+    prebuild = MagicMock()
+    monkeypatch.setattr(cp_balanced_indexer, "prebuild_balanced_layouts", prebuild)
+    model = MagicMock(return_value=torch.zeros(4096))
+
+    pretrain_hybrid.forward_step(None, model)
+
+    (packed_seq_params,), kwargs = prebuild.call_args
+    finalize.assert_called_once_with(packed_seq_params, sequence_parallel=False)
+    prebuild.assert_called_once()
+    assert packed_seq_params is expected_params
+    assert packed_seq_params.cu_seqlens_q.tolist() == [0, 1024, 4096]
+    assert kwargs == {
+        "cp_group": batch["hybrid_cp_group"],
+        "pad_alignment": 12,
+        "capacity": None,
+        "graphs_enabled": True,
+        "graph_dynamic_packs": False,
+    }
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("needs_padding_mask", [False, True])
+def test_get_batch_on_this_tp_rank_full_iteration_cudagraph_safe(
+    monkeypatch, tp_rank, needs_padding_mask
+):
+    """Optional batch inputs must not require host/device transfers during capture."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA Graph capture requires CUDA")
+
+    from megatron.training.utils import common_utils
+
+    torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
+    device = torch.cuda.current_device()
+    shape = (1, 4)
+    data = {
+        "tokens": torch.ones(shape, dtype=torch.int64, device=device),
+        "labels": torch.ones(shape, dtype=torch.int64, device=device),
+        "loss_mask": torch.ones(shape, dtype=torch.float32, device=device),
+        "position_ids": torch.arange(shape[1], dtype=torch.int64, device=device).view(shape),
+    }
+    if needs_padding_mask:
+        data["padding_mask"] = torch.zeros(shape, dtype=torch.bool, device=device)
+
+    args = SimpleNamespace(
+        create_attention_mask_in_dataloader=False,
+        cuda_graph_impl="full_iteration",
+        dynamic_context_parallel=False,
+        micro_batch_size=shape[0],
+        pipeline_model_parallel_size=1,
+        seq_length=shape[1],
+        sft=False,
+    )
+    monkeypatch.setattr(common_utils, "get_args", lambda: args)
+    monkeypatch.setattr(common_utils.mpu, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    monkeypatch.setattr(common_utils.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
+    monkeypatch.setattr(common_utils.mpu, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(torch.distributed, "broadcast", lambda *args, **kwargs: None)
+
+    data_iterator = iter([data]) if tp_rank == 0 else None
+    marker = torch.zeros((), device=device)
+    marker.add_(1)
+    marker.zero_()
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        marker.add_(1)
+        batch = common_utils.get_batch_on_this_tp_rank(
+            data_iterator, needs_padding_mask=needs_padding_mask
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+
+    # Capture records CUDA work without executing it; one replay increments once.
+    assert marker.item() == 1
+    assert (batch["padding_mask"] is not None) == needs_padding_mask
+
+
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
 @pytest.mark.parametrize("pp_size", [1, 2, 4])
 @pytest.mark.parametrize("cp_size", [1, 2, 4])
@@ -1067,6 +1381,7 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     ):
         cp_batch = get_batch(None)
 
+    finalize.assert_called_once_with(packed_seq_params, sequence_parallel=False)
     assert set(cp_batch.batches_by_layout) == {"zigzag"}
     assert cp_batch.get_packed_seq_params() is packed_seq_params
     batch = cp_batch.get_batch()
