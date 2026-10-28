@@ -368,6 +368,8 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 and module.expert_bias is not None
             ):
                 module.local_tokens_per_expert.zero_()
+            if getattr(module, 'qb_histogram', None) is not None:
+                module.qb_histogram.zero_()
             if (
                 config.moe_router_load_balancing_type == "global_aux_loss"
                 or "global_aux_loss" in config.moe_router_load_balancing_type
