@@ -1,6 +1,7 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from .groups import get_valid_dynamic_context_parallel_group_sizes
+from .conversion import CpPartitionModeConverter, convert_module_input_tensors_cp_partition_mode
 from .layout import (
     ContextParallelLayoutManager,
     ContextParallelLayoutState,
@@ -11,10 +12,19 @@ from .layout import (
     convert_cp_layout,
     zigzag_to_contiguous,
 )
+from .metadata import finalize_packed_seq_params
+from .routes import prebuild_thd_cp_partition_routes
+from .types import CpPartitionMode, ThdCpRoute
 from .utils import ContextParallelBatch, get_batches_on_this_cp_rank
 
 __all__ = [
     "CPLayout",
+    "CpPartitionMode",
+    "CpPartitionModeConverter",
+    "ThdCpRoute",
+    "convert_module_input_tensors_cp_partition_mode",
+    "finalize_packed_seq_params",
+    "prebuild_thd_cp_partition_routes",
     "ContextParallelBatch",
     "ContextParallelLayoutManager",
     "ContextParallelLayoutState",
