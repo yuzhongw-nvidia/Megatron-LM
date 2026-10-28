@@ -230,6 +230,8 @@ class MockSFTLowLevelDataset:
 
     Args:
         mode (str): Either 'file' or 'distribution'.
+        vocab_size (Optional[int]): Tokenizer vocabulary size. Required: generated token ids
+            wrap at ``vocab_size - 1`` so long mock sequences never exceed the vocabulary.
         **kwargs: Additional arguments depending on mode.
             For mode='file': path (str) - path to a CSV file with sequence lengths.
             For mode='distribution': type (str), min_seq_len (int), max_seq_len (int),
@@ -242,8 +244,16 @@ class MockSFTLowLevelDataset:
     size: int = 1000000
     """The hard-coded number of sequence to generate"""
 
-    def __init__(self, mode: str, **kwargs) -> None:
+    def __init__(self, mode: str, vocab_size: Optional[int] = None, **kwargs) -> None:
         np.random.seed(self.seed)
+        self.vocab_size = vocab_size
+
+        if vocab_size is None or vocab_size < 2:
+            raise ValueError(
+                "Generated mock data requires vocab_size >= 2. If tokenizer.vocab_size is "
+                "unavailable, set vocab_size in the mock dataset config JSON; "
+                f"got {vocab_size}."
+            )
 
         if mode == "file":
             # One sequence length per CSV line; non-numeric cells (e.g. a
@@ -291,6 +301,10 @@ class MockSFTLowLevelDataset:
 
         length = self.sequence_lengths[idx % self.size]
         sample = np.arange(1, length, dtype=np.int64)
+        # Preserve the original positive-token invariant while bounding IDs to the
+        # tokenizer vocabulary. In particular, do not synthesize token 0, which is
+        # commonly used as EOD/padding and therefore masked out of the loss.
+        sample = (sample - 1) % (self.vocab_size - 1) + 1
         return sample
 
 
@@ -321,6 +335,7 @@ class MockSFTDataset(SFTDataset):
             }
         else:
             mock_config = load_json_arg(config.sft_mock_dataset_config_json)
+        mock_config.setdefault("vocab_size", getattr(config.tokenizer, "vocab_size", None))
         return MockSFTLowLevelDataset(**mock_config)
 
     def __len__(self) -> int:
