@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import logging
 import math
 import os
@@ -515,7 +516,7 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     gdn_pre_gated_delta_rule_fusion: bool = False
-    """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+    """Whether to use streamed Triton pre-GDR preprocessing for GDN-family attention."""
 
     gdn_gated_output_norm_fusion: bool = False
     """Fuse GatedDeltaNet output RMSNorm and SiLU gating. Unsupported configurations and
@@ -2365,6 +2366,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"but current device has compute capability {sm[0]}.{sm[1]}."
                 )
                 uses_ratio4_indexer = 4 in self.csa_compress_ratios and not self.csa_dense_mode
+                # The MXFP8 DSA indexer precision knob is not carried on this branch; the
+                # cuDNN wrapper check below only needs a defined (False) flag.
+                uses_mxfp8_indexer = uses_ratio4_indexer and (
+                    getattr(self, "dsa_indexer_precision", None) == "mxfp8"
+                )
                 indexer_loss_enabled = (self.dsa_indexer_loss_coeff or 0.0) > 0
                 if (
                     sm[0] == 9
@@ -2377,13 +2383,68 @@ class TransformerConfig(ModelParallelConfig):
                         "because the cuDNN Frontend SM90 dense DSA kernels are not reliable for "
                         "this path. Use sparse indexer loss or set dsa_kernel_backend='none'."
                     )
-            self.hetereogenous_dist_checkpoint = True
 
-        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
+                from cudnn import DSA
+
+                if sm[0] >= 10 and uses_ratio4_indexer:
+                    compact_wrapper = getattr(DSA, "indexer_forward_top_k_wrapper", None)
+                    required_parameters = {"deterministic"}
+                    if uses_mxfp8_indexer:
+                        required_parameters.update(
+                            {
+                                "precision",
+                                "q_scale",
+                                "k_scale",
+                                "cu_seqlens_q_scale_padded",
+                                "cu_seqlens_k_scale_padded",
+                                "sf_vec_size",
+                            }
+                        )
+                    wrapper_parameters = (
+                        set(inspect.signature(compact_wrapper).parameters)
+                        if callable(compact_wrapper)
+                        else set()
+                    )
+                    missing_parameters = required_parameters - wrapper_parameters
+                    if missing_parameters:
+                        raise ValueError(
+                            "Fused DSA indexer requires a compatible cuDNN Frontend compact "
+                            "wrapper; "
+                            f"missing parameters: {', '.join(sorted(missing_parameters))}"
+                        )
+
+                if (
+                    self.context_parallel_size > 1 or self.dynamic_context_parallel
+                ) and uses_ratio4_indexer:
+                    required_wrappers = [DSA.indexer_forward_wrapper]
+                    if indexer_loss_enabled and not self.dsa_indexer_use_sparse_loss:
+                        required_wrappers.extend(
+                            [
+                                DSA.dense_indexer_score_recompute_wrapper,
+                                DSA.dense_attn_score_recompute_wrapper,
+                                DSA.dense_indexer_backward_wrapper,
+                            ]
+                        )
+                    missing_offsets = [
+                        wrapper.__name__
+                        for wrapper in required_wrappers
+                        if "q_causal_offsets" not in inspect.signature(wrapper).parameters
+                    ]
+                    if missing_offsets:
+                        raise ValueError(
+                            "DSv4 CP with ratio-4 fused DSA requires cuDNN Frontend wrappers "
+                            "with q_causal_offsets support; missing from: "
+                            f"{', '.join(missing_offsets)}. Install a compatible cuDNN Frontend "
+                            "build or set dsa_kernel_backend='none'."
+                        )
+
+        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant not in (
+            "gdn",
+            "kda",
+        ):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
-                "experimental_attention_variant='gdn' "
-                "or deprecated alias experimental_attention_variant='gated_delta_net'."
+                "experimental_attention_variant='gdn' or 'kda'."
             )
 
         if self.gdn_gated_output_norm_fusion and self.experimental_attention_variant != "gdn":
