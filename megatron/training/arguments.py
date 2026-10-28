@@ -1192,6 +1192,35 @@ def validate_args(args, defaults={}):
         _check_arg_is_not_none(args, req_arg)
 
     # Checks.
+    # The Kimi-K3 dev spelling of SiTU-GLU, --situ-glu [--situ-glu-beta1 B1 --situ-glu-beta2 B2],
+    # is SwiGLU with the soft tanh clamps activation_func_tanh_clamp_scale (gate half, B1) and
+    # activation_func_tanh_clamp_scale_linear (linear half, B2). Resolve the alias before any
+    # check that depends on args.swiglu.
+    if getattr(args, 'situ_glu', False):
+        if args.swiglu or args.quick_geglu or args.squared_relu:
+            raise ValueError(
+                "--situ-glu is mutually exclusive with --swiglu, --quick-geglu, and --squared-relu."
+            )
+        situ_glu_beta1 = args.situ_glu_beta1 if args.situ_glu_beta1 is not None else 4.0
+        situ_glu_beta2 = args.situ_glu_beta2 if args.situ_glu_beta2 is not None else 25.0
+        for name, value in (
+            ('activation_func_tanh_clamp_scale', situ_glu_beta1),
+            ('activation_func_tanh_clamp_scale_linear', situ_glu_beta2),
+        ):
+            current = getattr(args, name, None)
+            if current is not None and current != value:
+                raise ValueError(
+                    f"--situ-glu sets {name}={value} (--situ-glu-beta1/--situ-glu-beta2), which "
+                    f"contradicts --{name.replace('_', '-')} {current}."
+                )
+            setattr(args, name, value)
+        args.swiglu = True
+    elif (
+        getattr(args, 'situ_glu_beta1', None) is not None
+        or getattr(args, 'situ_glu_beta2', None) is not None
+    ):
+        raise ValueError("--situ-glu-beta1 and --situ-glu-beta2 require --situ-glu.")
+
     if args.ffn_hidden_size is None:
         if args.swiglu:
             # reduce the dimnesion for MLP since projections happens on
@@ -2565,6 +2594,17 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
+    group.add_argument('--situ-glu', '--moe-use-situ-glu', action='store_true',
+                       help='Use SiTU-GLU in all dense and MoE FFNs (the Kimi-K3 dev spelling): '
+                       'SwiGLU with the soft tanh clamps activation_func_tanh_clamp_scale (gate '
+                       'half, --situ-glu-beta1) and activation_func_tanh_clamp_scale_linear '
+                       '(linear half, --situ-glu-beta2).')
+    group.add_argument('--situ-glu-beta1', type=float, default=None,
+                       help='Soft clamp scale of the SiTU-GLU gate half (default 4.0). '
+                       'Requires --situ-glu.')
+    group.add_argument('--situ-glu-beta2', type=float, default=None,
+                       help='Soft clamp scale of the SiTU-GLU linear half (default 25.0). '
+                       'Requires --situ-glu.')
     group.add_argument('--quick-geglu', action='store_true',
                        help='Use quick geglu activation instead of default gelu')
     group.add_argument('--onnx-safe', type=bool, required=False,
