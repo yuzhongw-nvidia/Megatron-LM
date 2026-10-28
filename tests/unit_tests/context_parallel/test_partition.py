@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.context_parallel.partition import get_cp_partition_indices, partition_batch
+from megatron.core.context_parallel.layout.partition import get_cp_partition_indices, partition_batch
 from megatron.core.context_parallel.utils import _get_batch_on_this_cp_rank_contiguous
 from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
 from megatron.core.utils import _get_batch_on_this_cp_rank_per_document_balancing

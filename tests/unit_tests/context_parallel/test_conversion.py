@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import megatron.core.context_parallel.conversion as context_parallel_layout_conversion
+import megatron.core.context_parallel.layout.conversion as context_parallel_layout_conversion
 from megatron.core import parallel_state
 from megatron.core.context_parallel import (
     CpPartitionModeConverter,
@@ -14,7 +14,7 @@ from megatron.core.context_parallel import (
     finalize_packed_seq_params,
     prebuild_thd_cp_partition_routes,
 )
-from megatron.core.context_parallel.routes import (
+from megatron.core.context_parallel.layout.routes import (
     build_thd_cp_partition_route,
     get_thd_cp_partition_route,
 )
@@ -360,7 +360,7 @@ def test_finalize_packed_seq_params_uses_caller_group_with_dynamic_override(monk
         calls.append((packed_seq_params, cp_group))
 
     monkeypatch.setattr(
-        "megatron.core.context_parallel.routes.prebuild_thd_cp_partition_routes", fake_prebuild
+        "megatron.core.context_parallel.layout.routes.prebuild_thd_cp_partition_routes", fake_prebuild
     )
 
     static_packed_seq_params = PackedSeqParams(cp_group=None)

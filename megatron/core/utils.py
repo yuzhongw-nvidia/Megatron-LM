@@ -2595,7 +2595,7 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
         dict[str, torch.Tensor]: The batch with sequence-dimension tensors
         partitioned to this CP rank.
     """
-    from megatron.core.context_parallel.partition import get_cp_partition_indices, partition_batch
+    from megatron.core.context_parallel.layout.partition import get_cp_partition_indices, partition_batch
 
     cp_size = torch.distributed.get_world_size(cp_group)
     cp_rank = torch.distributed.get_rank(cp_group)

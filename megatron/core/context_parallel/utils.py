@@ -11,7 +11,7 @@ from megatron.core._batch_api_compat import deprecated_hybrid_cp_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from .layout import CPLayout, THDCPLayoutPlan, _build_thd_zigzag_metadata, build_thd_cp_layout_plan
-from .partition import get_cp_partition_indices, partition_batch
+from .layout.partition import get_cp_partition_indices, partition_batch
 
 
 @dataclass(eq=False)

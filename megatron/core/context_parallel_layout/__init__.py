@@ -1,24 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Compatibility exports for the context-parallel layout API.
+"""COMPATIBILITY SHIM -- do not add implementation here.
 
-Implementation and new imports live in :mod:`megatron.core.context_parallel`.
+The context-parallel layout API now lives in
+:mod:`megatron.core.context_parallel.layout`. This module only re-exports that
+package so older ``import megatron.core.context_parallel_layout`` call sites keep
+working. It is TEMPORARY and WILL BE DROPPED once every caller imports from
+``megatron.core.context_parallel.layout`` directly.
 """
 
-from megatron.core.context_parallel import (
-    CpPartitionMode,
-    CpPartitionModeConverter,
-    ThdCpRoute,
-    convert_module_input_tensors_cp_partition_mode,
-    finalize_packed_seq_params,
-    prebuild_thd_cp_partition_routes,
-)
+from megatron.core.context_parallel.layout import *  # noqa: F401,F403
+from megatron.core.context_parallel.layout import __all__ as _layout_all
 
-__all__ = [
-    "CpPartitionMode",
-    "CpPartitionModeConverter",
-    "ThdCpRoute",
-    "convert_module_input_tensors_cp_partition_mode",
-    "finalize_packed_seq_params",
-    "prebuild_thd_cp_partition_routes",
-]
+__all__ = list(_layout_all)

@@ -7,7 +7,7 @@ from functools import lru_cache
 
 import torch
 
-from megatron.core.context_parallel.types import CPLayout
+from .types import CPLayout
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.utils import nvtx_range

@@ -7,13 +7,13 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, Union, cast
 
 import torch
 
-from megatron.core.context_parallel.layout import _redistribute_layout
-from megatron.core.context_parallel.metadata import get_packed_seq_params_cp_partition_cu_seqlens
-from megatron.core.context_parallel.routes import (
+from .manager import _redistribute_layout
+from .metadata import get_packed_seq_params_cp_partition_cu_seqlens
+from .routes import (
     build_thd_cp_partition_route,
     get_thd_cp_partition_route,
 )
-from megatron.core.context_parallel.types import CpPartitionMode, ThdCpRoute
+from .types import CpPartitionMode, ThdCpRoute
 from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.utils import nvtx_range
 
