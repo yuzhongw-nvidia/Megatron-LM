@@ -14,9 +14,16 @@ from megatron.core.datasets.data_schedule_utils import (
     build_packed_microbatches,
     create_data_iterator,
     get_batch_and_global_seqlens,
+    get_cp_slice_for_thd,
     reroute_samples_to_dcp_ranks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    extend_thd_padding_before_cp_slice,
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+    resolve_thd_tail_padding_policy,
+)
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 
@@ -745,6 +752,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     mtp_on_this_rank: bool = False,
     vp_stage: Optional[int] = None,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    config=None,
 ):
     """
     Get a batch of data for sequence packing.
@@ -752,6 +760,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
+        config: Model config used for CP partitioning and optional THD packed-sequence
+            padding. When None, CP partitioning defaults to zigzag and no padding is applied.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)
@@ -779,22 +789,61 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     # data_iterator should return a batch including the following keys.
     batch_keys = ['cu_seqlens', 'cu_seqlens_padded', 'max_seqlen']
-    if is_first_stage:
+    if is_first_stage or mtp_on_this_rank:
         batch_keys.append('tokens')
         batch_keys.append('position_ids')
-    if is_last_stage:
+    if is_last_stage or mtp_on_this_rank:
         batch_keys.append('labels')
         batch_keys.append('loss_mask')
 
     # Get a batch from data_iterator or create an emtpy batch.
     if is_tp_rank_0:
         assert data_iterator is not None
-        batch = next(data_iterator)
+        # Work on a shallow copy: the per-rank slicing below rebinds the entries in place,
+        # and replay paths (RerunDataIterator, the PagedStashRunner dropless retry) serve
+        # the same dict objects again expecting the pre-slice tensors.
+        batch = dict(next(data_iterator))
         for key in batch_keys:
             assert key in batch, f"{key} is missing in current batch."
     else:
         assert data_iterator is None, "Non TP 0 rank should not have data_iterator"
         batch = {}
+
+    # Reconcile dev's single-knob cp_partition_mode (contiguous packed-THD CP, where the
+    # attention module converts its own input to zigzag) with the default zigzag path. When
+    # cp_partition_mode == "zigzag" (default; config is None) everything below is inert and
+    # the legacy path is byte-for-byte unchanged.
+    cp_partition_mode = getattr(config, "cp_partition_mode", "zigzag")
+    tail_padding_policy = resolve_thd_tail_padding_policy(config)
+    contiguous_cp_local_target_len = None
+    non_dummy_global_target_len = None
+    pad_alignment = (
+        getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
+    )
+    alignment = target_len = max_num_seqs = None
+    if pad_alignment is not None:
+        alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+            pad_alignment,
+            getattr(config, 'max_seqlen_per_dp_cp_rank', None),
+            getattr(config, 'thd_max_packed_sequences', None),
+            getattr(config, 'cuda_graph_impl', 'none') != 'none',
+        )
+    if (
+        is_tp_rank_0
+        and cp_group.size() > 1
+        and cp_partition_mode == "contiguous"
+        and pad_alignment is not None
+    ):
+        if target_len is not None:
+            contiguous_cp_local_target_len = target_len
+        else:
+            # Fix the local width before slicing so later padding cannot shift rank origins.
+            assert alignment is not None
+            total_rows = int(batch['cu_seqlens_padded'][-1].item())
+            local_rows = (total_rows + cp_group.size() - 1) // cp_group.size()
+            contiguous_cp_local_target_len = (
+                (local_rows + alignment - 1) // alignment
+            ) * alignment
 
     # Build padding_mask before CP slicing while tensors still have the full
     # packed length represented by cu_seqlens_padded[-1].
@@ -804,27 +853,44 @@ def get_batch_on_this_rank_for_sequence_packing(
         )
         _sanitize_thd_padding_values(batch, batch['padding_mask'])
 
-    # Partition padding_mask for context parallel on every PP stage. Partition
-    # token-like tensors only on stages that own them.
+        # In extend_last mode, the padding tail belongs to the final real sequence. Extend
+        # its global physical endpoint before CP slicing so both zigzag indices and
+        # contiguous rank origins see the padded layout. Inert unless pad_alignment is set.
+        if pad_alignment is not None and tail_padding_policy == 'extend_last':
+            batch['cu_seqlens_padded'], batch['max_seqlen'], non_dummy_global_target_len = (
+                extend_thd_padding_before_cp_slice(
+                    batch['cu_seqlens_padded'],
+                    batch['max_seqlen'],
+                    alignment=alignment,
+                    target_len=(
+                        target_len if target_len is not None else contiguous_cp_local_target_len
+                    ),
+                    cp_size=cp_group.size(),
+                    cp_partition_mode=cp_partition_mode,
+                )
+            )
+
+    # Partition sequence tensors for context parallelism. Padding mask is needed on every
+    # PP stage; token-like tensors only on stages that own them. get_cp_slice_for_thd
+    # dispatches on cp_partition_mode: "zigzag" (default) is identical to the legacy inline
+    # TE path; "contiguous" splits the (optionally padded) rows into equal per-rank blocks.
     if is_tp_rank_0:
-        cp_size = cp_group.size()
-        cp_rank = cp_group.rank()
-        # If cp_size == 1, no need to do further processing.
-        if cp_size > 1:
-            # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as
-            # cu_seqlens to get the correct result.
-            # TODO: Revert this workaround once TE fixes the issue.
-            cu_seqlens = batch["cu_seqlens_padded"]
-            total_tokens = int(cu_seqlens[-1].item())
-            assert (
-                tex is not None
-            ), "Transformer Engine is required to use Context Parallel with THD format data."
-            index = tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)
-            cp_slice_keys = ['padding_mask']
-            if is_first_or_last_stage:
-                cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
-            for key in cp_slice_keys:
-                batch[key] = batch[key].index_select(0, index)
+        cp_slice_keys = ['padding_mask']
+        if is_first_or_last_stage or mtp_on_this_rank:
+            cp_slice_keys.extend(['tokens', 'position_ids', 'labels', 'loss_mask'])
+        if non_dummy_global_target_len is not None:
+            partition_total_tokens = non_dummy_global_target_len
+        elif contiguous_cp_local_target_len is not None:
+            partition_total_tokens = contiguous_cp_local_target_len * cp_group.size()
+        else:
+            partition_total_tokens = None
+        get_cp_slice_for_thd(
+            batch,
+            cp_group,
+            keys=cp_slice_keys,
+            cp_partition_mode=cp_partition_mode,
+            partition_total_tokens=partition_total_tokens,
+        )
 
     # Broadcast the receive-buffer shapes inside the TP group:
     # - cu_seqlen_size is needed to allocate cu_seqlens / cu_seqlens_padded on non TP 0 ranks.
@@ -835,7 +901,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     )
     cu_seqlen_size, total_tokens = broadcast_scalars(shapes, tp_group, dev, dtype=torch.int32)
 
-    # Step1: Prepare "tokens", "position_ids" on all ranks.
+    # Step1: Prepare "tokens", "position_ids" for the first stage and MTP stages on all TP ranks.
     if is_first_stage or mtp_on_this_rank:
         if is_tp_rank_0:
             assert batch['tokens'].dtype == torch.int64
@@ -846,12 +912,12 @@ def get_batch_on_this_rank_for_sequence_packing(
             batch['tokens'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
             batch['position_ids'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
     else:
-        # Non first stage rank doesn't need tokens and position_ids.
+        # Ranks without the embedding or MTP layers don't need tokens and position_ids.
         batch['tokens'] = None
         batch['position_ids'] = None
 
-    # Step2: Prepare "labels", "loss_mask" on all ranks.
-    if is_last_stage:
+    # Step2: Prepare "labels", "loss_mask" for the last stage and MTP stages on all TP ranks.
+    if is_last_stage or mtp_on_this_rank:
         if is_tp_rank_0:
             assert batch['labels'].dtype == torch.int64
             assert batch['loss_mask'].dtype == torch.float32
@@ -861,7 +927,7 @@ def get_batch_on_this_rank_for_sequence_packing(
             batch['labels'] = torch.empty([1, total_tokens], dtype=torch.int64, device=dev)
             batch['loss_mask'] = torch.empty([1, total_tokens], dtype=torch.float32, device=dev)
     else:
-        # Non last stage rank doesn't need labels and loss_mask.
+        # Ranks without the loss head or MTP layers don't need labels and loss_mask.
         batch['labels'] = None
         batch['loss_mask'] = None
 
@@ -908,18 +974,58 @@ def get_batch_on_this_rank_for_sequence_packing(
     cu_seqlens_padded = batch['cu_seqlens_padded']
     max_seqlen = batch['max_seqlen'].item()
 
-    # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as cu_seqlens to
-    # get the correct result.
-    # TODO: Revert this workaround once TE fixes the issue.
-    packed_seq_params = PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_seqlens_padded,
-        cu_seqlens_kv=cu_seqlens_padded,
-        cu_seqlens_q_padded=cu_seqlens_padded,
-        cu_seqlens_kv_padded=cu_seqlens_padded,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-    )
+    if cp_partition_mode == "contiguous":
+        # Contiguous packed-THD CP: cu_seqlens_q/kv hold the original (unpadded) boundaries
+        # (dev semantics) so the model's MLA/KDA contiguous converters and downstream loss
+        # paths see real sequence boundaries, while cp_partition_mode tells the model the
+        # shard is contiguous. Static CP leaves cp_group / local_cp_size None (the model
+        # uses its build-time CP group).
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            cp_partition_mode="contiguous",
+            pad_between_seqs=True,
+        )
+    else:
+        # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as
+        # cu_seqlens to get the correct result (legacy zigzag path — UNCHANGED).
+        # TODO: Revert this workaround once TE fixes the issue.
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens_padded,
+            cu_seqlens_kv=cu_seqlens_padded,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
+
+    # Dummy metadata is appended after CP slicing as an ordinary sequence. Non-dummy tensors
+    # and their final padded endpoint were extended before slicing, so this is a no-op except
+    # for fixed-capacity cu_seqlens entries in eager or graph mode. Inert unless the recipe
+    # sets pad_packed_seq_alignment, so the zigzag path is unchanged. Static CP passes
+    # cp_group=None (the per-rank shard is already materialized).
+    if pad_alignment is not None:
+        tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
+            pad_sequence_for_thd(
+                tokens,
+                labels,
+                loss_mask,
+                position_ids,
+                packed_seq_params,
+                alignment=alignment,
+                target_len=target_len,
+                max_num_seqs=max_num_seqs,
+                tail_padding_policy=tail_padding_policy,
+                padding_mask=padding_mask,
+                cp_group=None,
+            )
+        )
 
     # "attention_mask" is not valid for sequence packing, so set it to None.
     return tokens, labels, loss_mask, None, position_ids, packed_seq_params, padding_mask

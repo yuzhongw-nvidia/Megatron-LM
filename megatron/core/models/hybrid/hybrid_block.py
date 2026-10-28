@@ -204,7 +204,13 @@ class HybridStack(MegatronModule):
         # Its auxiliary stack therefore remains ordinary width when the decoder is wide.
         self.uses_wide_residual_stream = self.config.wide_residual is not None and not is_mtp_layer
         boundary_layout = (
-            self.config.linear_cp_layout if boundary_layout is None else boundary_layout
+            (
+                self.config.linear_cp_layout
+                if uses_stack_cp_layout
+                else self.config.cp_partition_mode
+            )
+            if boundary_layout is None
+            else boundary_layout
         )
         self.mtp_layer_number = mtp_layer_number
 
@@ -228,7 +234,7 @@ class HybridStack(MegatronModule):
             for layer_config in self.layer_config_list
         )
         self._cp_layout_manager = None
-        if self.cp_group.size() > 1:
+        if self.cp_group.size() > 1 and uses_stack_cp_layout:
             layer_layouts = tuple(
                 (
                     layer_config.attention_cp_layout
