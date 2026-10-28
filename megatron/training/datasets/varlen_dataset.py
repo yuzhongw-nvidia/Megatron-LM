@@ -397,7 +397,7 @@ class VarlenDataset(SFTDataset):
         # 3. Right-truncate to ``sequence_length + 1`` (we drop the last token
         #    after the input/label shift below). Keep an EOD at the end so a
         #    truncated assistant turn still has a valid stop token.
-        if len(tokens_list) > max_len + 1:
+        if len(tokens_list) >= max_len + 1:
             tokens_list = tokens_list[: max_len + 1]
             targets_list = targets_list[: max_len + 1]
             if tokens_list[-1] != eod:
@@ -502,6 +502,7 @@ class MockVarlenDataset(MockSFTDataset):
             }
         else:
             mock_config = load_json_arg(config.varlen_mock_dataset_config_json)
+        mock_config.setdefault("vocab_size", getattr(config.tokenizer, "vocab_size", None))
         return MockSFTLowLevelDataset(**mock_config)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
