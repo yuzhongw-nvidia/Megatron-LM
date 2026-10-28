@@ -243,6 +243,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_layer_recompute": False,
     "moe_num_hash_layers": 0,
     "moe_ncclep_zero_copy": False,
+    "moe_megakernel_backend": None,
+    "moe_megakernel_backend_config": None,
     "moe_pad_expert_input_to_capacity": False,
     "moe_pad_experts_for_cuda_graph_inference": False,
     "moe_paged_stash": False,
