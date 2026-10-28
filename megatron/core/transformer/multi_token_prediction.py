@@ -35,6 +35,7 @@ from megatron.core.tensor_parallel.inference_layers import (
     inference_all_gather_from_tensor_model_parallel_region,
     is_inference_column_parallel_linear,
 )
+from megatron.core.transformer.attention_residual import AttentionResidual
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
@@ -50,6 +51,8 @@ from megatron.core.utils import (
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 if TYPE_CHECKING:
@@ -1578,6 +1581,13 @@ class MultiTokenPredictionLayer(MegatronModule):
                 setattr(self.hc_head_fn, "sequence_parallel", True)
                 setattr(self.hc_head_base, "sequence_parallel", True)
                 setattr(self.hc_head_scale, "sequence_parallel", True)
+
+        self.attn_res_enabled = self.config.enable_attention_residuals
+        if self.attn_res_enabled:
+            # Per-depth AttnRes output head: aggregates the trunk depth history
+            # plus this MTP depth's partial sum before its final layernorm.
+            self.final_attn_res = AttentionResidual(self.config)
+
         self.offload_context = nullcontext()
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
@@ -1800,6 +1810,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         self,
         hidden_states: Tensor,
         decoder_input: Tensor,
+        input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         padding_mask: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
@@ -1813,6 +1824,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         sequence_len_offset: Optional[torch.Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        attn_res_sources: Optional[tuple] = None,
     ) -> torch.Tensor:
         """
         Concatenates embeddings with hidden states and then applies transformer layer forward.
@@ -1844,6 +1856,12 @@ class MultiTokenPredictionLayer(MegatronModule):
             # FP8GlobalStateManager.is_first_fp8_module() is True so that the fp8 weight caching
             # can be triggered correctly.
             with transformer_layer_quantization_context:
+                # Only AttnRes-enabled inner layers (a nested AttnRes HybridStack or
+                # the GPT AttnResTransformerLayer) accept the trunk depth-source
+                # tuple; plain MTP inner layers must not see the keyword.
+                attn_res_kwargs = (
+                    {"attn_res_sources": attn_res_sources} if self.attn_res_enabled else {}
+                )
                 if self.mtp_layer_pattern is not None:
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
@@ -1854,6 +1872,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         packed_seq_params=packed_seq_params,
                         packed_seq_params_by_layout=packed_seq_params_by_layout,
                         cp_layout_plan=cp_layout_plan,
+                        **attn_res_kwargs,
                     )
                 else:
                     # GPT path: single TransformerLayer
@@ -1870,17 +1889,29 @@ class MultiTokenPredictionLayer(MegatronModule):
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
                         padding_mask=padding_mask,
+                        input_ids=input_ids,
+                        **attn_res_kwargs,
                     )
 
         if not self.mhc_enabled:
-            hidden_states = self._postprocess(hidden_states)
+            hidden_states = self._postprocess(hidden_states, attn_res_sources=attn_res_sources)
 
         return hidden_states
 
-    def _postprocess(self, hidden_states: torch.Tensor):
+    def _postprocess(self, hidden_states: torch.Tensor, attn_res_sources: Optional[tuple] = None):
         """
         Postprocesses the output of the transformer layers.
         """
+
+        if self.attn_res_enabled:
+            assert (
+                attn_res_sources is not None
+            ), "AttnRes MTP postprocess requires the trunk depth-source tuple."
+            # Per-depth output head: this depth's partial sum joins the trunk
+            # depth history for the final aggregation.
+            nvtx_range_push(msg="attn_res.mtp_final_aggregate")
+            hidden_states = self.final_attn_res([*attn_res_sources, hidden_states])
+            nvtx_range_pop(msg="attn_res.mtp_final_aggregate")
 
         if self.mhc_enabled:
             hidden_states = learned_output_contract(
@@ -2111,6 +2142,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         mtp_input_mask: Optional[Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        attn_res_sources: Optional[tuple] = None,
     ):
         """
         Execute the forward pass through the Multi-Token Prediction (MTP) layer.
@@ -2130,6 +2162,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             sequence_len_offset (Tensor, optional): Offset for sequence length, if applicable.
             embedding (Callable): The embedding module from gpt model to compute the decoder input.
             mtp_input_mask (Tensor, optional): Mask of valid MTP conditioning tokens.
+            attn_res_sources (tuple, optional): Immutable trunk depth-source tuple consumed
+                by this depth's AttnRes aggregations when Attention Residuals are enabled.
 
         Returns:
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
@@ -2168,6 +2202,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             and self.mtp_layer_pattern is None
         )
         if use_outer_recompute:
+            assert (
+                not self.attn_res_enabled
+            ), "Attention residuals do not support full recompute (rejected in config)."
             hidden_states = self._checkpointed_forward(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
@@ -2186,6 +2223,11 @@ class MultiTokenPredictionLayer(MegatronModule):
                 cp_layout_plan=cp_layout_plan,
             )
         else:
+            # Thread the depth sources only when attention residuals are on, so overrides of
+            # ``_proj_and_transformer_layer`` with the pre-AttnRes signature keep working.
+            attn_res_kwargs = (
+                {"attn_res_sources": attn_res_sources} if self.attn_res_enabled else {}
+            )
             hidden_states = self._proj_and_transformer_layer(
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
@@ -2202,6 +2244,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
+                **attn_res_kwargs,
             )
 
         return hidden_states, input_ids, position_ids, padding_mask, mtp_input_mask
@@ -2267,6 +2310,8 @@ class MultiTokenPredictionInputs:
     mtp_input_mask: Optional[Tensor]
     packed_seq_params: Optional[PackedSeqParams]
     padding_mask: Optional[Tensor] = None
+    # Immutable trunk depth-source tuple (Attention Residuals), in the MTP layout.
+    attn_res_sources: Optional[tuple] = None
 
 
 def _get_mtp_block_submodules(
@@ -2431,6 +2476,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         cp_batch: Optional[ContextParallelBatch],
         padding_mask: Optional[Tensor] = None,
+        attn_res_sources: Optional[tuple] = None,
     ) -> MultiTokenPredictionInputs:
         """Prepare MTP inputs, including the batch-major, optionally SP-sharded padding mask."""
         source_layout = (
@@ -2474,6 +2520,24 @@ class MultiTokenPredictionBlock(MegatronModule):
                     self.tp_cp_group,
                     cp_batch.thd_plan,
                 )
+            if attn_res_sources is not None:
+                # Every trunk depth source is an [s, b, h] activation in the
+                # decoder layout. MTP depths aggregate them token-aligned with
+                # the converted trunk hidden state, so convert each one the same
+                # way; the result stays an immutable tuple.
+                attn_res_sources = tuple(
+                    convert_cp_layout(
+                        source,
+                        source_layout,
+                        target_layout,
+                        self.cp_group,
+                        self.sequence_parallel,
+                        self.tp_group,
+                        self.tp_cp_group,
+                        cp_batch.thd_plan,
+                    )
+                    for source in attn_res_sources
+                )
             if padding_mask is not None:
                 # Convert validity so any new THD padding slots (zero-filled by
                 # layout conversion) remain excluded from routing.
@@ -2511,6 +2575,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             mtp_input_mask=mtp_input_mask,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            attn_res_sources=attn_res_sources,
         )
 
     def _build_layers(self, pg_collection):
@@ -2638,6 +2703,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         mhc_multistream: Optional[Tensor] = None,
         packed_seq_params_by_layout: Optional[dict[CPLayout, PackedSeqParams | None]] = None,
         cp_layout_plan: Optional[THDCPLayoutPlan] = None,
+        attn_res_sources: Optional[tuple] = None,
     ) -> Tensor:
         """
         Perform the forward pass through all of the MTP modules.
@@ -2650,6 +2716,10 @@ class MultiTokenPredictionBlock(MegatronModule):
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
             mtp_input_mask (Tensor, optional): Mask of valid MTP conditioning tokens.
+            attn_res_sources: Complete immutable trunk depth-source tuple used by
+                every MTP depth when Attention Residuals are enabled. With
+                ``mtp_detach_heads``, the tuple is detached together with the
+                trunk hidden state before entering the first depth.
 
         Returns:
             (Tensor): The mtp loss tensor of shape [b, s].
@@ -2665,6 +2735,10 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
+            if attn_res_sources is not None:
+                # Keep the detach semantics: MTP depths must not backprop into
+                # the trunk through the depth-source history either.
+                attn_res_sources = tuple(source.detach() for source in attn_res_sources)
 
         hidden_state_mixing_enabled = self.config.mtp_hsm and self.training
         if hidden_state_mixing_enabled:
@@ -2783,6 +2857,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 embedding=embedding,
                 decoder_input=decoder_input,
                 mtp_input_mask=mtp_input_mask,
+                attn_res_sources=attn_res_sources,
                 **(extra_block_kwargs or {}),
             )
 
