@@ -17,6 +17,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     CheckpointWithoutOutputManager,
@@ -100,6 +101,249 @@ class TestParallelTransformerLayer:
 
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
+
+    @pytest.mark.parametrize("cp_comm_type", ["all_gather", ["p2p", "all_gather"]])
+    def test_dynamic_cp_passes_cp_comm_type_at_configured_cp1(self, cp_comm_type):
+        seen = {}
+
+        class RecordingAttention(torch.nn.Module):
+            def __init__(self, *, cp_comm_type=None, **_kwargs):
+                super().__init__()
+                seen["cp_comm_type"] = cp_comm_type
+
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            context_parallel_size=1,
+            dynamic_context_parallel=True,
+            max_seqlen_per_dp_cp_rank=128,
+            cp_comm_type=cp_comm_type,
+        )
+
+        for layer_number in (1, 2):
+            TransformerLayer(
+                config,
+                TransformerLayerSubmodules(self_attention=RecordingAttention),
+                layer_number=layer_number,
+            )
+
+            expected = (
+                cp_comm_type[layer_number - 1] if isinstance(cp_comm_type, list) else cp_comm_type
+            )
+            assert seen["cp_comm_type"] == expected
+
+    def test_fp8_mlp_recompute_forwards_mlp_kwargs_through_checkpoint(self, monkeypatch):
+        """FP8 MLP recompute must deliver ``padding_mask`` and the MoE kwargs to the MLP.
+
+        ``te_checkpoint`` only receives the hidden states positionally; every other MLP
+        argument travels as a keyword and must survive the checkpoint boundary (TE's own
+        ``_CheckpointFunction`` forwards kwargs, torch's reentrant fallback rejects them).
+        """
+        import megatron.core.extensions.transformer_engine as transformer_engine
+        import megatron.core.transformer.transformer_layer as transformer_layer_module
+
+        layer = self.parallel_transformer_layer
+        layer.config.fp8 = "hybrid"
+        layer.recompute_mlp = True
+        # Mark the layer as MoE so ``_run_mlp`` builds ``input_ids``/``packed_seq_params``
+        # kwargs; ``_maybe_unflatten_for_moe`` stays a no-op without ``tokens_per_sample``.
+        layer.is_moe_layer = True
+
+        seen = {}
+
+        class RecordingMLP(torch.nn.Module):
+            def forward(
+                self, hidden_states, padding_mask=None, input_ids=None, packed_seq_params=None
+            ):
+                seen["padding_mask"] = padding_mask
+                seen["input_ids"] = input_ids
+                seen["packed_seq_params"] = packed_seq_params
+                return hidden_states + 1, None
+
+        layer.mlp = RecordingMLP()
+        monkeypatch.setattr(
+            layer,
+            "_pre_mlp_layernorm_and_residual",
+            lambda hidden_states, **_kwargs: (hidden_states, hidden_states, ()),
+        )
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_push", lambda **kwargs: None)
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_pop", lambda **kwargs: None)
+
+        def checkpoint(forward_func, _distribute, _rng_tracker, _tp_group, *args, **kwargs):
+            seen["checkpoint_args"] = args
+            seen["checkpoint_kwargs"] = kwargs
+            return forward_func(*args, **kwargs)
+
+        monkeypatch.setattr(transformer_engine, "te_checkpoint", checkpoint)
+
+        hidden_states = torch.randn(4, 2, layer.config.hidden_size)
+        padding_mask = torch.ones(2, 4, dtype=torch.bool)
+        input_ids = torch.arange(8, dtype=torch.long).view(2, 4)
+        packed_seq_params = PackedSeqParams(qkv_format="thd")
+        output_with_bias, residual = layer._forward_mlp_output_with_bias(
+            hidden_states,
+            padding_mask=padding_mask,
+            packed_seq_params=packed_seq_params,
+            input_ids=input_ids,
+        )
+
+        # Only the checkpointed activation is positional; nothing else may leak into args.
+        assert len(seen["checkpoint_args"]) == 1
+        assert seen["checkpoint_args"][0] is hidden_states
+        assert set(seen["checkpoint_kwargs"]) == {"padding_mask", "input_ids", "packed_seq_params"}
+        assert seen["padding_mask"] is padding_mask
+        assert seen["input_ids"] is input_ids
+        assert seen["packed_seq_params"] is packed_seq_params
+        assert torch.equal(output_with_bias[0], hidden_states + 1)
+        assert output_with_bias[1] is None
+        assert residual is hidden_states
+
+    def test_offload_scope_in_cuda_graph_preserves_gpt_rules(self):
+        """The shared helper keeps the existing GPT attention/dense-MLP scope rules."""
+        layer = self.parallel_transformer_layer
+        layer.config.fine_grained_activation_offloading = True
+        layer.offload_qkv_linear = False
+        layer.offload_core_attn = True
+        layer.offload_attn_proj = False
+        layer.offload_mlp_norm = False
+        layer.is_moe_layer = False
+
+        layer.config.cuda_graph_modules = [CudaGraphModule.attn]
+        assert layer.offload_scope_in_cuda_graph()
+
+        layer.offload_core_attn = False
+        assert not layer.offload_scope_in_cuda_graph()
+
+        layer.config.cuda_graph_modules = [CudaGraphModule.mlp]
+        layer.offload_mlp_norm = True
+        assert layer.offload_scope_in_cuda_graph()
+
+        layer.is_moe_layer = True
+        assert not layer.offload_scope_in_cuda_graph()
+
+    def test_offload_scope_in_cuda_graph_can_require_concrete_branches(self):
+        """Hybrid split layers ignore configured scopes backed only by IdentityOp."""
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        layer = self.parallel_transformer_layer
+        layer.config.fine_grained_activation_offloading = True
+        layer.config.cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.mlp]
+        layer.offload_qkv_linear = False
+        layer.offload_core_attn = True
+        layer.offload_attn_proj = False
+        layer.offload_mlp_norm = True
+        layer.is_moe_layer = False
+        layer.self_attention = IdentityOp()
+        layer.cross_attention = IdentityOp()
+        layer.mlp = IdentityOp()
+
+        # The default intentionally preserves GPT's config-based rule.
+        assert layer.offload_scope_in_cuda_graph()
+        assert not layer.offload_scope_in_cuda_graph(require_concrete_modules=True)
+
+        layer.self_attention = torch.nn.Linear(2, 2)
+        assert layer.offload_scope_in_cuda_graph(require_concrete_modules=True)
+
+        layer.offload_core_attn = False
+        layer.mlp = torch.nn.Linear(2, 2)
+        assert layer.offload_scope_in_cuda_graph(require_concrete_modules=True)
+
+    def test_set_offload_modules_requires_concrete_attention_branch(self, monkeypatch):
+        """The stored capture flag must not survive on an attention-free split layer."""
+        import megatron.core.transformer.transformer_layer as transformer_layer_module
+        from megatron.core.transformer.identity_op import IdentityOp
+
+        layer = self.parallel_transformer_layer
+        layer.config.fine_grained_activation_offloading = True
+        layer.config.offload_modules = ['core_attn']
+        layer.config.cuda_graph_modules = [CudaGraphModule.attn]
+        layer.config.cuda_graph_warmup_steps = 1
+        layer.is_moe_layer = False
+        monkeypatch.setattr(transformer_layer_module, 'is_torch_min_version', lambda _version: True)
+        monkeypatch.setattr(transformer_layer_module, 'is_te_min_version', lambda _version: True)
+
+        # A normal GPT attention layer owns the configured core-attention boundary.
+        assert not isinstance(layer.self_attention, IdentityOp)
+        layer._set_offload_modules()
+        assert layer.offload_module_in_cuda_graph
+
+        # A split Hybrid MoE tail shares the config but has no attention body.
+        layer.self_attention = IdentityOp()
+        layer.cross_attention = IdentityOp()
+        layer._set_offload_modules()
+        assert not layer.offload_module_in_cuda_graph
+
+    def test_split_branch_norms_join_mhc_recompute_manager(self, monkeypatch):
+        """Explicit norms in split hybrid branches use the unified mHC manager."""
+        from contextlib import nullcontext
+
+        import megatron.core.transformer.transformer_layer as transformer_layer_module
+
+        def build_layernorm(config, hidden_size, eps):
+            del config
+            return torch.nn.LayerNorm(hidden_size, eps=eps)
+
+        submodules = transformer_layer_module.TransformerLayerSubmodules(
+            input_layernorm=build_layernorm, pre_mlp_layernorm=build_layernorm
+        )
+        layer = TransformerLayer(self.parallel_transformer_layer.config, submodules)
+        assert layer.mhc_checkpoint_input_layernorm
+        assert layer.mhc_checkpoint_pre_mlp_layernorm
+        assert not layer.recompute_input_layernorm
+        assert not layer.recompute_pre_mlp_layernorm
+        layer.off_interface = lambda _enabled, hidden_states, _name: nullcontext(hidden_states)
+
+        class IdentityBranch(torch.nn.Module):
+            def forward(self, hidden_states, **_kwargs):
+                return hidden_states, None
+
+        layer.self_attention = IdentityBranch()
+        layer.mlp = IdentityBranch()
+        layer.is_moe_layer = False
+
+        seen_managers = []
+        retained_inputs = []
+        discarded_outputs = []
+
+        class RecordingCheckpoint:
+            def __init__(self, fp8=False, ckpt_manager=None, retain_input_tensors=False):
+                del fp8
+                seen_managers.append(ckpt_manager)
+                retained_inputs.append(retain_input_tensors)
+
+            def checkpoint(self, function, *args):
+                return function(*args)
+
+            def discard_output_and_register_recompute(self, hook_tensor):
+                discarded_outputs.append(hook_tensor)
+
+        monkeypatch.setattr(
+            transformer_layer_module.tensor_parallel, "CheckpointWithoutOutput", RecordingCheckpoint
+        )
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_push", lambda **_kwargs: None)
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_pop", lambda **_kwargs: None)
+
+        hidden_states = torch.randn(4, 2, layer.config.hidden_size)
+
+        layer._forward_self_attention_output_with_bias(hidden_states)
+        layer._forward_mlp_output_with_bias(hidden_states)
+        assert seen_managers == []
+
+        manager = MHCCheckpointManager()
+        attention_output, _, _ = layer._forward_self_attention_output_with_bias(
+            hidden_states, mhc_recompute_manager=manager
+        )
+        mlp_output, _ = layer._forward_mlp_output_with_bias(
+            hidden_states, mhc_recompute_manager=manager
+        )
+
+        assert seen_managers == [manager, manager]
+        assert retained_inputs == [False, False]
+        assert len(discarded_outputs) == 1
+        assert discarded_outputs[0] is attention_output[0]
+        assert mlp_output[0].shape == hidden_states.shape
 
     @pytest.mark.parametrize("threshold, is_hash_layer", [(None, False), (0, False), (2, True)])
     def test_function_moe_builder_receives_hash_layer_threshold(self, threshold, is_hash_layer):

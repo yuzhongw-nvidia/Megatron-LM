@@ -97,7 +97,9 @@ class TrainingConfig:
 
     manual_gc_interval: int = 0
     """Training step interval to trigger manual garbage collection. Values > 0 will trigger garbage
-    collections between training steps.
+    collections between training steps. Independently of the interval, one collection always runs
+    after the first training iteration of a run, which frees the reference cycles left behind by
+    kernel JIT compilation and autotuning (they can pin activation-sized tensors otherwise).
     """
 
     manual_gc_eval: bool = True
