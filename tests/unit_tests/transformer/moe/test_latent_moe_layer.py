@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import pytest
 import torch
@@ -141,6 +141,90 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
         "gtp_remat_group" not in kwargs and "gtp_replica_group" not in kwargs
         for _, kwargs in _RecordingInferenceLinear.calls
     )
+
+
+@pytest.mark.parametrize("remat_size", [1, 2])
+def test_latent_rmsnorm_preserves_dev_non_gtp_contract(monkeypatch, remat_size):
+    class RematGroup(_FakeProcessGroup):
+        def size(self):
+            return remat_size
+
+    class RecordingRMSNormLinear(_RecordingLinear):
+        def __init__(self, *args, **kwargs):
+            assert "gtp_remat_group" not in kwargs
+            assert "gtp_replica_group" not in kwargs
+            super().__init__(*args, **kwargs)
+
+    tp_group = _FakeProcessGroup()
+    pg_collection = ProcessGroupCollection(
+        tp=tp_group, ep=_FakeProcessGroup(), dp_cp=_FakeProcessGroup(), gtp_remat=RematGroup()
+    )
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_moe_experts=1,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_token_dispatcher_type="allgather",
+        moe_ffn_hidden_size=16,
+        moe_latent_size=4,
+        moe_latent_up_projection_rmsnorm=True,
+        use_cpu_initialization=True,
+        add_bias_linear=False,
+        gtp_remat_opt_in_modules=["moe_latent_proj"],
+    )
+    monkeypatch.setattr(moe_layer_module, "HAVE_TE", True)
+    monkeypatch.setattr(moe_layer_module, "TELinear", _RecordingLinear)
+    monkeypatch.setattr(moe_layer_module, "TERMSNormDuplicatedLinear", RecordingRMSNormLinear)
+    monkeypatch.setattr(moe_layer_module, "MoEAllGatherTokenDispatcher", _DummyDispatcher)
+    submodules = MoESubmodules(experts=_build_dummy_module, router=_build_dummy_module)
+    if remat_size > 1:
+        with pytest.raises(
+            ValueError, match="does not yet support.*moe_latent_up_projection_rmsnorm"
+        ):
+            MoELayer(config, submodules, pg_collection=pg_collection)
+    else:
+        layer = MoELayer(config, submodules, pg_collection=pg_collection)
+        assert isinstance(layer.fc2_latent_proj, RecordingRMSNormLinear)
+        assert layer.fc2_latent_proj._tp_group is tp_group
+
+
+@pytest.mark.skipif(
+    not is_te_min_version("1.7.0.dev0"),
+    reason="Transformer Engine linear layers require TE 1.7.0 or later.",
+)
+@pytest.mark.parametrize("linear_cls", [TELinear, TERMSNormDuplicatedLinear])
+def test_duplicated_linear_has_replicated_tensor_parallel_metadata(linear_cls):
+    """Duplicated TE linears must not retain TE's default dim-0 shard metadata."""
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+        use_cpu_initialization=True,
+        params_dtype=torch.bfloat16,
+    )
+    kwargs = {}
+    if linear_cls is TERMSNormDuplicatedLinear:
+        kwargs["tp_group"] = _FusedLatentNormProcessGroup()
+    layer = linear_cls(
+        16,
+        32,
+        parallel_mode="duplicated",
+        config=config,
+        init_method=config.output_layer_init_method,
+        bias=False,
+        skip_bias_add=False,
+        skip_weight_param_allocation=False,
+        **kwargs,
+    )
+
+    for name, param in layer.named_parameters():
+        assert not getattr(param, "tensor_model_parallel", True), name
+        assert getattr(param, "partition_dim", None) == -1, name
+        assert getattr(param, "partition_stride", None) == 1, name
 
 
 class TestLatentMoELayer:

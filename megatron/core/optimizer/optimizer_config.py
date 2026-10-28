@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
 import math
@@ -264,6 +264,19 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_qkv_per_head: bool = False
+    """Whether to orthogonalize each Q, gate, K, and V head independently. Requires
+    ``muon_split_qkv``. Uniform head sizes use the batched Newton-Schulz implementation
+    from the Emerging-Optimizers revision pinned in ``pyproject.toml``. By default, Muon
+    orthogonalizes the Q, gate, K, and V projection matrices separately. MLA up-projections
+    are only split when ``muon_split_mla_qkv`` is also enabled."""
+
+    muon_split_mla_qkv: bool = False
+    """Whether to split MLA up-projection weights (MLA, Absorbed MLA, and DSv4 hybrid attention
+    query/key-value up-projections) for Muon. Requires ``muon_split_qkv``. When disabled, these
+    weights are orthogonalized as whole matrices. Combine with ``muon_split_qkv_per_head`` to
+    orthogonalize each MLA head independently."""
+
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
@@ -271,7 +284,8 @@ class OptimizerConfig:
     """The mode to use for the scale factor. Defaults to "spectral"."""
 
     muon_fp32_matmul_prec: str = "medium"
-    """The precision to use for the fp32 matmul. Defaults to "medium"."""
+    """PyTorch FP32 matmul precision for Newton-Schulz: "medium", "high", or "highest".
+    Use "highest" to retain full FP32 arithmetic. Defaults to "medium"."""
 
     muon_coefficient_type: str = "quintic"
     """Newton-Schulz coefficient type for the Muon optimizer. Valid types are discovered

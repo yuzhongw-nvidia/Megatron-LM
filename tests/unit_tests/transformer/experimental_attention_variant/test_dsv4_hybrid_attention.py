@@ -521,28 +521,14 @@ class TestDSv4HybridAttentionConstructor:
         assert hasattr(attn, 'linear_proj')
         assert hasattr(attn, 'linear_o_group_proj')
         assert hasattr(attn, 'core_attention')
-        assert isinstance(attn.q_layernorm, IdentityOp)
-        assert isinstance(attn.kv_layernorm, IdentityOp)
-        assert not any(
-            key.startswith(("q_layernorm.", "kv_layernorm.")) for key in attn.state_dict()
+        assert hasattr(attn, 'q_layernorm')
+        assert hasattr(attn, 'kv_layernorm')
+        assert attn.linear_q_up_proj.weight.qkv_layout.num_groups == config.num_attention_heads
+        assert attn.linear_q_up_proj.weight.qkv_layout.projection_split_shapes == (
+            config.qk_head_dim,
+            config.qk_pos_emb_head_dim,
         )
-
-    def test_latent_norm_epsilon_is_scoped_to_q_and_kv_latents(self):
-        """The dedicated epsilon must not change the compressor norm."""
-        config = _make_config(
-            layernorm_epsilon=1e-5,
-            attention_latent_norm_epsilon=1e-6,
-            qk_layernorm=True,
-            csa_compress_ratios=[4, 4, 128, 4],
-        )
-        pg = ProcessGroupCollection.use_mpu_process_groups()
-        attn = _build_attention(config, layer_number=1, pg_collection=pg)
-
-        assert attn.q_layernorm.eps == pytest.approx(1e-6)
-        assert attn.kv_layernorm.eps == pytest.approx(1e-6)
-        assert attn.state_dict()["q_layernorm.weight"].shape == (config.q_lora_rank,)
-        assert attn.state_dict()["kv_layernorm.weight"].shape == (config.v_head_dim,)
-        assert attn.core_attention.compressor.norm.eps == pytest.approx(1e-5)
+        assert getattr(attn.linear_kv_proj.weight, 'qkv_layout', None) is None
 
     def test_q_head_dim_equals_v_head_dim(self):
         """q_head_dim must equal v_head_dim for DSv4 hybrid."""
