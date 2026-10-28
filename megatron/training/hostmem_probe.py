@@ -89,9 +89,13 @@ _state = {
     "gc_collected": 0,
     "gc_last": None,
 }
+_PROBE_VERSION = 2
 _CENSUS_AT = {s for s in os.environ.get(
     "MCORE_HOSTMEM_PROBE_CENSUS_AT",
     "optimizer_built,step1_fwdbwd_done,step1_end,step2_end,step3_end").split(",") if s}
+_TRIM_AT = {s for s in os.environ.get(
+    "MCORE_HOSTMEM_PROBE_TRIM_AT", "optimizer_built,step1_end,step3_end").split(",") if s}
+_WATCHDOG_S = float(os.environ.get("MCORE_HOSTMEM_PROBE_WATCHDOG_S", "900") or 900)
 _CENSUS_REFERRER_RANKS = {int(s) for s in os.environ.get("MCORE_HOSTMEM_PROBE_CENSUS_RANKS", "0,64,128,192").split(",") if s.strip().isdigit()}
 _CENSUS_REFERRER_TENSORS = int(os.environ.get("MCORE_HOSTMEM_PROBE_CENSUS_REFERRERS", "12") or 12)
 _GC_AT = {s for s in os.environ.get("MCORE_HOSTMEM_PROBE_GC_AT", "").split(",") if s}
@@ -128,6 +132,44 @@ _MEMINFO_KEYS = {
 
 def _read_status():
     return _kb_fields("/proc/self/status", _STATUS_KEYS)
+
+
+_SMAPS_KEYS = {"Pss", "Pss_Anon", "Pss_File", "Pss_Shmem", "Shared_Clean", "Shared_Dirty", "Private_Clean",
+               "Private_Dirty", "Swap", "Locked"}
+
+
+def _read_smaps_rollup(pid="self"):
+    """Proportional set size breakdown; Pss is additive over processes, unlike RSS of forked children."""
+    return _kb_fields(f"/proc/{pid}/smaps_rollup", _SMAPS_KEYS)
+
+
+def _malloc_info():
+    """glibc heap statistics (mallinfo2) in bytes; empty if unavailable."""
+    try:
+        import ctypes  # noqa: PLC0415
+
+        libc = ctypes.CDLL("libc.so.6")
+
+        class MallInfo2(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_size_t) for name in (
+                "arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks", "fsmblks", "uordblks", "fordblks", "keepcost")]
+
+        libc.mallinfo2.restype = MallInfo2
+        info = libc.mallinfo2()
+        return {name: int(getattr(info, name)) for name, _ in MallInfo2._fields_}
+    except Exception:  # pylint: disable=broad-except
+        return {}
+
+
+def _malloc_trim():
+    try:
+        import ctypes  # noqa: PLC0415
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim.restype = ctypes.c_int
+        return int(libc.malloc_trim(0))
+    except Exception:  # pylint: disable=broad-except
+        return None
 
 
 def _read_meminfo():
@@ -207,6 +249,7 @@ def _read_children():
         descendants.append(pid)
         stack.extend(children.get(pid, []))
     rss_total = 0
+    pss_total = 0
     cpu_total = 0.0
     names = collections.Counter()
     biggest = []
@@ -214,6 +257,8 @@ def _read_children():
         status = _kb_fields(f"/proc/{pid}/status", {"VmRSS"})
         rss = status.get("VmRSS", 0)
         rss_total += rss
+        # RSS of a forked worker repeats the parent's shared pages; Pss divides them among sharers.
+        pss_total += _read_smaps_rollup(pid).get("Pss", 0)
         cpu_s, comm = info.get(pid, (0.0, "?"))
         cpu_total += cpu_s
         names[comm] += 1
@@ -223,6 +268,7 @@ def _read_children():
     return {
         "child_count": len(descendants),
         "child_rss": rss_total,
+        "child_pss": pss_total,
         "child_cpu_s": round(cpu_total, 1),
         "child_names": dict(names.most_common(6)),
         "child_top": [{"rss": r, "comm": c, "pid": p} for r, c, p in biggest[:5]],
@@ -417,15 +463,22 @@ def _torch_stats():
         hms = getattr(torch.cuda, "host_memory_stats", None) or getattr(torch.cuda.memory, "host_memory_stats", None)
         if hms is not None:
             stats = hms()
-            for key, name in (
-                ("allocated_bytes.all.current", "pin_alloc"),
-                ("allocated_bytes.all.peak", "pin_alloc_peak"),
-                ("reserved_bytes.all.current", "pin_reserved"),
-                ("reserved_bytes.all.peak", "pin_reserved_peak"),
-                ("num_alloc_retries", "pin_alloc_retries"),
-            ):
-                if key in stats:
-                    out[name] = int(stats[key])
+            # The flattened key layout differs between PyTorch versions ("allocated_bytes.all.current" vs
+            # "allocated_bytes.current"); match on prefix + suffix instead of exact names.
+            for key, value in stats.items():
+                if not isinstance(value, (int, float)):
+                    continue
+                for prefix, name in (("allocated_bytes", "pin_alloc"), ("reserved_bytes", "pin_reserved")):
+                    if key.startswith(prefix):
+                        if key.endswith(".current"):
+                            out[name] = int(value)
+                        elif key.endswith(".peak"):
+                            out[name + "_peak"] = int(value)
+                if key == "num_alloc_retries":
+                    out["pin_alloc_retries"] = int(value)
+            if "pin_alloc" not in out and not _state.get("host_stats_keys_logged"):
+                _state["host_stats_keys_logged"] = True
+                _write({"type": "host_stats_keys", "rank": _state["rank"], "keys": sorted(stats.keys())[:60]})
     except Exception:  # pylint: disable=broad-except
         pass
     return out
@@ -437,20 +490,66 @@ def _out_dir():
     return os.path.expandvars(raw)
 
 
+_QUEUE = None  # records waiting for the writer thread (the main thread never touches the shared file system)
+
+
 def _write(record):
+    """Queue a record for the writer thread; never blocks the caller on file-system latency."""
+    global _QUEUE  # pylint: disable=global-statement
     try:
-        with _lock:
-            fh = _state["fh"]
-            if fh is None:
-                directory = _out_dir()
-                os.makedirs(directory, exist_ok=True)
-                path = os.path.join(directory, f"rank{_state['rank']:05d}_{_state['host']}.jsonl")
-                fh = open(path, "a", buffering=1)  # noqa: SIM115
-                _state["fh"] = fh
-            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
-            fh.flush()
+        if _QUEUE is None:
+            import queue  # noqa: PLC0415
+
+            _QUEUE = queue.Queue(maxsize=20000)
+        line = json.dumps(record, separators=(",", ":"))
+        try:
+            _QUEUE.put_nowait(line)
+        except Exception:  # pylint: disable=broad-except
+            try:
+                _QUEUE.get_nowait()  # drop the oldest record rather than block
+                _QUEUE.put_nowait(line)
+            except Exception:  # pylint: disable=broad-except
+                pass
     except Exception:  # pylint: disable=broad-except
         pass
+
+
+def _open_output_files():
+    directory = _out_dir()
+    os.makedirs(directory, exist_ok=True)
+    if _state.get("fh") is None:
+        path = os.path.join(directory, f"rank{_state['rank']:05d}_{_state['host']}.jsonl")
+        _state["fh"] = open(path, "a", buffering=1)  # noqa: SIM115
+    if _state.get("stack_fh") is None:
+        _state["stack_fh"] = open(_stack_file_path(), "a", buffering=1)  # noqa: SIM115
+
+
+def _writer():
+    """Writer thread: opens the per-rank files (a slow shared file system must never stall the
+    training process), installs the SIGUSR1 / watchdog stack dumps once the stacks file exists,
+    and drains the record queue."""
+    import queue  # noqa: PLC0415
+
+    while _QUEUE is None:
+        time.sleep(0.05)
+    while _state.get("fh") is None:
+        try:
+            _open_output_files()
+            _install_signal_dump()
+            _arm_watchdog()
+        except Exception:  # pylint: disable=broad-except
+            time.sleep(1.0)
+    fh = _state["fh"]
+    while True:
+        try:
+            line = _QUEUE.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        try:
+            fh.write(line + "\n")
+            fh.flush()
+        except Exception:  # pylint: disable=broad-except
+            time.sleep(0.5)
 
 
 def _gib(value):
@@ -460,11 +559,14 @@ def _gib(value):
         return "?"
 
 
-def _snapshot(kind, name, extra=None):
+def _snapshot(kind, name, extra=None, with_torch=True):
+    """Collect one record. ``with_torch=False`` (sampler thread) touches only /proc and the heap stats:
+    the torch.cuda statistics bindings take allocator mutexes while holding the GIL, which can
+    interlock with a main thread that sits in a long allocator call — keep them on the main thread."""
     status = _read_status()
     meminfo = _read_meminfo()
     cgroup = _read_cgroup()
-    tstats = _torch_stats()
+    tstats = _torch_stats() if with_torch else {}
     children = _read_children()
     with _lock:
         cum_total = _state["pinned_cum_total"]
@@ -479,6 +581,7 @@ def _snapshot(kind, name, extra=None):
         "host": _state["host"],
         "step": _state["step"],
         "status": status,
+        "smaps": _read_smaps_rollup(),
         "meminfo": meminfo,
         "cgroup": cgroup,
         "torch": tstats,
@@ -490,6 +593,7 @@ def _snapshot(kind, name, extra=None):
     }
     if kind == "anchor":
         record["offload"] = _offload_state()
+        record["malloc"] = _malloc_info()
     if extra:
         record.update(extra)
     return record
@@ -523,6 +627,10 @@ def _on_free(sig, nbytes):
 
 def _record_pinned(tensor):
     try:
+        # Only genuine pinned host tensors: compiled (Inductor) wrappers pass pin_memory kwargs for
+        # device tensors too, which must not be attributed as host memory.
+        if tensor.device.type != "cpu" or not tensor.is_pinned():
+            return
         nbytes = int(tensor.untyped_storage().nbytes())
     except Exception:  # pylint: disable=broad-except
         try:
@@ -597,6 +705,7 @@ def anchor(name, extra=None):
     """Record an anchor: JSONL record + pinned stack deltas + one stdout line."""
     try:
         record = _snapshot("anchor", name, extra)
+        _arm_watchdog()
         with _lock:
             _state["anchors"] += 1
             cum = _state["pinned_cum_by_stack"]
@@ -625,6 +734,21 @@ def anchor(name, extra=None):
             census["seconds"] = round(time.time() - t0, 2)
             _write({"type": "census", "name": name, "rank": _state["rank"], "step": _state["step"], "t": record["t"],
                     "census": census})
+        if name in _TRIM_AT:
+            # heap fragmentation check: RSS/anon before and after returning free heap to the OS
+            before_st = _read_status()
+            info_before = _malloc_info()
+            trimmed = _malloc_trim()
+            after_st = _read_status()
+            rec = {"type": "malloc_trim", "name": name, "rank": _state["rank"], "step": _state["step"],
+                   "t": round(time.time() - _T0, 3), "trimmed": trimmed, "mallinfo_before": info_before,
+                   "mallinfo_after": _malloc_info(), "rss_before": before_st.get("VmRSS"), "rss_after": after_st.get("VmRSS"),
+                   "anon_before": before_st.get("RssAnon"), "anon_after": after_st.get("RssAnon")}
+            _write(rec)
+            print(f"[HOSTMEM] malloc_trim anchor={name} rank={_state['rank']} rss {_gib(rec['rss_before'] or 0)} -> "
+                  f"{_gib(rec['rss_after'] or 0)} anon {_gib(rec['anon_before'] or 0)} -> {_gib(rec['anon_after'] or 0)} "
+                  f"heap_arena={_gib(info_before.get('arena', 0))} heap_free={_gib(info_before.get('fordblks', 0))} "
+                  f"mmap={_gib(info_before.get('hblkhd', 0))}", flush=True)
         if name in _GC_AT:
             import gc  # noqa: PLC0415
 
@@ -655,7 +779,8 @@ def anchor(name, extra=None):
         print(
             f"[HOSTMEM] anchor={name} rank={_state['rank']} host={_state['host']} t={record['t']:.0f}s "
             f"rss={_gib(st.get('VmRSS', 0))} hwm={_gib(st.get('VmHWM', 0))} lck={_gib(st.get('VmLck', 0))} "
-            f"pin={_gib(st.get('VmPin', 0))} anon={_gib(st.get('RssAnon', 0))} "
+            f"shm={_gib(st.get('RssShmem', 0))} anon={_gib(st.get('RssAnon', 0))} pss={_gib(record['smaps'].get('Pss', 0))} "
+            f"child_pss={_gib(ch.get('child_pss', 0))} "
             f"pin_alloc={_gib(tt.get('pin_alloc', 0))} pin_resv={_gib(tt.get('pin_reserved', 0))} "
             f"pin_py_cum={_gib(record['pinned_py_cum'])} pin_py_live={_gib(record['pinned_py_live'])} "
             f"pin_py_delta={_gib(delta_total)} dev_alloc={_gib(tt.get('dev_alloc', 0))} "
@@ -678,9 +803,48 @@ def _sampler():
     while True:
         time.sleep(_INTERVAL)
         try:
-            _write(_snapshot("sample", "periodic"))
+            _write(_snapshot("sample", "periodic", with_torch=False))
         except Exception:  # pylint: disable=broad-except
             pass
+
+
+def _stack_file_path():
+    return os.path.join(_out_dir(), f"stacks_rank{_state['rank']:05d}_{_state['host']}.txt")
+
+
+def _arm_watchdog():
+    """Re-arm faulthandler's C-level watchdog: if no anchor arrives for _WATCHDOG_S seconds it
+    dumps every thread's Python stack into the per-rank stacks file (works even when the main
+    thread holds the GIL, which a Python thread could not do), and keeps repeating."""
+    if _WATCHDOG_S <= 0:
+        return
+    try:
+        import faulthandler  # noqa: PLC0415
+
+        fh = _state.get("stack_fh")
+        if fh is None:
+            return  # the writer thread opens the files and arms the watchdog once they exist
+        fh.write(f"# armed at t={time.time() - _T0:.1f}s step={_state['step']} anchors={_state['anchors']} "
+                 f"(dump follows only if no anchor for {_WATCHDOG_S:.0f}s)\n")
+        fh.flush()
+        faulthandler.cancel_dump_traceback_later()
+        faulthandler.dump_traceback_later(_WATCHDOG_S, repeat=True, file=fh, exit=False)
+    except Exception:  # pylint: disable=broad-except
+        pass
+
+
+def _install_signal_dump():
+    try:
+        import faulthandler  # noqa: PLC0415
+        import signal  # noqa: PLC0415
+
+        fh = _state.get("stack_fh")
+        if fh is None:
+            return  # opened by the writer thread
+        # chain=False: the default SIGUSR1 action would terminate the process after the dump.
+        faulthandler.register(signal.SIGUSR1, file=fh, all_threads=True, chain=False)
+    except Exception:  # pylint: disable=broad-except
+        pass
 
 
 # --------------------------------------------------------------------------- lazy patches
@@ -740,6 +904,12 @@ def _patch_training(module):
         if _in_window():
             anchor(_step_label("end"))
 
+    # training.py imports the warm-up entry point by name, so patch the name bound in this module too
+    # (patching the kernel_warmup module attribute alone is not reached from pretrain()).
+    def after_warmup(result, *args, **kwargs):
+        anchor("kernel_warmup_done")
+
+    _wrap_function(module, "warmup_training_kernels", after=after_warmup, tag="training.warmup_training_kernels")
     return _wrap_function(module, "train_step", before=before_train_step, after=after_train_step) and ok
 
 
@@ -964,15 +1134,23 @@ def _install_gc_trace():
             with _lock:
                 _state["gc_events"] += 1
                 _state["gc_collected"] += int(info.get("collected", 0) or 0)
+            gen = info.get("generation")
+            # Automatic gen-0/1 collections while the collector is enabled (start-up) are frequent and
+            # uninteresting: count them, keep the stack only for gen 2, explicit collections under
+            # manual gc, or large ones.
+            interesting = (not gc.isenabled()) or gen == 2 or int(info.get("collected", 0) or 0) >= 20000
+            if not interesting:
+                _state["gc_auto_skipped"] = _state.get("gc_auto_skipped", 0) + 1
+                return
             stack = traceback.extract_stack(sys._getframe(1), limit=14)  # pylint: disable=protected-access
             desc = " < ".join(f"{os.path.basename(fr.filename)}:{fr.lineno}:{fr.name}" for fr in reversed(stack))
             rec = {"type": "gc", "rank": _state["rank"], "step": _state["step"], "t": round(time.time() - _T0, 3),
-                   "generation": info.get("generation"), "collected": info.get("collected"),
+                   "generation": gen, "collected": info.get("collected"), "auto_skipped": _state.get("gc_auto_skipped", 0),
                    "ms": round((time.perf_counter() - state["t0"]) * 1e3, 1) if state["t0"] else None, "stack": desc}
             _state["gc_last"] = rec
             _write(rec)
-            if _state["rank"] == 0:
-                print(f"[HOSTMEM] gc rank=0 step={_state['step']} gen={rec['generation']} collected={rec['collected']} "
+            if _state["rank"] == 0 and (not gc.isenabled() or "convert_frame" in desc):
+                print(f"[HOSTMEM] gc rank=0 step={_state['step']} gen={gen} collected={rec['collected']} "
                       f"{rec['ms']} ms | {desc[:300]}", flush=True)
         except Exception:  # pylint: disable=broad-except
             pass
@@ -1031,6 +1209,10 @@ def _install_import_hook():
 def _at_exit():
     try:
         anchor("exit", {"patched": sorted(_state["patched"])})
+        # give the writer thread a moment to drain the queue (daemon threads die with the process)
+        deadline = time.time() + 5.0
+        while _QUEUE is not None and not _QUEUE.empty() and time.time() < deadline:
+            time.sleep(0.05)
         with _lock:
             top = [
                 {"stack": sig, "cum_bytes": value, "live_bytes": _state["pinned_live_by_stack"][sig],
@@ -1058,12 +1240,13 @@ def _main():
     except Exception:  # pylint: disable=broad-except
         pass
     try:
+        threading.Thread(target=_writer, name="hostmem-writer", daemon=True).start()
         threading.Thread(target=_sampler, name="hostmem-probe", daemon=True).start()
     except Exception:  # pylint: disable=broad-except
         pass
     atexit.register(_at_exit)
-    anchor("probe_start", {"pid": os.getpid(), "steps": _STEPS, "interval": _INTERVAL,
-                           "argv": sys.argv[:3], "out_dir": _out_dir()})
+    anchor("probe_start", {"pid": os.getpid(), "steps": _STEPS, "interval": _INTERVAL, "version": _PROBE_VERSION,
+                           "watchdog_s": _WATCHDOG_S, "argv": sys.argv[:3], "out_dir": _out_dir()})
 
 
 _main()
