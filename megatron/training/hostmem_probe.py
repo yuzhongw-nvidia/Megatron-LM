@@ -95,7 +95,7 @@ _CENSUS_AT = {s for s in os.environ.get(
     "optimizer_built,step1_fwdbwd_done,step1_end,step2_end,step3_end").split(",") if s}
 _TRIM_AT = {s for s in os.environ.get(
     "MCORE_HOSTMEM_PROBE_TRIM_AT", "optimizer_built,step1_end,step3_end").split(",") if s}
-_WATCHDOG_S = float(os.environ.get("MCORE_HOSTMEM_PROBE_WATCHDOG_S", "900") or 900)
+_WATCHDOG_S = float(os.environ.get("MCORE_HOSTMEM_PROBE_WATCHDOG_S", "2700") or 2700)
 _CENSUS_REFERRER_RANKS = {int(s) for s in os.environ.get("MCORE_HOSTMEM_PROBE_CENSUS_RANKS", "0,64,128,192").split(",") if s.strip().isdigit()}
 _CENSUS_REFERRER_TENSORS = int(os.environ.get("MCORE_HOSTMEM_PROBE_CENSUS_REFERRERS", "12") or 12)
 _GC_AT = {s for s in os.environ.get("MCORE_HOSTMEM_PROBE_GC_AT", "").split(",") if s}
@@ -843,6 +843,9 @@ def _install_signal_dump():
             return  # opened by the writer thread
         # chain=False: the default SIGUSR1 action would terminate the process after the dump.
         faulthandler.register(signal.SIGUSR1, file=fh, all_threads=True, chain=False)
+        # v3: a SIGSEGV/SIGABRT/SIGBUS (exit 139/134/135 without a Python traceback, as on the
+        # two stage-2 ranks of the first B-fix run) also writes every thread's Python stack here.
+        faulthandler.enable(file=fh, all_threads=True)
     except Exception:  # pylint: disable=broad-except
         pass
 
@@ -921,12 +924,46 @@ def _patch_kernel_warmup(module):
 
 
 def _patch_schedules(module):
+    def record_microbatch(phase):
+        # v3: device envelope per microbatch (current / high-water allocation) so a step-1
+        # peak difference can be placed on a schedule position (warm-up forward n, backward n).
+        if not _in_window():
+            return
+        try:
+            import torch  # noqa: PLC0415
+
+            counter = _state.setdefault("mb_counter", {})
+            key = (_state["step"], phase)
+            counter[key] = counter.get(key, 0) + 1
+            _write({"type": "mb", "rank": _state["rank"], "step": _state["step"], "phase": phase,
+                    "idx": counter[key], "t": round(time.time() - _T0, 3),
+                    "dev_alloc": int(torch.cuda.memory_allocated()),
+                    "dev_max_alloc": int(torch.cuda.max_memory_allocated()),
+                    "dev_reserved": int(torch.cuda.memory_reserved())})
+        except Exception:  # pylint: disable=broad-except
+            pass
+
     def before_forward_step(*args, **kwargs):
         if _in_window() and _state["first_forward_seen_step"] != _state["step"]:
             _state["first_forward_seen_step"] = _state["step"]
             anchor(_step_label("first_forward"))
+        else:
+            # Step 1 spends ~30 min between first_forward and fwdbwd_done (JIT + autotune of
+            # every microbatch) without an anchor; each microbatch proves the process is alive.
+            _arm_watchdog()
+        record_microbatch("fwd_begin")
 
-    ok = _wrap_function(module, "forward_step", before=before_forward_step)
+    def after_forward_step(result, *args, **kwargs):
+        record_microbatch("fwd_end")
+
+    def before_backward_step(*args, **kwargs):
+        record_microbatch("bwd_begin")
+
+    def after_backward_step(result, *args, **kwargs):
+        record_microbatch("bwd_end")
+
+    ok = _wrap_function(module, "forward_step", before=before_forward_step, after=after_forward_step)
+    ok = _wrap_function(module, "backward_step", before=before_backward_step, after=after_backward_step) and ok
 
     original_get = getattr(module, "get_forward_backward_func", None)
     if original_get is None:
