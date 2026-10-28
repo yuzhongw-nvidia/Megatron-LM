@@ -5019,9 +5019,21 @@ def post_training_step_callbacks(
 
     # Manual garbage collection. With --manual-gc the interpreter's automatic
     # collector is off; this synchronous full collection is the only GC. With
-    # manual_gc_interval=0 (the common case) it never fires.
+    # manual_gc_interval=0 (the common case) it fires only once, after the first
+    # iteration of the run: that iteration JIT-compiles and autotunes kernels, and
+    # the exceptions this raises and swallows (e.g. Triton's OutOfResources for an
+    # autotune config over the shared-memory limit) leave reference cycles of
+    # traceback <-> frame <-> locals that keep the raising call stack alive, with
+    # the backward's intermediate tensors and the kernel arguments in it, until a
+    # collection runs. Nothing else collects them while the automatic collector is
+    # disabled, so without this one collection they inflate the resident memory of
+    # every following iteration (by one microbatch's attention backward, several
+    # GiB per rank for long sequences) until the interval collect, or forever.
     if cfg.train.manual_gc:
-        if cfg.train.manual_gc_interval != 0 and iteration % cfg.train.manual_gc_interval == 0:
+        first_iteration_of_run = iteration == get_train_state().resume_iteration + 1
+        if first_iteration_of_run or (
+            cfg.train.manual_gc_interval != 0 and iteration % cfg.train.manual_gc_interval == 0
+        ):
             with _otel_managed_span('step', 'megatron.train.gc_collect', is_goodput_span=True):
                 gc.collect()
 
