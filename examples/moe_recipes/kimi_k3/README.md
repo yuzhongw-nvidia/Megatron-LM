@@ -71,6 +71,12 @@ restores the family's 16,777,216 tokens per step.
   `attn_res_norm_fusion: true`). This replaces the compiled AttnRes path of
   the earlier recipes; `DYNAMO_CACHE_SIZE_LIMIT` stays exported for
   compatibility.
+- The element-wise MLA output gate runs as one Triton kernel per direction
+  (`attention_output_gate_fusion: true`): the same values and gradients as the
+  eager gate, with only the two gate inputs kept for backward. The eager
+  composition keeps the FP32 sigmoid output and the cast scale alive until
+  backward (2.25 GiB per pipeline stage and in-flight microbatch at these
+  sizes).
 - The MoE layers run the Mixture-of-Kittens megakernel
   (`moe_megakernel_backend: mok`, `moe_megakernel_backend_config:
   {shared_expert_mode: native}`): the routed experts' dispatch, grouped GEMMs
@@ -188,15 +194,16 @@ real-data result is claimed here; the mock-data throughput runs do not
 establish long-context convergence.
 
 Two regressions pulled in by the rebase onto `dev` were found with the
-full-model runs and are fixed in this code base: the kernel warm-up left
-16 GiB of cached pinned host memory per rank because `torch.accelerator
-.memory.empty_host_cache` does not exist in the NGC 26.04 PyTorch
-(`megatron/training/kernel_warmup.py` now falls back to
-`torch._C._host_emptyCache`), and the eager element-wise MLA output gate
-kept an fp32 sigmoid copy per layer and in-flight microbatch on the device
-(+2.25 GiB per pipeline stage and microbatch; `attention_output_gate.py`
-now saves only the gate inputs with bit-identical results). The 2026-10-28
-numbers above include both fixes.
+full-model runs. The kernel warm-up left 16 GiB of cached pinned host memory
+per rank because `torch.accelerator.memory.empty_host_cache` does not exist
+in the NGC 26.04 PyTorch; `megatron/training/kernel_warmup.py` now falls
+back to `torch._C._host_emptyCache`. The eager element-wise MLA output gate
+keeps an fp32 sigmoid copy per layer and in-flight microbatch on the device
+(+2.25 GiB per pipeline stage and microbatch); the recipes avoid it with
+`attention_output_gate_fusion: true`. The 2026-10-28 numbers above were
+taken with the warm-up fix and an input-saving gate equivalent to the
+fusion; the 9L A/B of 2026-10-29 confirmed identical peak memory and a
+1.85e-4 real-data parity for the fused kernel.
 
 ## Build the container
 
