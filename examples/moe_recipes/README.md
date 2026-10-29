@@ -30,7 +30,7 @@ Kimi-K3 container build and launch instructions are in the [Kimi-K3 guide](kimi_
       <td>256</td>
       <td>4/4/64/8/1</td>
       <td>1/64/262144</td>
-      <td>MoK MoE megakernel; fused AttnRes + output RMSNorm; MLA latent CP (a2a8); FA4; contiguous CP; MTP1; per-head Muon; selective recompute; attention offload</td>
+      <td>MoK MoE megakernel; fused AttnRes + output RMSNorm; fused MLA output gate; MLA latent CP (a2a8); FA4; contiguous CP; MTP1; per-head Muon; selective recompute; attention offload</td>
       <td>813</td>
     </tr>
     <tr>
@@ -39,7 +39,7 @@ Kimi-K3 container build and launch instructions are in the [Kimi-K3 guide](kimi_
       <td>512</td>
       <td>4/4/64/32/1</td>
       <td>1/32/1048576</td>
-      <td>MoK MoE megakernel; fused AttnRes + output RMSNorm; MLA latent CP (a2a8+p2p4); FA4; contiguous CP; MTP1; per-head Muon; selective recompute; attention offload</td>
+      <td>MoK MoE megakernel; fused AttnRes + output RMSNorm; fused MLA output gate; MLA latent CP (a2a8+p2p4); FA4; contiguous CP; MTP1; per-head Muon; selective recompute; attention offload</td>
       <td>813</td>
     </tr>
     <tr>
@@ -48,7 +48,7 @@ Kimi-K3 container build and launch instructions are in the [Kimi-K3 guide](kimi_
       <td>64</td>
       <td>4/1/64/16/1</td>
       <td>1/32/524288</td>
-      <td>MoK MoE megakernel; fused AttnRes + output RMSNorm; MLA latent CP (a2a8+p2p2); FA4; contiguous CP; MTP1; per-head Muon; selective recompute; attention offload</td>
+      <td>MoK MoE megakernel; fused AttnRes + output RMSNorm; fused MLA output gate; MLA latent CP (a2a8+p2p2); FA4; contiguous CP; MTP1; per-head Muon; selective recompute; attention offload</td>
       <td>978</td>
     </tr>
     <tr>
@@ -57,7 +57,7 @@ Kimi-K3 container build and launch instructions are in the [Kimi-K3 guide](kimi_
       <td>64</td>
       <td>4/1/64/2/1</td>
       <td>1/256/65536</td>
-      <td>MoK MoE megakernel; fused AttnRes + output RMSNorm; MLA latent CP (a2a2); FA4; contiguous CP; MTP1; per-head Muon; selective recompute; attention offload</td>
+      <td>MoK MoE megakernel; fused AttnRes + output RMSNorm; fused MLA output gate; MLA latent CP (a2a2); FA4; contiguous CP; MTP1; per-head Muon; selective recompute; attention offload</td>
       <td></td>
     </tr>
     <tr>

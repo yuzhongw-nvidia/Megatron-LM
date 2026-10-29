@@ -143,6 +143,9 @@ ARGS:
   distributed_backend: nccl
   attn_res_impl: fla
   attn_res_norm_fusion: true
+  # Element-wise MLA output gate as one Triton kernel per direction (same values and gradients as
+  # the eager gate; only the two gate inputs are kept for backward).
+  attention_output_gate_fusion: true
   gdn_pre_gated_delta_rule_fusion: true
   gdn_gated_output_norm_fusion: true
   # Run the hybrid layers' strict runtime input checks on the first instance of each layer type
