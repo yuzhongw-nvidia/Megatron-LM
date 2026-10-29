@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-import megatron.core.context_parallel.layout as context_parallel_layout_module
+import megatron.core.context_parallel.layout as cp_layout
 from megatron.core import parallel_state
 from megatron.core.context_parallel import (
     ContextParallelLayoutManager,
@@ -108,10 +108,10 @@ def test_layout_conversion_coalesces_layout_runs(monkeypatch):
         return input_ + 2
 
     monkeypatch.setattr(
-        context_parallel_layout_module, "contiguous_to_zigzag", fake_contiguous_to_zigzag
+        cp_layout, "contiguous_to_zigzag", fake_contiguous_to_zigzag
     )
     monkeypatch.setattr(
-        context_parallel_layout_module, "zigzag_to_contiguous", fake_zigzag_to_contiguous
+        cp_layout, "zigzag_to_contiguous", fake_zigzag_to_contiguous
     )
 
     hidden_states = torch.zeros(2, 1, 1)
@@ -148,8 +148,8 @@ def test_matching_cp_layouts_do_not_convert(monkeypatch):
     def fail_conversion(*_args):
         raise AssertionError("matching layouts must not convert")
 
-    monkeypatch.setattr(context_parallel_layout_module, "contiguous_to_zigzag", fail_conversion)
-    monkeypatch.setattr(context_parallel_layout_module, "zigzag_to_contiguous", fail_conversion)
+    monkeypatch.setattr(cp_layout, "contiguous_to_zigzag", fail_conversion)
+    monkeypatch.setattr(cp_layout, "zigzag_to_contiguous", fail_conversion)
 
     hidden_states = torch.zeros(2, 1, 1)
     assert manager.prepare_layer_input(0, hidden_states) is hidden_states

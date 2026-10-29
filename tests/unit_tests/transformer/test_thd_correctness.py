@@ -764,7 +764,7 @@ def _prepare_gqa_mtp_batch(
     if input_format == "sbhd":
         return (
             get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=cp_group, cp_partition_mode=cp_partition_mode
+                batch, dynamic_cp=False, cp_group=cp_group, cp_partition_mode=cp_partition_mode
             ),
             None,
         )

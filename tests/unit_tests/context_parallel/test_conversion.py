@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import megatron.core.context_parallel.layout.conversion as context_parallel_layout_conversion
+import megatron.core.context_parallel.layout.conversion as cp_layout_conversion
 from megatron.core import parallel_state
 from megatron.core.context_parallel import (
     CpPartitionModeConverter,
@@ -227,7 +227,7 @@ def test_sbhd_convert_cp_partition_mode_matches_direct_target_shard(
             full_tensor, seq_dim, cp_group, cp_partition_mode=source_layout
         )
 
-        converted = context_parallel_layout_conversion.convert_cp_partition_mode(
+        converted = cp_layout_conversion.convert_cp_partition_mode(
             x=source_shard,
             source_partition_mode=source_layout,
             target_partition_mode=target_layout,
@@ -296,7 +296,7 @@ def test_sbhd_convert_cp_partition_mode_backward_matches_direct_source_shard(
             if sequence_parallel
             else {}
         )
-        converted = context_parallel_layout_conversion.convert_cp_partition_mode(
+        converted = cp_layout_conversion.convert_cp_partition_mode(
             x=source_shard,
             source_partition_mode=source_layout,
             target_partition_mode=target_layout,
@@ -411,7 +411,7 @@ def test_cp_partition_mode_converter_recurses_over_tensor_containers(monkeypatch
         return x + 10
 
     monkeypatch.setattr(
-        context_parallel_layout_conversion, "convert_cp_partition_mode", fake_convert
+        cp_layout_conversion, "convert_cp_partition_mode", fake_convert
     )
     cp_group = SimpleNamespace(size=lambda: 2)
     tp_cp_group = object()
@@ -503,7 +503,7 @@ def test_module_input_conversion_treats_missing_packed_seq_params_as_sbhd(monkey
         return x + 1
 
     monkeypatch.setattr(
-        context_parallel_layout_conversion, "convert_cp_partition_mode", fake_convert
+        cp_layout_conversion, "convert_cp_partition_mode", fake_convert
     )
     cp_group = SimpleNamespace(size=lambda: 2)
     tp_cp_group = object()
@@ -587,7 +587,7 @@ def test_public_conversion_apis_default_to_no_cp_group():
     assert converted is hidden_states
     assert back_to_input_converter is None
     assert (
-        context_parallel_layout_conversion.convert_cp_partition_mode(
+        cp_layout_conversion.convert_cp_partition_mode(
             x=hidden_states, source_partition_mode="zigzag", target_partition_mode="contiguous"
         )
         is hidden_states
@@ -610,10 +610,10 @@ def test_sbhd_conversion_uses_one_redistribution_path(monkeypatch, sequence_para
         return kwargs["input_"] + 1
 
     monkeypatch.setattr(
-        context_parallel_layout_conversion, "_redistribute_layout", fake_redistribute
+        cp_layout_conversion, "_redistribute_layout", fake_redistribute
     )
 
-    converted = context_parallel_layout_conversion.convert_cp_partition_mode(
+    converted = cp_layout_conversion.convert_cp_partition_mode(
         x=x,
         source_partition_mode="zigzag",
         target_partition_mode="contiguous",
@@ -661,12 +661,12 @@ def test_sequence_parallel_thd_conversion_warns_about_naive_fallback(monkeypatch
 
     monkeypatch.setattr(mappings, "gather_from_sequence_parallel_region", fake_gather)
     monkeypatch.setattr(
-        context_parallel_layout_conversion, "_redistribute_thd_layout", fake_redistribute
+        cp_layout_conversion, "_redistribute_thd_layout", fake_redistribute
     )
     monkeypatch.setattr(mappings, "scatter_to_sequence_parallel_region", fake_scatter)
 
     with pytest.warns(RuntimeWarning, match="naive TP gather"):
-        converted = context_parallel_layout_conversion.convert_cp_partition_mode(
+        converted = cp_layout_conversion.convert_cp_partition_mode(
             x=x,
             source_partition_mode="zigzag",
             target_partition_mode="contiguous",

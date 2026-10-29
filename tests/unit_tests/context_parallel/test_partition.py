@@ -89,7 +89,7 @@ def test_sample_level_masking_does_not_require_document_routes(monkeypatch, cu_v
     batch = {"tokens": full[None].clone(), "cu_seqlens": cu[None]}
     result = get_batch_on_this_cp_rank(
         batch,
-        is_hybrid_cp=False,
+        dynamic_cp=False,
         cp_group=group,
         use_per_sequence_balancing=True,
         cp_partition_mode="zigzag",
@@ -102,7 +102,7 @@ def test_sample_level_masking_does_not_require_document_routes(monkeypatch, cu_v
     with pytest.raises(NotImplementedError, match="sample-level inter-document masking"):
         get_batch_on_this_cp_rank(
             {"tokens": full[None], "cu_seqlens": cu[None]},
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=group,
             use_per_sequence_balancing=True,
             cp_partition_mode="contiguous",

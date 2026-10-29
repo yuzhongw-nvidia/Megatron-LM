@@ -835,7 +835,7 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="contiguous" if with_contiguous_layout else "zigzag",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=cp_group,
             additional_layouts=("zigzag",) if with_contiguous_layout else (),
             use_per_sequence_balancing=True,
@@ -903,7 +903,7 @@ def test_metadata_only_cp_batch_skips_sharding():
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="zigzag",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=MagicMock(),
             tokens_per_sample=16,
         )
@@ -924,7 +924,7 @@ def test_size_one_cp_batch_without_group_skips_sharding():
 
     with patch("megatron.core.utils.get_batch_on_this_cp_rank") as shard_batch:
         cp_batch = get_batches_on_this_cp_rank(
-            batch, boundary_layout="zigzag", is_hybrid_cp=False, cp_group=None, tokens_per_sample=8
+            batch, boundary_layout="zigzag", dynamic_cp=False, cp_group=None, tokens_per_sample=8
         )
 
     shard_batch.assert_not_called()
@@ -956,7 +956,7 @@ def test_intermediate_stage_dynamic_cp_shards_padding_mask_without_token_tensors
         patch("torch.distributed.get_rank", return_value=0),
     ):
         cp_batch = get_batches_on_this_cp_rank(
-            batch, boundary_layout="zigzag", is_hybrid_cp=True, cp_group=runtime_cp_group
+            batch, boundary_layout="zigzag", dynamic_cp=True, cp_group=runtime_cp_group
         )
 
     torch.testing.assert_close(cp_batch.get_batch()["padding_mask"], padding_mask[:, [0, 1, 6, 7]])
