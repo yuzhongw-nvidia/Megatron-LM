@@ -111,7 +111,7 @@ class _ElementwiseGateBeforeCast(torch.autograd.Function):
 
 
 def apply_elementwise_attention_output_gate_before_cast(
-    core_attn_out: torch.Tensor, gate: torch.Tensor
+    core_attn_out: torch.Tensor, gate: torch.Tensor, *, fusion: bool = False
 ) -> torch.Tensor:
     """Elementwise ``apply_attention_output_gate(..., cast_mode='before')`` for training.
 
@@ -119,8 +119,35 @@ def apply_elementwise_attention_output_gate_before_cast(
     ``core_attn_out`` and ``gate`` (see ``_ElementwiseGateBeforeCast``). Use it on paths that
     must keep the eager rounding and VJP and whose activations stay live across pipeline
     microbatches, such as the MLA output gate.
+
+    With ``fusion=True`` (``TransformerConfig.attention_output_gate_fusion``) the forward and the
+    backward each run as one Triton kernel
+    (``megatron.core.fusions.fused_attention_output_gate``), with the same values and saved
+    tensors. Contiguous CUDA inputs then require Triton; non-contiguous views and CPU inputs
+    keep the unfused path (which saves the views themselves instead of contiguous copies).
     """
     validate_attention_output_gate_shapes(core_attn_out, gate, 'elementwise')
+    if fusion and core_attn_out.is_cuda:
+        from megatron.core.fusions.fused_attention_output_gate import (
+            HAVE_TRITON,
+            SUPPORTED_DTYPES,
+            can_use_fused_elementwise_attention_output_gate,
+            fused_elementwise_attention_output_gate_before_cast,
+        )
+
+        if can_use_fused_elementwise_attention_output_gate(core_attn_out, gate):
+            return fused_elementwise_attention_output_gate_before_cast(core_attn_out, gate)
+        if (
+            not HAVE_TRITON
+            or core_attn_out.dtype not in SUPPORTED_DTYPES
+            or gate.dtype not in SUPPORTED_DTYPES
+            or core_attn_out.device != gate.device
+        ):
+            raise RuntimeError(
+                "attention_output_gate_fusion requires Triton and BF16/FP16/FP32 CUDA tensors "
+                f"on one device, got {core_attn_out.dtype} / {gate.dtype} on "
+                f"{core_attn_out.device} / {gate.device}."
+            )
     if not torch.is_grad_enabled() or not (core_attn_out.requires_grad or gate.requires_grad):
         return apply_attention_output_gate(core_attn_out, gate, 'elementwise', cast_mode='before')
     return _ElementwiseGateBeforeCast.apply(core_attn_out, gate)

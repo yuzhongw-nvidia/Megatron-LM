@@ -674,7 +674,10 @@ class MultiLatentAttention(Attention):
         # FP32 sigmoid output and the cast scale alive until backward (384 MiB per MLA
         # layer and microbatch at 32K tokens x 3072 local channels, pinned on the device
         # for every in-flight pipeline microbatch); this variant saves only the inputs.
-        return apply_elementwise_attention_output_gate_before_cast(core_attn_out, gate)
+        # attention_output_gate_fusion runs the same math as one Triton kernel per direction.
+        return apply_elementwise_attention_output_gate_before_cast(
+            core_attn_out, gate, fusion=self.config.attention_output_gate_fusion
+        )
 
     @staticmethod
     @jit_fuser
