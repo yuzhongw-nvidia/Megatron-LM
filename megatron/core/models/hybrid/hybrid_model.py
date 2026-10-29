@@ -654,6 +654,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
 
         rotary_pos_emb = None
+        # Model-level rotary_pos_emb is only for regular attention. Regular
+        # attention uses the default zigzag CP RoPE layout; MLA/CSA/DSv4-style
+        # variants must ignore this external RoPE and build/apply RoPE internally.
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
@@ -661,6 +664,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
         elif self.position_embedding_type == 'yarn':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -670,6 +674,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb, _ = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
             )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
@@ -815,6 +820,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                         or self.pg_collection.dp_cp
                     ),
                     main_hidden_states=hidden_states,
+                    cp_partition_mode=mtp_inputs.cp_partition_mode,
                 )
         sequence_parallel_override = False
         if (
