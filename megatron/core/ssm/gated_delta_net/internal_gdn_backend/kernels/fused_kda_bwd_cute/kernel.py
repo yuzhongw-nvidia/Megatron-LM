@@ -363,11 +363,10 @@ class FusedKdaBwdKernel:
 
     threads_per_cta = _THREADS
 
-    def __init__(self, *, heads: int, num_sequences: int, debug: bool = False, trace: bool = False):
-        if heads <= 0 or num_sequences <= 0:
-            raise ValueError("heads and num_sequences must be positive")
+    def __init__(self, *, heads: int, debug: bool = False, trace: bool = False):
+        if heads <= 0:
+            raise ValueError("heads must be positive")
         self.heads = heads
-        self.num_sequences = num_sequences
         self.debug = debug
         self.trace = trace
         self.io_dtype = cutlass.BFloat16
@@ -502,7 +501,8 @@ class FusedKdaBwdKernel:
             ops["intra_lower"].tiled_mma,
             ops["intra_upper"].tiled_mma,
         ).launch(
-            grid=(self.num_sequences * self.heads, 1, 1),
+            # The sequence count is dynamic: one CTA per (sequence, head).
+            grid=((cute.size(cu_seqlens, mode=[0]) - 1) * self.heads, 1, 1),
             block=(self.threads_per_cta, 1, 1),
             cluster=(1, 1, 1),
             smem=SharedStorage.size_in_bytes(),

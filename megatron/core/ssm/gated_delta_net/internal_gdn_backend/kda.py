@@ -304,8 +304,13 @@ class InternalChunkKDAFunction(torch.autograd.Function):
         cu_seqlens_cpu: torch.LongTensor | None,
         validated_chunk_indices: torch.LongTensor | None,
         cp_context: object | None,
+        recompute_h: bool,
     ):
         strict = _backend_mode() == "cute"
+        fused_bwd = _fused_kda_bwd_support_reason(q=q, k=k, v=v, beta=beta) is None
+        # The fused backward reads h (and, under CP, v_new) from the forward: keeping
+        # them skips the backward state recompute unless recompute_h is set.
+        save_fused_bwd_state = fused_bwd and not disable_recompute and not recompute_h
         _validate_validated_chunk_indices(validated_chunk_indices, cu_seqlens)
         chunk_indices = validated_chunk_indices
         if chunk_indices is None and cu_seqlens is not None:
@@ -393,7 +398,15 @@ class InternalChunkKDAFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
             state_v_first=False,
         )
-        if not disable_recompute:
+        if save_fused_bwd_state:
+            # Keep h (and v_new for the CP pre-process); the gate cumsum is cheap to
+            # recompute and as large as h in fp32.
+            w, u, qg, kg = None, None, None, None
+            if cp_context is None:
+                v_new = None
+            if use_gate_in_kernel:
+                g = None
+        elif not disable_recompute:
             # Delete to save memory; the backward recomputes them.
             w, u, qg, kg, v_new, h = None, None, None, None, None, None
             if use_gate_in_kernel:
@@ -427,7 +440,8 @@ class InternalChunkKDAFunction(torch.autograd.Function):
         ctx.disable_recompute = disable_recompute
         ctx.cp_context = cp_context
         ctx.strict = strict
-        ctx.fused_bwd = _fused_kda_bwd_support_reason(q=q, k=k, v=v, beta=beta) is None
+        ctx.fused_bwd = fused_bwd
+        ctx.saved_fused_bwd_state = save_fused_bwd_state
         return o.type_as(q), None
 
     @staticmethod
@@ -459,7 +473,10 @@ class InternalChunkKDAFunction(torch.autograd.Function):
         cp_context = ctx.cp_context
 
         # fla/ops/kda/chunk_bwd.py: recompute the gate cumsum, WY tensors and states.
+        # A forward that kept h for the fused backward skips the state recompute; the
+        # CP pre-process still reads the WY tensors and the gated q / k.
         if not ctx.disable_recompute:
+            recompute_state = not ctx.saved_fused_bwd_state
             if ctx.use_gate_in_kernel:
                 g = kda_gate_chunk_cumsum(
                     g=g_org,
@@ -471,31 +488,33 @@ class InternalChunkKDAFunction(torch.autograd.Function):
                     chunk_indices=chunk_indices,
                     lower_bound=ctx.lower_bound,
                 )
-            # Passing q materialises qg = q * 2^gk, which the CP pre-process needs.
-            w, u, qg, kg = recompute_w_u_fwd(
-                q=q,
-                k=k,
-                v=v,
-                beta=beta,
-                A=Akk,
-                gk=g,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-            )
+            if recompute_state or cp_context is not None:
+                # Passing q materialises qg = q * 2^gk, which the CP pre-process needs.
+                w, u, qg, kg = recompute_w_u_fwd(
+                    q=q,
+                    k=k,
+                    v=v,
+                    beta=beta,
+                    A=Akk,
+                    gk=g,
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                )
             if cp_context is not None:
                 initial_state = expand_h0(initial_state, context=cp_context)
-            h, v_new, _final_state = chunk_gated_delta_rule_fwd_h(
-                k=kg,
-                w=w,
-                u=u,
-                gk=g,
-                initial_state=initial_state,
-                output_final_state=False,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                chunk_size=_CHUNK_SIZE,
-                state_v_first=False,
-            )
+            if recompute_state:
+                h, v_new, _final_state = chunk_gated_delta_rule_fwd_h(
+                    k=kg,
+                    w=w,
+                    u=u,
+                    gk=g,
+                    initial_state=initial_state,
+                    output_final_state=False,
+                    cu_seqlens=cu_seqlens,
+                    chunk_indices=chunk_indices,
+                    chunk_size=_CHUNK_SIZE,
+                    state_v_first=False,
+                )
         elif cp_context is not None:
             initial_state = expand_h0(initial_state, context=cp_context)
 
@@ -654,7 +673,7 @@ class InternalChunkKDAFunction(torch.autograd.Function):
 
         # Seven gradients (q, k, v, g, beta, A_log, dt_bias) in FLA's order, then None
         # for scale, safe_gate, lower_bound, use_gate_in_kernel, disable_recompute,
-        # cu_seqlens, cu_seqlens_cpu, validated_chunk_indices and cp_context.
+        # cu_seqlens, cu_seqlens_cpu, validated_chunk_indices, cp_context and recompute_h.
         return (
             dq.to(q),
             dk.to(k),
@@ -663,6 +682,7 @@ class InternalChunkKDAFunction(torch.autograd.Function):
             db.to(beta),
             dA,
             dbias,
+            None,
             None,
             None,
             None,
@@ -698,9 +718,14 @@ def chunk_kda(
     cu_seqlens_cpu: torch.LongTensor | None = None,
     validated_chunk_indices: torch.LongTensor | None = None,
     cp_context: object | None = None,
+    recompute_h: bool = False,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run FLA's KDA kernels with the CP pre-processing and the backward in-tree.
+
+    When the fused backward runs, the forward keeps the chunk states ``h`` so the
+    backward skips FLA's state recompute; ``recompute_h=True``
+    (``gdn_gdr_recompute_h``) recomputes them instead to save activation memory.
 
     ``MCORE_GDN_INTERNAL_BACKEND=fla`` is FLA verbatim, and so is a call without a
     CP context that the fused backward cannot serve (see
@@ -840,4 +865,5 @@ def chunk_kda(
         cu_seqlens_cpu,
         validated_chunk_indices,
         cp_context,
+        recompute_h,
     )

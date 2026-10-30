@@ -115,3 +115,57 @@ def test_fused_bwd_can_be_disabled(monkeypatch):
     before = adapter.get_fused_kda_bwd_launch_count()
     _grads(adapter.chunk_kda, leaves, do, cu_seqlens, False, None)
     assert adapter.get_fused_kda_bwd_launch_count() == before
+
+
+def test_fused_bwd_compiles_once_across_packings(monkeypatch):
+    from fla.ops.kda import chunk_kda as fla_chunk_kda
+
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_kda_bwd_cute import (
+        launcher,
+    )
+
+    adapter = _adapter()
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.delenv("MCORE_KDA_FUSED_BWD", raising=False)
+    # Token count, chunk count, tail lengths and sequence count all change.
+    packings = ([64], [130, 64, 257], [1, 63, 65, 128, 200], [512, 77])
+    sizes = []
+    for seed, lengths in enumerate(packings):
+        leaves, do = _inputs(1, sum(lengths), (-1.0, 1.0), seed=seed)
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
+        )
+        reference = _grads(fla_chunk_kda, leaves, do, cu_seqlens, False, None)
+        candidate = _grads(adapter.chunk_kda, leaves, do, cu_seqlens, False, None)
+        for got, want in zip(candidate, reference):
+            relative_l2 = ((got.float() - want.float()).norm() / want.float().norm()).item()
+            assert relative_l2 < 1e-2, f"{lengths}: relative L2 {relative_l2:.3e}"
+        sizes.append(launcher.compile_cache_size())
+    assert sizes[1:] == sizes[:1] * (len(sizes) - 1), sizes
+
+
+@pytest.mark.parametrize("lengths", [[130, 64, 257], None], ids=["packed", "dense_batch2"])
+def test_fused_bwd_saved_state_matches_recompute(monkeypatch, lengths):
+    from functools import partial
+
+    adapter = _adapter()
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.delenv("MCORE_KDA_FUSED_BWD", raising=False)
+    if lengths is None:
+        leaves, do = _inputs(2, 192, (-1.0, 1.0))
+        cu_seqlens = None
+    else:
+        leaves, do = _inputs(1, sum(lengths), (-1.0, 1.0))
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
+        )
+    saved = _grads(
+        partial(adapter.chunk_kda, recompute_h=False), leaves, do, cu_seqlens, True, -5.0
+    )
+    recomputed = _grads(
+        partial(adapter.chunk_kda, recompute_h=True), leaves, do, cu_seqlens, True, -5.0
+    )
+    # Same math either way; only the order of the backward's floating-point
+    # reductions may differ between runs.
+    for got, want in zip(saved, recomputed):
+        torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-6)

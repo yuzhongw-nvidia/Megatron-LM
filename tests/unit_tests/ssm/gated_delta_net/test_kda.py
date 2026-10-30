@@ -179,7 +179,8 @@ def test_kda_binds_gated_delta_rule_by_backend(backend):
     KimiDeltaAttention._setup_variant_attrs(shell)
 
     if backend == "internal":
-        assert shell.gated_delta_rule is internal_backend.chunk_kda
+        assert shell.gated_delta_rule.func is internal_backend.chunk_kda
+        assert shell.gated_delta_rule.keywords == {"recompute_h": shell.config.gdn_gdr_recompute_h}
     else:
         # Every other backend value keeps FLA's chunk_kda (None when FLA is absent).
         assert shell.gated_delta_rule is kda_module.chunk_kda
@@ -570,6 +571,7 @@ def _fused_kda_bwd_supported() -> bool:
         (True, 1, False, 2, "headwise"),
         (True, 1, False, 2, "chunkwise"),
         (True, 2, True, 2, "chunkwise"),
+        (True, 1, False, 4, "chunkwise"),
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
@@ -577,7 +579,7 @@ def _fused_kda_bwd_supported() -> bool:
 def test_parallel_kda_fused_bwd_correctness(
     monkeypatch, tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode
 ):
-    """Head dimension 128 runs the fused CuTe DSL backward; check it under CP1 and CP2."""
+    """Head dimension 128 runs the fused CuTe DSL backward; check it under CP1, CP2 and CP4."""
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend import kda as kda_adapter
 
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
@@ -596,6 +598,10 @@ def test_parallel_kda_fused_bwd_correctness(
         rtol=1e-2,
         input_grad_atol=_KDA_INPUT_GRAD_ATOL,
         input_grad_rtol=1e-2,
+        # Under CP4 both the fused and the FLA backward move a few BF16 input-grad
+        # values by two bins (relative L2 ~4e-3); bound those outliers globally.
+        cosine_similarity_threshold=0.9999,
+        relative_l2_threshold=1e-2,
         tp=tp,
         sp=sp,
         cp=cp,
