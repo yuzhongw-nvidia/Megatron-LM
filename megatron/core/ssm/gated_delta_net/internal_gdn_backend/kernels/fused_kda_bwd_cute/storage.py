@@ -1,8 +1,9 @@
 """Shared-memory and tensor-memory contracts for the fused KDA backward.
 
-The ledger is described in ``docs/fused-gdr-to-kda-port-analysis_cc.md``
-section 6.  Every buffer below lists its contents in chunk order; aliases are
-only legal across the phase boundaries named there.
+``TMEM_RANGES`` assigns the 512 tensor-memory columns to accumulators per
+chunk phase and is checked for overlapping live ranges at import time.  Every
+shared-memory buffer below lists its contents in chunk order; a buffer is only
+reused for a new tensor after the phase that last reads the previous one.
 """
 
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ _THREADS_PER_CTA = 384
 _BUFFER_ALIGN_BYTES = 1024
 _SM100_OPTIN_SMEM_BYTES = 232_448
 
-# Phases of one chunk; see the design document section 7.
+# Phases of one chunk, in execution order.
 PHASES = ("seed", "wy", "grad", "inv_mid", "inv_out", "intra", "epilogue")
 _PHASE = {name: index for index, name in enumerate(PHASES)}
 

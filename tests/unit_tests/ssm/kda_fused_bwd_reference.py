@@ -2,9 +2,9 @@
 """Executable dataflow specification for the fused KDA backward kernel.
 
 The functions here mirror, chunk by chunk, the operation decomposition that
-``fused_kda_bwd_cute`` implements (see docs/fused-gdr-to-kda-port-analysis_cc.md).
+``fused_kda_bwd_cute`` implements.
 They are written in plain PyTorch so the numerical scheme can be checked against
-an independent autograd oracle before any device code exists:
+an independent autograd oracle without the device kernel:
 
 * ``kda_recurrent_reference`` is the token-recurrent definition of KDA; its
   autograd gradients are the oracle.

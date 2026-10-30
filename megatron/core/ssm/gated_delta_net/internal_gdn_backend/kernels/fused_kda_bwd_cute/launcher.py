@@ -90,8 +90,14 @@ def fused_kda_bwd(
 ):
     """Run the fused KDA backward on packed inputs.
 
-    Shapes follow ``docs/fused-gdr-to-kda-port-analysis_cc.md`` section 2.
-    ``chunk_offsets`` is the per-sequence chunk prefix of ``cu_seqlens``
+    With T packed tokens, H heads, C chunks of 64 tokens and S sequences:
+    ``q``, ``k``, ``v`` and ``do`` are BF16 ``[1, T, H, 128]``; ``gc`` is FP32
+    ``[1, T, H, 128]``, FLA's chunk-local log2 gate cumsum; ``beta`` is FP32
+    ``[1, T, H]``; ``aqk`` (scaled, causal) and ``akk`` (``(I + L)^-1``) are
+    BF16 ``[1, T, H, 64]``; ``h`` holds the BF16 chunk-start states
+    ``[1, C, H, 128, 128]`` in ``[K, V]`` layout; ``dht`` is the FP32
+    final-state gradient ``[S, H, 128, 128]``; ``cu_seqlens`` is int32
+    ``[S + 1]``.  ``chunk_offsets`` is the per-sequence chunk prefix of ``cu_seqlens``
     (computed on device when omitted). Returns ``(dq, dk, dv, dg, dbeta, dh0)``
     and, with ``debug=True``, a sixth FP32 tensor of per-chunk intermediates
     ``[C, H, 10, 64, 128]``. With ``trace=True`` the last element is an int64

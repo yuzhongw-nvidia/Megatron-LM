@@ -1,17 +1,38 @@
-"""SM100 CuTe DSL device kernel for the fused KDA backward (v1 schedule).
+"""SM100 CuTe DSL device kernel for the fused KDA backward.
 
-The algorithm is the per-chunk specification in
-``tests/unit_tests/ssm/kda_fused_bwd_reference.py``; the schedule, buffer
-ledger and numerics are described in
-``docs/fused-gdr-to-kda-port-analysis_cc.md``.  The CTA topology, MMA layout
-contracts, TMA descriptors and TMEM helpers come from the fused GDR backward
-(``fused_gdr_bwd_cute``), itself a CuTe DSL derivative of QwenLM FlashQLA's
-Blackwell fused GDR backward (MIT License).
+One CTA per (sequence, head) walks the sequence's 64-token chunks in reverse
+and keeps the state gradient dH (128 key x 128 value, FP32) in tensor memory.
+A chunk reads FLA's forward residuals (q, k, v, dO, Aqk, Akk and the
+chunk-start state h in BF16; the chunk-local log2 gate cumsum and beta in
+FP32) and writes dq, dk, dv, dg (after the chunk-local reverse cumsum), dbeta
+and, after the first chunk, dh0.  The per-chunk math is the executable
+specification in ``tests/unit_tests/ssm/kda_fused_bwd_reference.py``.
 
-Every phase of a chunk is a pair of one-shot mbarriers (consumers -> MMA
-"ready", MMA -> consumers "done").  The next chunk's v, dO, Akk and h are
-loaded once MMA phase D has consumed them; q, k and Aqk are loaded after the
-current chunk releases them (FREE).
+Orientation: value-side products (X = k*Gamma*S, dv_new, v_new, D) are
+token-major as in the GDR backward.  Every token x key-channel product (dq,
+dk and the intra-chunk partials) accumulates channel-major, with the 128 key
+channels on TMEM lanes, so per-channel gate factors, the diagonal fallback and
+the dg reverse cumsum are per-thread work.
+
+Numerics: the state path only needs 2^G and 2^(G_last - G), both <= 1.
+Intra-chunk products work on 16-token blocks anchored at a block's last row
+(lower products) or first row (upper products), so off-diagonal factors are
+<= 1 for any gate.  A diagonal block uses the same tensor-core product for a
+channel while that channel's log2 gate span is below ``DIAG_SPAN_LIMIT``;
+otherwise the owning thread recomputes the channel's triangle on CUDA cores.
+The anchored token operands are BF16 high/low pairs, which keeps dg at
+FP32-operand accuracy; every other MMA operand is a single BF16 tile.
+
+Schedule: warps 0-3 (CH) do the channel-major element-wise work and stores,
+warps 4-7 (TK) the token-major work, warp 8 issues tcgen05 MMAs and warp 9
+issues TMA loads.  Every phase of a chunk is a pair of one-shot mbarriers
+(consumers -> MMA "ready", MMA -> consumers "done").  The next chunk's v, dO,
+Akk and h are loaded once MMA phase D has consumed them; q, k and Aqk are
+loaded after the current chunk releases them (FREE).
+
+The CTA topology, MMA layout contracts, TMA descriptors and TMEM helpers come
+from the fused GDR backward (``fused_gdr_bwd_cute``), itself a CuTe DSL
+derivative of QwenLM FlashQLA's Blackwell fused GDR backward (MIT License).
 """
 
 from dataclasses import dataclass
@@ -48,7 +69,7 @@ _TK_WARPS = (4, 5, 6, 7)
 _MMA_WARP = 8
 _TMA_WARP = 9
 # A diagonal 16-token block uses the tensor-core product for a channel only
-# while its log2 gate span is below this bound (see the design document).  At
+# while its log2 gate span is below this bound (see the module docstring).  At
 # 112 the bounded-gate configuration (|g| <= 5 per token, span <= 108) never
 # falls back.
 DIAG_SPAN_LIMIT = 112.0

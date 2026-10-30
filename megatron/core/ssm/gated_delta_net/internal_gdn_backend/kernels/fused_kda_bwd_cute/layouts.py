@@ -3,7 +3,8 @@
 The KDA schedule reuses the GDR backward's oriented MMA variants, canonical
 SMEM mappings and packed-operand validation (``fused_gdr_bwd_cute.layouts``)
 and adds one variant for the intra-chunk lower products.  Operation names
-follow ``docs/fused-gdr-to-kda-port-analysis_cc.md`` section 3.
+follow the intermediates of ``tests/unit_tests/ssm/kda_fused_bwd_reference.py``
+(for example ``x_state = k*Gamma @ S`` and ``dvn_state = k*2^(G_last - G) @ dS``).
 """
 
 from dataclasses import dataclass
@@ -40,7 +41,7 @@ MMA_VARIANT_SPECS = (
 )
 
 # (name, stage, variant, A view, B view).  "ch-major" results put the 128 key
-# channels on the M (TMEM lane) axis; see the design document's section 3.
+# channels on the M (TMEM lane) axis; "token" results put 64 tokens there.
 MMA_OPERATION_SPECS = (
     # Token-major value-side products.
     MmaOperationSpec("x_state", "01", "mm_64_128_128_k_mn", "token_direct", "state_transposed"),
