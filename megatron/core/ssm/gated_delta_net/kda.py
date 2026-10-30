@@ -208,7 +208,12 @@ class KimiDeltaAttention(_GDNBase):
         # independent from the Q/K/V(/F/G) projection. Beta has only one scalar per key
         # head. Keep this small projection replicated across TP ranks so MXFP8 quantizes the
         # globally aligned output dimension rather than a potentially unaligned local shard
-        # (for example, 96 / TP2 = 48).
+        # (for example, 96 / TP2 = 48). Under sequence parallelism it consumes this rank's
+        # sequence shard like the other projections and _forward_compute all-to-alls its
+        # narrow output into the head-parallel layout, so the replicated weight only sees
+        # local tokens and its gradient is completed by the sequence-parallel
+        # parameter-gradient all-reduce (the duplicated TELinear sets the
+        # ``sequence_parallel`` parameter attribute).
         self.beta_proj = _build_with_kda_fp8_disabled(
             self.config,
             submodules.beta_proj,
@@ -223,13 +228,6 @@ class KimiDeltaAttention(_GDNBase):
             is_expert=False,
             name=(name + ".beta_proj") if name is not None else None,
         )
-        # _forward_compute explicitly handles both the SP input gather and TP output
-        # scatter. Their paired autograd mappings produce the complete, identical
-        # replicated-weight gradient on every TP rank, so beta_proj must not participate
-        # in the later sequence-parallel parameter-gradient all-reduce.
-        self.beta_proj.sequence_parallel = False
-        for parameter in self.beta_proj.parameters():
-            setattr(parameter, "sequence_parallel", False)
 
         # Separate output-gate projection, laid out like the F-decay projection above.
         if not self.use_legacy_fused_projections:
@@ -764,18 +762,21 @@ class KimiDeltaAttention(_GDNBase):
                 seq_len_post_headwise,
                 packed_seq_params,
             )
-        beta_input = hidden_states
+        beta, _ = self._proj(self.beta_proj, hidden_states)
         if self.config.sequence_parallel:
-            # The duplicated projection needs the full sequence. Its output is TP-scattered
-            # below, whose backward all-gathers the complete beta gradient; therefore this
-            # gather's backward only splits instead of reduce-scattering duplicate gradients.
-            beta_input = tensor_parallel.gather_from_sequence_parallel_region(
-                beta_input, tensor_parallel_output_grad=False, group=self.pg_collection.tp
+            # The replicated projection ran on this rank's sequence shard. Exchange its
+            # [S/TP, B, H_k] output for the head-parallel [S, B, H_k/TP] layout with one
+            # all-to-all of the beta values: H_k columns instead of all-gathering the
+            # hidden_size-wide input (96 vs 7168 for Kimi-K3). Its backward is the inverse
+            # all-to-all, which hands every rank the complete gradient of its own tokens.
+            beta = tensor_parallel.all_to_all_sp2hp(beta, group=self.pg_collection.tp)
+            beta = beta.view(
+                hidden_states.shape[0] * self.sp_size, batch, self.num_k_heads_local_tp
             )
-        beta, _ = self._proj(self.beta_proj, beta_input)
-        beta = tensor_parallel.scatter_to_tensor_model_parallel_region(
-            beta, group=self.pg_collection.tp
-        )
+        else:
+            beta = tensor_parallel.scatter_to_tensor_model_parallel_region(
+                beta, group=self.pg_collection.tp
+            )
         beta, _ = a2a_cp_to_hp(
             beta,
             (self.num_k_heads_local_tp,),
@@ -1180,16 +1181,14 @@ class KimiDeltaAttention(_GDNBase):
     def _projections_reading_hidden_states(self) -> list[torch.nn.Module]:
         """in_proj plus the separate f / gate / beta projections that also read hidden states.
 
-        f_b_proj and g_b_proj consume the low-rank latents, not the hidden states. Under
-        sequence parallelism beta_proj reads an all-gathered copy of the hidden states rather
-        than the layernorm output itself, so saving its original input would only cost memory.
+        f_b_proj and g_b_proj consume the low-rank latents, not the hidden states. beta_proj
+        reads the same (sequence-sharded) layernorm output as in_proj in every parallel mode.
         """
         modules = super()._projections_reading_hidden_states()
         if not self.use_legacy_fused_projections:
             modules.append(self.f_proj if self.f_latent_dim is None else self.f_a_proj)
             modules.append(self.g_proj if self.gate_latent_dim is None else self.g_a_proj)
-        if not self.config.sequence_parallel:
-            modules.append(self.beta_proj)
+        modules.append(self.beta_proj)
         return modules
 
     def backward_dw(self) -> None:
