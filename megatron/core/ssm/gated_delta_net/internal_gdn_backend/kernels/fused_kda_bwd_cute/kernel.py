@@ -5,8 +5,20 @@ and keeps the state gradient dH (128 key x 128 value, FP32) in tensor memory.
 A chunk reads FLA's forward residuals (q, k, v, dO, Aqk, Akk and the
 chunk-start state h in BF16; the chunk-local log2 gate cumsum and beta in
 FP32) and writes dq, dk, dv, dg (after the chunk-local reverse cumsum), dbeta
-and, after the first chunk, dh0.  The per-chunk math is the executable
-specification in ``tests/unit_tests/ssm/kda_fused_bwd_reference.py``.
+and, after the first chunk, dh0.
+
+Per chunk, with G the gate tile, Gamma = 2^G, G_last its last valid row, S the
+chunk-start state and dS the gradient of the chunk-end state (initially dht):
+
+* X = (k*Gamma) S, Delta = v - X, v_new = (Akk diag(beta)) Delta;
+* dv_new = (k*2^(G_last - G)) dS + Aqk^T dO;
+* D = Akk^T dv_new, dv = beta*D, dbeta += rowsum(D*Delta);
+* dAqk = scale dO v_new^T (causal), dAkk = (dv_new Delta^T) diag(beta)
+  (strictly lower), dL = -Akk^T dAkk Akk^T;
+* dq and dk collect state-path terms from S, dS and D and intra-chunk terms
+  from dAqk and dL; dg = q*dq + k*dk-terms, then its chunk-local reverse
+  cumsum;
+* dS <- Gamma_last*dS + (scale q*Gamma)^T dO - (k*beta*Gamma)^T D.
 
 Orientation: value-side products (X = k*Gamma*S, dv_new, v_new, D) are
 token-major as in the GDR backward.  Every token x key-channel product (dq,

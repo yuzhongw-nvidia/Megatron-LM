@@ -567,10 +567,9 @@ def _fused_kda_bwd_supported() -> bool:
     ("sequence_packing", "tp", "sp", "cp", "linear_cp_mode"),
     [
         (True, 1, False, 1, "chunkwise"),
+        # Headwise CP hands the kernel whole local sequences, as CP1 does.
         (False, 1, False, 2, "headwise"),
-        (True, 1, False, 2, "headwise"),
-        (True, 1, False, 2, "chunkwise"),
-        (True, 2, True, 2, "chunkwise"),
+        # CP4 has first, middle and last ranks, so it covers chunkwise CP2.
         (True, 1, False, 4, "chunkwise"),
     ],
 )

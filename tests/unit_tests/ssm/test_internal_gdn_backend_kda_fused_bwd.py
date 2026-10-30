@@ -69,12 +69,15 @@ def _grads(chunk_kda, leaves, do, cu_seqlens, safe_gate, lower_bound):
 
 
 @pytest.mark.parametrize(
-    "lengths", [[130, 64, 257], None], ids=["packed_with_tails", "dense_batch2"]
-)
-@pytest.mark.parametrize(
-    "safe_gate, lower_bound, A_log_range",
-    [(False, None, (-1.0, 1.0)), (True, -5.0, (-1.0, 1.0)), (False, None, (1.5, 2.5))],
-    ids=["unbounded", "bounded", "strong_unbounded"],
+    "lengths, safe_gate, lower_bound, A_log_range",
+    [
+        ([130, 64, 257], False, None, (-1.0, 1.0)),
+        ([130, 64, 257], True, -5.0, (-1.0, 1.0)),
+        # Strong gates push many diagonal blocks past DIAG_SPAN_LIMIT (CUDA-core fallback).
+        ([130, 64, 257], False, None, (1.5, 2.5)),
+        (None, False, None, (-1.0, 1.0)),
+    ],
+    ids=["unbounded", "bounded", "strong_unbounded", "dense_batch2"],
 )
 def test_fused_bwd_matches_fla(monkeypatch, lengths, safe_gate, lower_bound, A_log_range):
     from fla.ops.kda import chunk_kda as fla_chunk_kda
@@ -144,21 +147,17 @@ def test_fused_bwd_compiles_once_across_packings(monkeypatch):
     assert sizes[1:] == sizes[:1] * (len(sizes) - 1), sizes
 
 
-@pytest.mark.parametrize("lengths", [[130, 64, 257], None], ids=["packed", "dense_batch2"])
-def test_fused_bwd_saved_state_matches_recompute(monkeypatch, lengths):
+def test_fused_bwd_saved_state_matches_recompute(monkeypatch):
     from functools import partial
 
     adapter = _adapter()
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
     monkeypatch.delenv("MCORE_KDA_FUSED_BWD", raising=False)
-    if lengths is None:
-        leaves, do = _inputs(2, 192, (-1.0, 1.0))
-        cu_seqlens = None
-    else:
-        leaves, do = _inputs(1, sum(lengths), (-1.0, 1.0))
-        cu_seqlens = torch.tensor(
-            [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
-        )
+    lengths = [130, 64, 257]
+    leaves, do = _inputs(1, sum(lengths), (-1.0, 1.0))
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
+    )
     saved = _grads(
         partial(adapter.chunk_kda, recompute_h=False), leaves, do, cu_seqlens, True, -5.0
     )

@@ -3,8 +3,8 @@
 The KDA schedule reuses the GDR backward's oriented MMA variants, canonical
 SMEM mappings and packed-operand validation (``fused_gdr_bwd_cute.layouts``)
 and adds one variant for the intra-chunk lower products.  Operation names
-follow the intermediates of ``tests/unit_tests/ssm/kda_fused_bwd_reference.py``
-(for example ``x_state = k*Gamma @ S`` and ``dvn_state = k*2^(G_last - G) @ dS``).
+follow the per-chunk math in the ``kernel`` module docstring (for example
+``x_state = k*Gamma @ S`` and ``dvn_state = k*2^(G_last - G) @ dS``).
 """
 
 from dataclasses import dataclass
