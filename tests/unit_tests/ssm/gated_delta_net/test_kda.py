@@ -368,8 +368,73 @@ def test_kda_input_layernorm_recompute_fp8_sequence_parallel():
         assert kda.in_proj.save_original_input
         assert kda.f_a_proj.save_original_input
         assert kda.g_a_proj.save_original_input
-        # SP beta consumes an all-gathered copy, not the discarded layernorm output.
-        assert not kda.beta_proj.save_original_input
+        # SP beta consumes the same sequence-sharded layernorm output as in_proj.
+        assert kda.beta_proj.save_original_input
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.parametrize(
+    ("f_lora_rank", "gate_lora_rank"),
+    [(None, None), (16, None)],
+    ids=["legacy-fused", "kimi-low-rank-f"],
+)
+def test_kda_sequence_parallel_beta_matches_replicated_input(f_lora_rank, gate_lora_rank):
+    """Under TP + SP beta_proj runs on the sequence shard and all-to-alls its output into the
+    head-parallel layout. The layer output and the TP-summed gradient of the replicated beta
+    weight must match the same layer fed the full (replicated) sequence without SP."""
+    Utils.initialize_distributed()
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2, pipeline_model_parallel_size=1, context_parallel_size=1
+    )
+    try:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_rank, tp_size = tp_group.rank(), tp_group.size()
+        hidden_size = _make_config().hidden_size
+        full_input = torch.randn(
+            (32, 2, hidden_size), device=torch.cuda.current_device(), dtype=torch.bfloat16
+        )
+        torch.distributed.broadcast(
+            full_input, src=torch.distributed.get_global_rank(tp_group, 0), group=tp_group
+        )
+
+        outputs, beta_weight_grads = {}, {}
+        for sequence_parallel in (False, True):
+            model_parallel_cuda_manual_seed(123)
+            config = _make_config(
+                tp_size=tp_size,
+                sequence_parallel=sequence_parallel,
+                f_lora_rank=f_lora_rank,
+                gate_lora_rank=gate_lora_rank,
+            )
+            kda = _build_kda(config)
+            weight = kda.beta_proj.weight
+            assert getattr(weight, "sequence_parallel", False) == sequence_parallel
+            assert not getattr(weight, "tensor_model_parallel", False)
+            local_input = full_input
+            if sequence_parallel:
+                local_input = full_input.chunk(tp_size, dim=0)[tp_rank]
+            local_input = local_input.clone().requires_grad_(True)
+            output, bias = kda(local_input, None)
+            assert bias is None
+            output.float().sum().backward()
+            grad = weight.grad.detach().float().clone()
+            if sequence_parallel:
+                # Each rank holds the contribution of its own tokens; the sequence-parallel
+                # parameter-gradient all-reduce completes it.
+                torch.distributed.all_reduce(grad, group=tp_group)
+                output_shards = [torch.empty_like(output) for _ in range(tp_size)]
+                torch.distributed.all_gather(output_shards, output.detach(), group=tp_group)
+                output = torch.cat(output_shards, dim=0)
+            outputs[sequence_parallel] = output.detach().float()
+            beta_weight_grads[sequence_parallel] = grad
+
+        torch.testing.assert_close(outputs[True], outputs[False], atol=1e-2, rtol=1e-2)
+        grad_diff = torch.linalg.vector_norm(beta_weight_grads[True] - beta_weight_grads[False])
+        grad_norm = torch.linalg.vector_norm(beta_weight_grads[False]).clamp_min(1e-12)
+        assert grad_diff / grad_norm < 1e-2, (grad_diff / grad_norm).item()
     finally:
         Utils.destroy_model_parallel()
 
