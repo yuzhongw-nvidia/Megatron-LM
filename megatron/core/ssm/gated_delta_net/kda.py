@@ -288,7 +288,53 @@ class KimiDeltaAttention(_GDNBase):
         self.dt_bias_dim = self.qk_dim_local_tp
         self.a_log_dim = self.num_k_heads_local_tp
         self.gate_params_dtype = torch.float32
-        self.gated_delta_rule = chunk_kda
+        self.gated_delta_rule = self._select_kda_kernel()
+
+    def _select_kda_kernel(self):
+        """The ``chunk_kda``-compatible kernel entry point for ``config.kda_kernel_backend``."""
+        backend = getattr(self.config, "kda_kernel_backend", "fla")
+        if backend == "fla":
+            return chunk_kda
+        if backend == "cudnn":
+            # Hybrid stacks can reach this module with experimental_attention_variant unset, which
+            # skips TransformerConfig's KDA validation block; keep the guard here too.
+            if getattr(self.config, "deterministic_mode", False):
+                raise ValueError(
+                    "kda_kernel_backend='cudnn' is not deterministic; use 'fla' with "
+                    "deterministic_mode=True."
+                )
+            from megatron.core.ssm.gated_delta_net.cudnn_kda import (
+                chunk_kda_cudnn,
+                cudnn_kda_unavailable_reason,
+            )
+            from megatron.core.ssm.gated_delta_net.cudnn_kda.ops import device_unavailable_reason
+
+            reason = cudnn_kda_unavailable_reason()
+            if reason is not None:
+                raise ImportError(
+                    f"kda_kernel_backend='cudnn' needs cudnn-frontend >= 1.32.0 with the native "
+                    f"KDA operators: {reason}"
+                )
+            # cuDNN's other KDA engines serve a forward-only subset; fail at construction rather
+            # than in the first backward when this GPU / CuTe DSL cannot run the training engines.
+            reason = device_unavailable_reason()
+            if reason is not None:
+                raise RuntimeError(f"kda_kernel_backend='cudnn' cannot run here: {reason}")
+            producer = getattr(self.config, "kda_cudnn_cp_state_producer", "cudnn")
+            if producer == "cudnn":
+                return chunk_kda_cudnn
+            if producer != "cute":
+                raise ValueError(
+                    f"Unsupported kda_cudnn_cp_state_producer {producer!r}; "
+                    "expected 'cudnn' or 'cute'."
+                )
+            from megatron.core.ssm.gated_delta_net.cudnn_kda import cute_preprocess
+
+            reason = cute_preprocess.unavailable_reason()
+            if reason is not None:
+                raise ImportError(f"kda_cudnn_cp_state_producer='cute' cannot run here: {reason}")
+            return partial(chunk_kda_cudnn, cp_state_producer="cute")
+        raise ValueError(f"Unsupported kda_kernel_backend {backend!r}; expected 'fla' or 'cudnn'.")
 
     def _get_in_proj_qkv_layout(self) -> QKVLayout:
         """Describe KDA's rank-major packed input projection for Muon splitting."""

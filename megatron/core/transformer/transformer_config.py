@@ -647,6 +647,24 @@ class TransformerConfig(ModelParallelConfig):
     kda_lower_bound: Optional[float] = None
     """Optional lower bound for KDA's bounded gate values."""
 
+    kda_kernel_backend: Literal["fla", "cudnn"] = "fla"
+    """Kernel implementation of the KDA chunked recurrence.
+
+    ``fla`` (default) runs flash-linear-attention's Triton ``chunk_kda``; ``cudnn`` runs
+    cudnn-frontend's native KDA kernels (>= 1.32.0, Blackwell SM100+) behind the same call,
+    including chunkwise context parallelism through cuDNN's per-span summary primitives.  FLA
+    stays required for the causal convolution, L2 norm and the CP context.
+    """
+
+    kda_cudnn_cp_state_producer: Literal["cudnn", "cute"] = "cudnn"
+    """How the cuDNN KDA backend produces the chunkwise-CP boundary states.
+
+    ``cudnn`` (default): cuDNN's per-span summaries, an all-gather and a transition fold.
+    ``cute``: the fused CuTe DSL preprocess ported from PR #6511 (experimental; requires its
+    kernels to import on the installed CuTe DSL).  Only used with ``kda_kernel_backend="cudnn"``
+    and ``linear_cp_mode="chunkwise"``.
+    """
+
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use streamed Triton pre-GDR preprocessing for GDN-family attention."""
 
@@ -2864,6 +2882,31 @@ class TransformerConfig(ModelParallelConfig):
                             "KDA requires kda_lower_bound to be in [-5, 0) "
                             "when kda_safe_gate=True."
                         )
+                if self.kda_kernel_backend not in ("fla", "cudnn"):
+                    raise ValueError(
+                        "kda_kernel_backend must be 'fla' or 'cudnn', "
+                        f"got {self.kda_kernel_backend!r}."
+                    )
+                if self.kda_kernel_backend == "cudnn" and self.deterministic_mode:
+                    raise ValueError(
+                        "kda_kernel_backend='cudnn' is not deterministic; use 'fla' with "
+                        "deterministic_mode=True."
+                    )
+                if self.kda_cudnn_cp_state_producer not in ("cudnn", "cute"):
+                    raise ValueError(
+                        "kda_cudnn_cp_state_producer must be 'cudnn' or 'cute', "
+                        f"got {self.kda_cudnn_cp_state_producer!r}."
+                    )
+                if (
+                    self.kda_kernel_backend == "cudnn"
+                    and self.kda_cudnn_cp_state_producer == "cute"
+                    and self.cuda_graph_impl != "none"
+                ):
+                    raise ValueError(
+                        "kda_cudnn_cp_state_producer='cute' exchanges states through symmetric "
+                        "memory and cannot be CUDA-graphed; use cuda_graph_impl='none' or the "
+                        "'cudnn' producer."
+                    )
 
             if (
                 self.experimental_attention_variant == "gdn2"

@@ -238,6 +238,24 @@ def test_kda_recurrence_replays():
     )
 
 
+def test_kda_deterministic_path_stays_on_fla():
+    """The deterministic KDA path keeps the FLA recurrence; the cuDNN backend is refused."""
+    from megatron.core.ssm.gated_delta_net import kda
+
+    if kda.chunk_kda is None:
+        pytest.skip("FLA KDA kernel is unavailable")
+    select = kda.KimiDeltaAttention._select_kda_kernel
+    fla_shell = SimpleNamespace(
+        config=SimpleNamespace(kda_kernel_backend="fla", deterministic_mode=True)
+    )
+    assert select(fla_shell) is kda.chunk_kda
+    cudnn_shell = SimpleNamespace(
+        config=SimpleNamespace(kda_kernel_backend="cudnn", deterministic_mode=True)
+    )
+    with pytest.raises(ValueError, match="deterministic"):
+        select(cudnn_shell)
+
+
 def test_mok_route_adapter_replays():
     """Replay the fixed-width route gather and its probability-gradient scatter."""
     from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs

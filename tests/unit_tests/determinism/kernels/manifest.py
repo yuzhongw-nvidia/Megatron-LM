@@ -205,6 +205,26 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Multi-rank convolution and chunkwise CP remain in the existing parity suite.",
     ),
     KernelEntry(
+        name="kda_cudnn_backend",
+        sources=(
+            "megatron/core/ssm/gated_delta_net/cudnn_kda/chunk.py",
+            "megatron/core/ssm/gated_delta_net/cudnn_kda/cp.py",
+            "megatron/core/ssm/gated_delta_net/cudnn_kda/ops.py",
+            "megatron/core/ssm/gated_delta_net/cudnn_kda/cute_preprocess/backend.py",
+            "megatron/core/ssm/gated_delta_net/cudnn_kda/cute_preprocess/producer.py",
+            "megatron/core/ssm/gated_delta_net/cudnn_kda/cute_preprocess/fused_ws.py",
+            "megatron/core/ssm/gated_delta_net/cudnn_kda/cute_preprocess/bwd_ws.py",
+        ),
+        kind="dispatch",
+        notes="cudnn-frontend's native KDA kernels (kda_kernel_backend='cudnn'), the chunkwise-CP "
+        "composition from cuDNN's per-span summaries, and the optional CuTe DSL CP preprocess "
+        "producer. Parity against FLA: tests/unit_tests/ssm/gated_delta_net/test_kda_cudnn.py.",
+        exempt_reason="cuDNN's KDA engines are not bit-exact and need a Blackwell GPU plus "
+        "cudnn-frontend >= 1.32.0; TransformerConfig and KimiDeltaAttention reject "
+        "kda_kernel_backend='cudnn' under deterministic_mode, so the deterministic path stays on "
+        "the FLA/torch kernels covered by kda_recurrence.",
+    ),
+    KernelEntry(
         name="mok_route_adapter",
         sources=("megatron/core/transformer/moe/megakernel/mok/route_adapter.py",),
         tests=(K + "test_dev_sync_kernels.py",),
