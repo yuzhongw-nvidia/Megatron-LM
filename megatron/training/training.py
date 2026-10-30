@@ -1335,6 +1335,17 @@ def num_floating_point_operations(
         # Core attention (L^2) FLOPs per standard-attention layer.
         self_attn_core_term = standard_self_attn_core_term * num_standard_attention_layers
 
+        attention_residual_term = 0
+        if getattr(args, "enable_attention_residuals", False):
+            attention_residual_term = forward_backward_expansion_factor * attention_residual_flops(
+                total_tokens=1,
+                hidden_size=args.hidden_size,
+                num_layers=args.num_layers,
+                block_layers=args.attn_res_block_layers,
+                transformer_layer_layout=True,
+                mtp_num_layers=mtp_num_layers,
+            )
+
         # Token-linear FLOPs scale with the real (unpadded) token count.
         # For BSHD this falls back to ``batch_size * seq_length`` (no padding).
         total_floating_point_operations = (
@@ -1370,6 +1381,8 @@ def num_floating_point_operations(
                 )
                 # Self Attention (token-linear part).
                 + self_attn_term
+                # Attention Residual depth scoring and value aggregation.
+                + attention_residual_term
                 # MTP norms and proj
                 + forward_backward_expansion_factor
                 * fma_expansion_factor

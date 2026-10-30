@@ -10,7 +10,10 @@ import pytest
 import torch
 
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -454,6 +457,14 @@ def _build_gpt_model(
     model_parallel_cuda_manual_seed(seed)
     torch.manual_seed(seed)
     ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
+    if recompute_modules is None:
+        recompute_modules = ["layernorm"]
+        if num_experts is not None and not use_transformer_engine_op_fuser:
+            recompute_modules.append("moe_act")
+    else:
+        recompute_modules = list(recompute_modules)
+    if enable_hyper_connections and mhc_recompute_layer_num is not None:
+        recompute_modules.append("mhc")
     transformer_config = ConfigClass(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -467,6 +478,12 @@ def _build_gpt_model(
         # MoE
         num_moe_experts=num_experts,
         moe_grouped_gemm=(num_experts is not None),
+        gated_linear_unit=use_transformer_engine_op_fuser,
+        activation_func=(
+            torch.nn.functional.silu
+            if use_transformer_engine_op_fuser
+            else torch.nn.functional.gelu
+        ),
         # Fine-grained activation offloading
         fine_grained_activation_offloading=fine_grained_activation_offloading,
         offload_modules=offload_modules,
@@ -581,6 +598,12 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     - backward gradient correctness (subset)
     - peak GPU memory is reduced roughly as expected (based on recorded offload bytes)
     """
+    if attn_res_impl == "fla":
+        from megatron.core.transformer.attention_residual import _get_fla_fused_attnres
+
+        if _get_fla_fused_attnres() is None:
+            pytest.skip("FLA fused AttnRes is not installed")
+
     # setup distributed/model-parallel (same pattern as other UTs)
     os.environ.pop("NVTE_FUSED_ATTN", None)
     os.environ.pop("NVTE_FLASH_ATTN", None)
@@ -598,6 +621,15 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     seq_length = 1024
     micro_batch_size = 2
     device = torch.device("cuda")
+    use_transformer_engine_op_fuser = "fused_group_mlp" in offload_modules
+    if use_transformer_engine_op_fuser:
+        if not is_te_min_version("2.14.0"):
+            pytest.skip("TE operation fuser requires transformer-engine>=2.14.0")
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
+        except ImportError:
+            pytest.skip("Installed Transformer Engine does not provide the operation-fuser API")
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
 
     input_ids, position_ids, attention_mask = _make_gpt_inputs(
         seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
@@ -622,6 +654,11 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=None,
             min_offloaded_tensor_size=1024 * 1024,
             is_mla=is_mla,
+            enable_attention_residuals=enable_attention_residuals,
+            attn_res_impl=attn_res_impl,
+            mtp_num_layers=mtp_num_layers,
+            use_transformer_engine_op_fuser=use_transformer_engine_op_fuser,
+            recompute_modules=recompute_modules,
         ).cuda()
         base_model.train()
         base_params = _capture_params(base_model)
@@ -680,6 +717,20 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         )
 
         mgr = PipelineOffloadManager.get_instance()
+        for module in offload_modules:
+            if (
+                enable_attention_residuals
+                and module == "qkv_linear"
+                and "layernorm" in off_model.config.recompute_modules
+            ):
+                # AttnRes uses an explicit norm: checkpointing its output makes
+                # the QKV input recompute-owned rather than offload-owned.
+                assert mgr.offload_summary_bytes.get(module, 0) == 0
+                continue
+            assert mgr.offload_summary_bytes.get(module, 0) > 0, (
+                f"Expected {module} to offload at least one activation, got "
+                f"{mgr.offload_summary_bytes.get(module, 0)} bytes"
+            )
         expected_offload_bytes = int(
             sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
         )

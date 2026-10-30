@@ -3,7 +3,7 @@
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Set, Union, cast
+from typing import List, Optional, Set, Tuple, Union, cast
 
 import torch
 from torch import Tensor
@@ -23,6 +23,11 @@ from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_observation import observe_layer_residuals
+from megatron.core.transformer.attention_residual import (
+    AttentionResidual,
+    AttnResStageSources,
+    is_attn_res_block_start,
+)
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
@@ -45,6 +50,8 @@ from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_rank,
     make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 try:
@@ -415,6 +422,21 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
+            if self.config.enable_mhc_connections:
+                hc_mult = self.config.num_residual_streams
+                hc_dim = self.config.hidden_size * hc_mult
+                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
+            if self.config.enable_attention_residuals:
+                # Final AttnRes output head: aggregates all depth sources plus the
+                # trailing partial block right before the final layernorm.
+                self.final_attn_res = AttentionResidual(self.config)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -449,6 +471,150 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 and has_final_layernorm_in_this_stage
                 and self.post_layer_norm
             )
+
+    def preprocess_for_layer_schedule(self, hidden_states: Union[Tensor, WrappedTensor]) -> Tensor:
+        """Apply TransformerBlock entry processing for normal and scheduled forward paths.
+
+        On the first pipeline stage, this method uses the provided hidden states. On subsequent
+        stages, it uses the tensor supplied through :meth:`set_input_tensor`. The result is made
+        viewless and, on the first pipeline stage, expanded into mHC residual streams when mHC is
+        enabled.
+
+        Args:
+            hidden_states: Hidden states for the first pipeline stage, optionally wrapped for
+                deferred unwrapping.
+
+        Returns:
+            Viewless hidden states ready for layer execution. When mHC is enabled on the first
+            pipeline stage, the hidden dimension contains all residual streams.
+        """
+        # Delete the obsolete reference to the initial input tensor if necessary.
+        if isinstance(hidden_states, WrappedTensor):
+            hidden_states = hidden_states.unwrap()
+
+        if not self.pre_process:
+            # See set_input_tensor().
+            hidden_states = self.input_tensor
+
+        # Make the input viewless. This is usually redundant — embedding outputs and
+        # p2p_communication.py both produce viewless tensors — but make_viewless_tensor()
+        # is a negligible-overhead no-op on already-viewless inputs, so it is kept here
+        # defensively for mbs == 1 view-tensor and other corner cases.
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+        # Expand hidden states for hyper connections at the start of the block.
+        # Only expand at the first PP stage; subsequent stages receive n-stream from previous stage.
+        if self.config.enable_mhc_connections and self.pre_process:
+            hidden_states = HyperConnectionModule.input_expand(
+                hidden_states, self.num_residual_streams
+            )  # [s, b, C] -> [s, b, n*C]
+            # Embedding-only stages send this expanded view without executing a layer.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
+
+        return hidden_states
+
+    def postprocess_for_layer_schedule(
+        self,
+        hidden_states: Tensor,
+        *,
+        extract_layer_indices: Optional[Set[int]] = None,
+        return_mhc_multistream: bool = False,
+        attn_res_state: Optional[AttnResStageSources] = None,
+    ) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
+        """Apply TransformerBlock exit processing shared by normal and scheduled forward paths.
+
+        This method contracts mHC residual streams on the stage that owns the final layer norm,
+        applies the final layer norm, and preserves a distinct output node for empty pipeline
+        stages. With MTP, it can also return the pre-contraction mHC streams for the MTP input.
+        With attention residuals it aggregates (final stage) or packs (earlier stages) the
+        depth sources and, with MTP, hands the complete trunk source tuple back through the
+        same extra output slot mHC uses (the two modes are mutually exclusive).
+
+        Args:
+            hidden_states: Hidden states produced by the transformer layers.
+            extract_layer_indices: Requested feature-extraction layer indices. Nonempty feature
+                extraction is not supported when mHC and MTP are both enabled.
+            return_mhc_multistream: Whether to return the pre-contraction mHC streams together with
+                the processed hidden states.
+            attn_res_state: The stage's attention-residual depth-source state; required when
+                ``config.enable_attention_residuals`` is set.
+
+        Returns:
+            The processed hidden states. If ``return_mhc_multistream`` is true, returns a tuple of
+            the processed hidden states and the pre-contraction mHC streams. The second element is
+            ``None`` when no MTP mHC streams need to be preserved.
+
+        Raises:
+            AssertionError: If nonempty feature extraction is requested while mHC and MTP are both
+                enabled.
+        """
+        mhc_multistream = None
+        # Only contract if the final layer norm is in this stage.
+        if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
+            # When MTP is enabled, save pre-contraction multi-stream for MTP input.
+            if self.config.mtp_num_layers is not None:
+                if extract_layer_indices is not None:
+                    assert (
+                        len(extract_layer_indices) == 0
+                    ), "Feature extraction is not supported with mHC + MTP."
+                mhc_multistream = hidden_states
+            # [s, b, n*C] -> [s, b, C]
+            hidden_states = HyperConnectionModule.output_contract(
+                hidden_states, self.mhc_num_residual_streams
+            )
+
+        if self.config.enable_attention_residuals:
+            assert attn_res_state is not None, (
+                "enable_attention_residuals requires the caller to thread the depth-source "
+                "state into postprocess_for_layer_schedule; this execution path does not."
+            )
+            if extract_layer_indices is not None:
+                # The per-layer carried state is the intra-block partial sum, not a
+                # baseline-equivalent hidden state — extraction would be misleading.
+                assert (
+                    len(extract_layer_indices) == 0
+                ), "Feature extraction is not supported with attention residuals."
+            # The network end is a block boundary: the trailing partial sum always
+            # holds the last (possibly incomplete) depth block and is never in the
+            # source list, so it must be aggregated (and shipped) alongside them.
+            if self.has_final_layernorm_in_this_stage():
+                attn_res_values = attn_res_state.exit_aggregate_values(hidden_states)
+                if self.config.mtp_num_layers is not None:
+                    # Hand the full depth history to MTP through the same extra
+                    # output slot mHC uses for its multistream (mutually exclusive).
+                    mhc_multistream = tuple(attn_res_values)
+                nvtx_range_push(msg="attn_res.final_aggregate")
+                hidden_states = self.final_attn_res(attn_res_values)
+                nvtx_range_pop(msg="attn_res.final_aggregate")
+            else:
+                # Not the final stage: pack the pipeline payload (full prefix, or
+                # delta + padding under interleaved VPP), concatenated along the
+                # sequence dim.
+                nvtx_range_push(msg="attn_res.pack_payload")
+                hidden_states = attn_res_state.exit_pack(hidden_states)
+                nvtx_range_pop(msg="attn_res.pack_payload")
+
+        # Final layer norm.
+        if self.final_layernorm is not None:
+            hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
+            # TENorm produces a "viewed" tensor. This will result in schedule.py's
+            # deallocate_output_tensor() throwing an error, so a viewless tensor is
+            # created to prevent this.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
+
+        # If this TransformerBlock is empty, input and output hidden states will be the same
+        # node on the computational graph and will lead to unexpected errors in pipeline
+        # schedules.
+        if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
+            hidden_states = hidden_states.clone()
+
+        if return_mhc_multistream:
+            return hidden_states, mhc_multistream
+        return hidden_states
 
     def _setup_fused_tp_communication(self):
         """Setup fused TP communication for all layers.
@@ -642,6 +808,29 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
 
+        # Attention residuals: recover (depth sources, partial sum) for this stage.
+        # On the first stage the embedding output is the initial partial sum (it
+        # becomes depth source b_0 when layer 1 opens the first block); later
+        # stages unpack the seq-dim-concatenated payload from the previous stage.
+        # Under interleaved VPP the payload is a padded delta and the rest of
+        # the prefix comes from the rank-local source cache.
+        attn_res_state: Optional[AttnResStageSources] = None
+        if self.config.enable_attention_residuals:
+            current_microbatch = None
+            if self.config.virtual_pipeline_model_parallel_size is not None:
+                current_microbatch = (
+                    getattr(self.layers[0], 'current_microbatch', None) if self.layers else None
+                )
+            attn_res_state, hidden_states = AttnResStageSources.enter(
+                self.config,
+                hidden_states,
+                layers_before=layer_offset,
+                pp_rank=get_pg_rank(pp_group),
+                vp_stage=self.vp_stage,
+                microbatch_id=current_microbatch,
+                pre_process=self.pre_process,
+            )
+
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
@@ -743,6 +932,14 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     extra_layer_kwargs = (
                         {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
                     )
+                    if attn_res_state is not None:
+                        if is_attn_res_block_start(
+                            layer.layer_number, self.config.attn_res_block_layers
+                        ):
+                            # Block boundary: the completed partial sum becomes a
+                            # depth source; the layer starts a fresh partial sum.
+                            attn_res_state.append_block_start(hidden_states)
+                        extra_layer_kwargs["attn_res_sources"] = tuple(attn_res_state.graph_sources)
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
@@ -778,29 +975,21 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
 
-        # Only contract if the final layer norm is in this stage
-        if self.config.enable_mhc_connections and self.has_final_layernorm_in_this_stage():
-            hidden_states = HyperConnectionModule.output_contract(
-                hidden_states, self.mhc_num_residual_streams
-            )  # [s, b, n*C] -> [s, b, C]
-
-        # Final layer norm.
-        if self.final_layernorm is not None:
-            hidden_states = apply_module(self.final_layernorm)(cast(Tensor, hidden_states))
-            # TENorm produces a "viewed" tensor. This will result in schedule.py's
-            # deallocate_output_tensor() throwing an error, so a viewless tensor is
-            # created to prevent this.
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
-
-        # If this TransformerBlock is empty, input and output hidden states will be the same node
-        # on the computational graph and will lead to unexpected errors in pipeline schedules.
-        if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
-            hidden_states = hidden_states.clone()
+        hidden_states, mhc_multistream = self.postprocess_for_layer_schedule(
+            hidden_states,
+            extract_layer_indices=extract_layer_indices,
+            return_mhc_multistream=True,
+            attn_res_state=attn_res_state,
+        )
 
         if len(extract_layer_indices) > 0:
             return hidden_states, intermediate_hidden_states
+
+        # When mHC + MTP, return both contracted [s,b,h] (for lm_head) and
+        # pre-contraction multi-stream [s,b,n*h] (for MTP input). With AttnRes +
+        # MTP the second element is the complete trunk depth-source tuple instead.
+        if mhc_multistream is not None:
+            return hidden_states, mhc_multistream
 
         return hidden_states
 

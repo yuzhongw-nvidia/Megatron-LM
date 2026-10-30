@@ -37,6 +37,7 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
+    AttnResTransformerLayer,
     MlpBuilder,
     TransformerLayer,
     TransformerLayerSubmodules,
@@ -332,8 +333,10 @@ def get_gpt_layer_with_transformer_engine_submodules(
 @copy_signature(get_gpt_layer_with_transformer_engine_submodules)
 def get_gpt_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training)."""
+    enable_attn_res = kwargs.pop('enable_attention_residual', False)
+    layer_module = AttnResTransformerLayer if enable_attn_res else TransformerLayer
     return ModuleSpec(
-        module=TransformerLayer,
+        module=layer_module,
         submodules=get_gpt_layer_with_transformer_engine_submodules(*args, **kwargs),
     )
 
@@ -445,8 +448,10 @@ def get_gpt_layer_local_submodules(
 @copy_signature(get_gpt_layer_local_submodules)
 def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core."""
+    enable_attn_res = kwargs.pop('enable_attention_residual', False)
+    layer_module = AttnResTransformerLayer if enable_attn_res else TransformerLayer
     return ModuleSpec(
-        module=TransformerLayer, submodules=get_gpt_layer_local_submodules(*args, **kwargs)
+        module=layer_module, submodules=get_gpt_layer_local_submodules(*args, **kwargs)
     )
 
 
@@ -576,6 +581,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            enable_attention_residual=config.enable_attention_residuals,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
@@ -588,6 +594,7 @@ def get_gpt_decoder_layer_specs(
             qk_l2_norm=qk_l2_norm,
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
+            enable_attention_residual=config.enable_attention_residuals,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
@@ -617,6 +624,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            enable_attention_residual=config.enable_attention_residuals,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
             num_experts=config.num_moe_experts,
@@ -628,6 +636,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            enable_attention_residual=config.enable_attention_residuals,
         )
 
     # Parse config.moe_layer_freq to determine the pattern of expert/dense layers.
@@ -744,7 +753,7 @@ def get_gpt_mtp_block_spec_for_backend(
     if isinstance(spec, TransformerBlockSubmodules):
         # get the spec for the last layer of decoder block
         transformer_layer_spec = spec.layer_specs[-1]
-    elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
+    elif isinstance(spec, ModuleSpec) and issubclass(spec.module, TransformerLayer):
         transformer_layer_spec = spec
     else:
         raise ValueError(f"Invalid spec: {spec}")

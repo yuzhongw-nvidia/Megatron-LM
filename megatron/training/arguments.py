@@ -2454,6 +2454,8 @@ def _add_network_size_args(parser):
         "wide_residual",
         # Parsed manually as a JSON object below.
         "moe_megakernel_backend_config",
+        # Manually added in _add_experimental_args (avoids ArgumentGroupFactory double-registration).
+        "hybrid_layer_pattern",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
