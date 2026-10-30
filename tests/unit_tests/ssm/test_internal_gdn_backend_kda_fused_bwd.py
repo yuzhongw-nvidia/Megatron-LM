@@ -1,0 +1,117 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""GPU tests for the fused CuTe DSL KDA backward behind the internal KDA adapter."""
+
+import importlib.util
+
+import pytest
+import torch
+
+
+def _fused_kda_bwd_available() -> bool:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        return False
+    if importlib.util.find_spec("fla") is None or importlib.util.find_spec("cutlass") is None:
+        return False
+    return True
+
+
+pytestmark = pytest.mark.skipif(
+    not _fused_kda_bwd_available(), reason="needs SM100, FLA and the CuTe DSL runtime"
+)
+
+_HEADS = 4
+_DIM = 128
+
+
+def _adapter():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import kda as adapter
+
+    return adapter
+
+
+def _inputs(batch, seq_len, gate_range, seed=0):
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=generator, device="cuda")
+
+    shape = (batch, seq_len, _HEADS, _DIM)
+    q = torch.nn.functional.normalize(randn(*shape), dim=-1).bfloat16()
+    k = torch.nn.functional.normalize(randn(*shape), dim=-1).bfloat16()
+    v = randn(*shape).bfloat16()
+    raw_g = randn(*shape).bfloat16()
+    beta = torch.rand(batch, seq_len, _HEADS, generator=generator, device="cuda")
+    low, high = gate_range
+    A_log = (low + (high - low) * torch.rand(_HEADS, generator=generator, device="cuda")).float()
+    dt_bias = 0.1 * randn(_HEADS * _DIM)
+    do = randn(*shape).bfloat16()
+    return (q, k, v, raw_g, beta, A_log, dt_bias), do
+
+
+def _grads(chunk_kda, leaves, do, cu_seqlens, safe_gate, lower_bound):
+    leaves = [x.detach().clone().requires_grad_(True) for x in leaves]
+    q, k, v, raw_g, beta, A_log, dt_bias = leaves
+    out, _ = chunk_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=raw_g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        use_gate_in_kernel=True,
+        safe_gate=safe_gate,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+    )
+    return (out, *torch.autograd.grad(out, leaves, do))
+
+
+@pytest.mark.parametrize(
+    "lengths", [[130, 64, 257], None], ids=["packed_with_tails", "dense_batch2"]
+)
+@pytest.mark.parametrize(
+    "safe_gate, lower_bound, A_log_range",
+    [(False, None, (-1.0, 1.0)), (True, -5.0, (-1.0, 1.0)), (False, None, (1.5, 2.5))],
+    ids=["unbounded", "bounded", "strong_unbounded"],
+)
+def test_fused_bwd_matches_fla(monkeypatch, lengths, safe_gate, lower_bound, A_log_range):
+    from fla.ops.kda import chunk_kda as fla_chunk_kda
+
+    adapter = _adapter()
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.delenv("MCORE_KDA_FUSED_BWD", raising=False)
+    if lengths is None:
+        leaves, do = _inputs(2, 192, A_log_range)
+        cu_seqlens = None
+    else:
+        leaves, do = _inputs(1, sum(lengths), A_log_range)
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
+        )
+
+    # The fused backward evaluates the intra-chunk terms exactly for any gate, so the
+    # reference is FLA's exact path (safe_gate=False) on the same gate activation:
+    # FLA's safe_gate M=16 approximation alone moves ddt_bias by about 5e-2.
+    reference = _grads(fla_chunk_kda, leaves, do, cu_seqlens, False, lower_bound)
+    before = adapter.get_fused_kda_bwd_launch_count()
+    candidate = _grads(adapter.chunk_kda, leaves, do, cu_seqlens, safe_gate, lower_bound)
+    assert adapter.get_fused_kda_bwd_launch_count() == before + 1
+
+    names = ("out", "dq", "dk", "dv", "draw_g", "dbeta", "dA_log", "ddt_bias")
+    for name, got, want in zip(names, candidate, reference):
+        assert torch.isfinite(got).all(), name
+        relative_l2 = ((got.float() - want.float()).norm() / want.float().norm()).item()
+        assert relative_l2 < 1e-2, f"{name}: relative L2 {relative_l2:.3e}"
+
+
+def test_fused_bwd_can_be_disabled(monkeypatch):
+    adapter = _adapter()
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    monkeypatch.setenv("MCORE_KDA_FUSED_BWD", "0")
+    leaves, do = _inputs(1, 128, (-1.0, 1.0))
+    cu_seqlens = torch.tensor([0, 128], dtype=torch.int32, device="cuda")
+    before = adapter.get_fused_kda_bwd_launch_count()
+    _grads(adapter.chunk_kda, leaves, do, cu_seqlens, False, None)
+    assert adapter.get_fused_kda_bwd_launch_count() == before

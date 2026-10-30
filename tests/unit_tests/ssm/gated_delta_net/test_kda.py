@@ -550,3 +550,58 @@ def test_parallel_kda_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, 
         micro_batch_size=2,
         sequence_packing=sequence_packing,
     )
+
+
+def _fused_kda_bwd_supported() -> bool:
+    import importlib.util
+
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 10
+        and importlib.util.find_spec("cutlass") is not None
+    )
+
+
+@pytest.mark.parametrize(
+    ("sequence_packing", "tp", "sp", "cp", "linear_cp_mode"),
+    [
+        (True, 1, False, 1, "chunkwise"),
+        (False, 1, False, 2, "headwise"),
+        (True, 1, False, 2, "headwise"),
+        (True, 1, False, 2, "chunkwise"),
+        (True, 2, True, 2, "chunkwise"),
+    ],
+)
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.skipif(not _fused_kda_bwd_supported(), reason="needs SM100 and the CuTe DSL runtime.")
+def test_parallel_kda_fused_bwd_correctness(
+    monkeypatch, tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode
+):
+    """Head dimension 128 runs the fused CuTe DSL backward; check it under CP1 and CP2."""
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import kda as kda_adapter
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    config = replace(
+        _make_config(linear_cp_mode=linear_cp_mode),
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        gdn_gdr_backend="internal",
+    )
+    before = kda_adapter.get_fused_kda_bwd_launch_count()
+    _test_parallel_attention_correctness(
+        transformer_config=config,
+        transformer_layer_spec=hybrid_stack_spec.submodules.kda_layer,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
+        atol=1e-2,
+        rtol=1e-2,
+        input_grad_atol=_KDA_INPUT_GRAD_ATOL,
+        input_grad_rtol=1e-2,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=42,
+        sequence_length=256,
+        micro_batch_size=2,
+        sequence_packing=sequence_packing,
+    )
+    assert kda_adapter.get_fused_kda_bwd_launch_count() > before
