@@ -39,11 +39,13 @@ launch per direction, in place of cuDNN's per-span summaries + ``all_gather`` + 
 ``cp_state_producer="cute"``; the cuDNN backend never imports this package on its own, and
 importing it imports neither cutlass nor flash-linear-attention.
 
-Toolchain caveat: the kernels were written against nvidia-cutlass-dsl 4.5.x, and importing them
-under 4.8.x fails (``cutlass.cute.core.ThrMma`` is gone).  cudnn-frontend 1.32 -- the release the
-cuDNN KDA backend requires -- needs the DSL >= 4.7, so in an environment where the cuDNN backend
-runs, this producer cannot run until the kernels are ported to the newer DSL.  It is shipped as
-an optional, experimental optimisation; :func:`unavailable_reason` names the blocker.
+Toolchain: the kernels were written against nvidia-cutlass-dsl 4.5.x and run unchanged on 4.8.x
+(validated with nvidia-cutlass-dsl 4.8.1 + cudnn-frontend 1.32.0 on GB300: a four-rank chunkwise
+CP step on packed documents agrees with the ``cudnn`` producer to bf16 precision in the output
+and all seven gradients).  cudnn-frontend 1.32 needs the DSL >= 4.7 anyway, so the cuDNN KDA
+backend and this producer share one toolchain.  The first launch of each kernel geometry is a
+multi-second ``cute.compile`` on every rank.  It is shipped as an optional, experimental
+optimisation; :func:`unavailable_reason` names whatever is missing.
 
 Envelope (``backend._is_supported``): SM100-class GPU (compute capability 10.x), NCCL CP group of
 size 2..8, one packed sequence (``B == 1``), ``K == V == 128``, ``HV % 4 == 0`` and ``HV == H``,
@@ -88,8 +90,8 @@ def _probe() -> Optional[str]:
         from . import bwd_ws, fused_ws  # noqa: F401  (imports the engines)
     except Exception as e:  # pragma: no cover - environment dependent
         return (
-            f"the CuTe CP engines do not import under nvidia-cutlass-dsl {version} (they were "
-            f"written against 4.5.x; 4.8.x removed cutlass.cute.core.ThrMma): {e!r}"
+            f"the CuTe CP engines do not import under nvidia-cutlass-dsl {version} (validated "
+            f"with 4.5.x and 4.8.1): {e!r}"
         )
     import torch
 

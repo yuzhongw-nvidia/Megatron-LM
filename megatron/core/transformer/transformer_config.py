@@ -660,9 +660,9 @@ class TransformerConfig(ModelParallelConfig):
     """How the cuDNN KDA backend produces the chunkwise-CP boundary states.
 
     ``cudnn`` (default): cuDNN's per-span summaries, an all-gather and a transition fold.
-    ``cute``: the fused CuTe DSL preprocess ported from PR #6511 (experimental; requires its
-    kernels to import on the installed CuTe DSL).  Only used with ``kda_kernel_backend="cudnn"``
-    and ``linear_cp_mode="chunkwise"``.
+    ``cute``: the fused CuTe DSL preprocess ported from PR #6511 (experimental; needs the CuTe DSL
+    the cuDNN engines need anyway, validated with nvidia-cutlass-dsl 4.8.1).  Only used with
+    ``kda_kernel_backend="cudnn"`` and ``linear_cp_mode="chunkwise"``.
     """
 
     gdn_pre_gated_delta_rule_fusion: bool = False

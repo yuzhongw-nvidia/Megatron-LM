@@ -43,14 +43,24 @@ count).
 * The bounded ("safe") gate needs `a_log` and `-5 <= gate_lower_bound < 0` (FLA's range); the
   unbounded softplus gate and a caller-supplied log decay go through `chunk_local_cumsum`.
 
-## Toolchain caveat
+## Toolchain
 
 The engines (`fused_ws.py`, `bwd_ws.py`, `protocol.py`) were written against
-nvidia-cutlass-dsl 4.5.x; importing them under 4.8.x fails (`cutlass.cute.core.ThrMma` is
-gone). cudnn-frontend 1.32, which the cuDNN KDA backend requires, needs the DSL >= 4.7, so in an
-environment where the cuDNN backend runs this producer cannot, until the kernels are ported.
-`unavailable_reason()` reports exactly that. The first launch of each wrapper is a multi-second
-`cute.compile`, entered by all ranks in lockstep right after a rank-consistent handshake.
+nvidia-cutlass-dsl 4.5.x and run unchanged on 4.8.x: every CuTe symbol they use resolves in
+4.8.1, and on GB300 with nvidia-cutlass-dsl 4.8.1 + cudnn-frontend 1.32.0 a four-rank chunkwise
+CP step on packed documents (a document crossing one boundary, one document spanning all ranks,
+one rank holding several documents) agrees with the `cudnn` producer to bf16 precision (relative
+L2 <= 4e-3 in the output and all seven gradients). cudnn-frontend 1.32 needs the DSL >= 4.7, so
+the cuDNN KDA backend and this producer share one toolchain. `unavailable_reason()` reports a
+missing DSL, cuda-python, symmetric memory, flash-linear-attention or SM100 GPU. The first
+launch of each wrapper is a multi-second `cute.compile` (about 100 s for the forward and backward
+engines of one geometry, a few seconds for further boundary-window lengths), entered by all ranks
+in lockstep right after a rank-consistent handshake.
+
+Note that other CuTe DSL users of the same image can still pin the DSL: a `quack` /
+`flash_attn.cute` release written for 4.5.x annotates with `cutlass.cute.core.ThrMma`, which
+4.8 moved out of `core`, and TransformerEngine imports it on `import megatron.core`. That failure
+is unrelated to these engines and is fixed by updating those packages.
 
 ## What the producer computes
 

@@ -6,9 +6,12 @@ The CPU-only tests cover the configuration knob, the kernel binding and the argu
 of ``chunk_kda_cudnn``.  The GPU tests compare the cuDNN kernels with FLA's ``chunk_kda`` at the
 kernel, module and chunkwise context-parallel level.  Agreement is measured as relative L2
 (``||cudnn - fla|| / ||fla||``); the bounds widen the values observed on Blackwell (output ~6e-3,
-dq/dk/dv/dbeta ~5-7e-3, dg ~9e-3, dA_log/ddt_bias up to ~1.3e-2) for headroom.
+dq/dk/dv/dbeta ~5-7e-3, dg ~9e-3, dA_log/ddt_bias up to ~1.3e-2) for headroom.  The chunkwise CP
+tests run with both boundary-state producers of the cuDNN backend: ``cudnn`` (summaries,
+all-gather, fold) and, where its CuTe DSL engines run, ``cute`` (PR #6511's fused preprocess).
 """
 
+import functools
 import importlib
 import math
 import os
@@ -28,6 +31,7 @@ from megatron.core.ssm.gated_delta_net.cudnn_kda import (
     HAVE_CUDNN_KDA,
     chunk_kda_cudnn,
     cudnn_kda_unavailable_reason,
+    cute_preprocess,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.ssm.gated_delta_net.test_kda import (
@@ -91,6 +95,32 @@ _CP2_MARKS = _GPU_PARITY_MARKS + [
     pytest.mark.skipif(
         Utils.world_size < 2, reason="chunkwise CP2 parity needs at least two distributed ranks."
     )
+]
+
+
+def _cute_producer_unavailable_reason():
+    """Why the ``cute`` boundary-state producer cannot run here, or ``None``.
+
+    Only asked once the cuDNN GPU tests can run at all, so CPU-only collection never imports
+    cutlass or the CuTe DSL engines.
+    """
+    if not (HAVE_CUDNN_KDA and _HAVE_BLACKWELL_GPU):
+        return "the cuDNN KDA GPU tests cannot run here"
+    return cute_preprocess.unavailable_reason()
+
+
+_CUTE_PRODUCER_UNAVAILABLE = _cute_producer_unavailable_reason()
+# The chunkwise-CP boundary-state producers of the cuDNN backend; ``cute`` (PR #6511's fused CuTe
+# DSL preprocess) needs its engines to import and an SM100 GPU.
+_CP_STATE_PRODUCERS = [
+    "cudnn",
+    pytest.param(
+        "cute",
+        marks=pytest.mark.skipif(
+            _CUTE_PRODUCER_UNAVAILABLE is not None,
+            reason=f"cute boundary-state producer unavailable: {_CUTE_PRODUCER_UNAVAILABLE}",
+        ),
+    ),
 ]
 
 
@@ -577,7 +607,9 @@ class TestKdaCudnnChunkwiseCP:
     of the same global sequence; the module converts the shard to the contiguous chunkwise
     layout itself, as it does under ``_test_parallel_attention_correctness``.  After that
     conversion the single SBHD sequence and the 384-token THD document both cross the rank
-    boundary, so cuDNN's per-span summary exchange is exercised in forward and backward.
+    boundary, so the boundary-state exchange is exercised in forward and backward -- with the
+    ``cudnn`` producer (per-span summaries, all-gather, fold) and, where its CuTe DSL engines
+    run, the ``cute`` producer (PR #6511's fused preprocess over symmetric memory).
     """
 
     pytestmark = _CP2_MARKS
@@ -593,19 +625,27 @@ class TestKdaCudnnChunkwiseCP:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _build_pair():
+    def _build_pair(producer: str):
         config_kwargs = dict(
             cp_size=2, linear_cp_mode="chunkwise", f_lora_rank=8, gate_lora_rank=12
         )
         reference = _build_kda(_make_backend_config("fla", **config_kwargs))
-        candidate = _build_kda(_make_backend_config("cudnn", **config_kwargs))
+        candidate = _build_kda(
+            _make_backend_config("cudnn", kda_cudnn_cp_state_producer=producer, **config_kwargs)
+        )
         candidate.load_state_dict(reference.state_dict())
         assert candidate.config.linear_cp_layout == "contiguous"
-        assert candidate.gated_delta_rule is chunk_kda_cudnn
+        kernel = candidate.gated_delta_rule
+        if producer == "cudnn":
+            assert kernel is chunk_kda_cudnn
+        else:
+            assert isinstance(kernel, functools.partial) and kernel.func is chunk_kda_cudnn
+            assert kernel.keywords == {"cp_state_producer": producer}
         return reference, candidate
 
-    def test_sbhd_matches_fla_backend(self):
-        reference, candidate = self._build_pair()
+    @pytest.mark.parametrize("producer", _CP_STATE_PRODUCERS)
+    def test_sbhd_matches_fla_backend(self, producer):
+        reference, candidate = self._build_pair(producer)
         cp_group = parallel_state.get_context_parallel_group()
         torch.manual_seed(2026)
         # SBHD chunkwise CP requires micro_batch_size == 1.
@@ -617,8 +657,9 @@ class TestKdaCudnnChunkwiseCP:
         hidden_states = _zigzag_shard_sbhd(global_hidden_states, cp_group)
         _compare_module_forward_backward(reference, candidate, hidden_states, cp_group=cp_group)
 
-    def test_thd_matches_fla_backend(self):
-        reference, candidate = self._build_pair()
+    @pytest.mark.parametrize("producer", _CP_STATE_PRODUCERS)
+    def test_thd_matches_fla_backend(self, producer):
+        reference, candidate = self._build_pair(producer)
         cp_group = parallel_state.get_context_parallel_group()
         # Per-sequence lengths divisible by 2 * cp_size.  The first document (384 tokens) spans
         # both 256-token ranks after the contiguous re-partition; sizes stay large enough that
@@ -642,21 +683,27 @@ class TestKdaCudnnChunkwiseCP:
 
 
 @_apply_marks(_CP2_MARKS)
+@pytest.mark.parametrize("producer", _CP_STATE_PRODUCERS)
 @pytest.mark.parametrize(
     ("sequence_packing", "micro_batch_size"), [(True, 3), (False, 1)], ids=["thd", "sbhd-mbs1"]
 )
 def test_cudnn_chunkwise_cp_matches_single_rank(
-    tmp_path_dist_ckpt, sequence_packing, micro_batch_size, run_config
+    tmp_path_dist_ckpt, sequence_packing, micro_batch_size, producer, run_config
 ):
     """CP2 chunkwise cuDNN against the CP1 cuDNN reference (``test_kda_fusion``'s recipe).
 
     SBHD chunkwise CP requires ``micro_batch_size == 1``.  The THD case packs three 128-token
     sequences so that, after the contiguous re-partition (192 tokens per rank), the middle
-    sequence spans both ranks and the cross-rank summary / fold path of ``cp.py`` is exercised
-    (two sequences would give each rank one whole sequence and only zero summaries).
+    sequence spans both ranks and the cross-rank boundary-state path of ``cp.py`` is exercised
+    (two sequences would give each rank one whole sequence and only zero summaries).  The CP1
+    reference never builds a boundary state, so ``producer`` only affects the CP2 side.
     """
     config = _make_backend_config(
-        "cudnn", linear_cp_mode="chunkwise", f_lora_rank=8, gate_lora_rank=12
+        "cudnn",
+        linear_cp_mode="chunkwise",
+        f_lora_rank=8,
+        gate_lora_rank=12,
+        kda_cudnn_cp_state_producer=producer,
     )
     _test_parallel_attention_correctness(
         transformer_config=config,
