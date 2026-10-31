@@ -47,14 +47,18 @@ count).
 
 The engines (`fused_ws.py`, `bwd_ws.py`, `protocol.py`) were written against
 nvidia-cutlass-dsl 4.5.x and run on 4.8.x as well: every CuTe symbol they use resolves in
-4.8.1 (the 4.8 differences were deprecated aliases -- `cutlass.utils.{Smem,Tmem}Allocator`,
-`cutlass.utils.LayoutEnum`, `tcgen05.OperandMajorMode`, `cpasync.LoadCacheMode`, the
-single-dtype `make_trivial_tiled_mma` -- which the engines now spell the canonical way, with a
-4.5 fallback for the moved classes), and on GB300 with nvidia-cutlass-dsl 4.8.1 +
-cudnn-frontend 1.32.0 a four-rank chunkwise
-CP step on packed documents (a document crossing one boundary, one document spanning all ranks,
-one rank holding several documents) agrees with the `cudnn` producer to bf16 precision (relative
-L2 <= 4e-3 in the output and all seven gradients). cudnn-frontend 1.32 needs the DSL >= 4.7, so
+4.8.1. The only 4.8 change on their symbol set is a move -- `SmemAllocator` / `TmemAllocator` to
+`cutlass.memory` and `LayoutEnum` to `cutlass.tensor_utils`, with deprecated aliases kept under
+`cutlass.utils` -- which `protocol.py` resolves once, falling back to `cutlass.utils` on releases
+before 4.8 (4.7 is the backend's minimum). Three further spellings the engines used,
+`tcgen05.OperandMajorMode`, `cpasync.LoadCacheMode` and the single-dtype
+`make_trivial_tiled_mma` overload, are deprecation shims in 4.5.2 and 4.8.1 alike; the engines now
+use the canonical `cute.nvgpu.OperandMajorMode` / `cute.nvgpu.LoadCacheMode` and the
+`a_dtype`/`b_dtype` overload, which both releases define. On GB300 with nvidia-cutlass-dsl 4.8.1 +
+cudnn-frontend 1.32.0 a four-rank chunkwise CP step on packed documents (a document crossing one
+boundary, one document spanning all ranks, one rank holding several documents) agrees with the
+`cudnn` producer to bf16 precision (relative L2 of about 3e-3 in the output and up to 4.1e-3 in
+the gradients, dk / dg / dA_log being the largest). cudnn-frontend 1.32 needs the DSL >= 4.7, so
 the cuDNN KDA backend and this producer share one toolchain. `unavailable_reason()` reports a
 missing DSL, cuda-python, symmetric memory, flash-linear-attention or SM100 GPU. The first
 launch of each wrapper is a multi-second `cute.compile` (about 100 s for the forward and backward
@@ -62,9 +66,10 @@ engines of one geometry, a few seconds for further boundary-window lengths), ent
 in lockstep right after a rank-consistent handshake.
 
 Note that other CuTe DSL users of the same image can still pin the DSL: a `quack` /
-`flash_attn.cute` release written for 4.5.x annotates with `cutlass.cute.core.ThrMma`, which
-4.8 moved out of `core`, and TransformerEngine imports it on `import megatron.core`. That failure
-is unrelated to these engines and is fixed by updating those packages.
+`flash_attn.cute` release written for 4.5.x annotates with `cutlass.cute.core.ThrMma`, a
+deprecated alias in 4.5.x that no longer exists in `core` from 4.7 on -- i.e. on every DSL this
+backend accepts -- and TransformerEngine imports it on `import megatron.core`. That failure is
+unrelated to these engines and is fixed by updating those packages.
 
 ## What the producer computes
 

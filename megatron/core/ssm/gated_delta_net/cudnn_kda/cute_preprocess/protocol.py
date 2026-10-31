@@ -29,11 +29,13 @@ from cutlass.cute.nvgpu import tcgen05
 
 # CuTe DSL 4.8 moved the shared/tensor-memory allocators to ``cutlass.memory`` and
 # ``LayoutEnum`` to ``cutlass.tensor_utils``, keeping deprecated aliases under
-# ``cutlass.utils``; 4.5.x only has the old homes.  Resolved once here so both engines
-# are warning-free on either release.
+# ``cutlass.utils``; every earlier release (4.5.x through 4.7.x) only has the old homes,
+# and 4.7 is the cuDNN KDA backend's minimum (``ops.MIN_CUTE_DSL``), so the fallback is a
+# supported path.  Resolved once here so both engines are warning-free on either side of
+# the move.
 try:  # nvidia-cutlass-dsl >= 4.8
     from cutlass.memory import SmemAllocator, TmemAllocator
-except ImportError:  # 4.5.x
+except ImportError:  # < 4.8
     from cutlass.utils import SmemAllocator, TmemAllocator
 try:
     from cutlass.tensor_utils import LayoutEnum

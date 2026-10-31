@@ -370,6 +370,37 @@ def test_kda_cudnn_backend_rejects_deterministic_mode():
     assert config.deterministic_mode
 
 
+def test_kda_cudnn_cp_state_producer_knob():
+    """The boundary-state producer knob: default, both values, and its two rejections."""
+    assert _make_config().kda_cudnn_cp_state_producer == "cudnn"
+    for producer in ("cudnn", "cute"):
+        config = replace(
+            _make_config(), kda_kernel_backend="cudnn", kda_cudnn_cp_state_producer=producer
+        )
+        assert config.kda_cudnn_cp_state_producer == producer
+        assert config.cuda_graph_impl == "none"
+    with pytest.raises(ValueError, match="kda_cudnn_cp_state_producer must be"):
+        replace(_make_config(), kda_cudnn_cp_state_producer="triton")
+    # The CuTe producer spins on symmetric-memory flags and runs host collectives: no CUDA graphs.
+    with pytest.raises(ValueError, match="CUDA-graph"):
+        replace(
+            _make_config(),
+            kda_kernel_backend="cudnn",
+            kda_cudnn_cp_state_producer="cute",
+            cuda_graph_impl="local",
+        )
+    # The conflict check only applies to the cuDNN backend; FLA ignores the producer knob.
+    # (``replace`` carries the resolved inference_cuda_graph_scope of the cuda_graph_impl="none"
+    # base config over, so it is reset to let __post_init__ derive the one for "local".)
+    config = replace(
+        _make_config(),
+        kda_cudnn_cp_state_producer="cute",
+        cuda_graph_impl="local",
+        inference_cuda_graph_scope=None,
+    )
+    assert config.kda_kernel_backend == "fla"
+
+
 def test_select_kda_kernel_binds_backend():
     """``_select_kda_kernel`` reads only the config, so a module shell suffices (no GPU)."""
     fla_shell = SimpleNamespace(config=replace(_make_config(), kda_kernel_backend="fla"))
@@ -384,6 +415,31 @@ def test_select_kda_kernel_binds_backend():
 
         if device_unavailable_reason() is None:
             assert KimiDeltaAttention._select_kda_kernel(cudnn_shell) is chunk_kda_cudnn
+
+            # The binding guards against a bypassed config for the producer knob as well.
+            bogus_producer_shell = SimpleNamespace(
+                config=SimpleNamespace(
+                    kda_kernel_backend="cudnn",
+                    deterministic_mode=False,
+                    kda_cudnn_cp_state_producer="triton",
+                )
+            )
+            with pytest.raises(ValueError, match="Unsupported kda_cudnn_cp_state_producer"):
+                KimiDeltaAttention._select_kda_kernel(bogus_producer_shell)
+
+            # "cute" binds a partial of the cuDNN kernel, or names what is missing.
+            cute_shell = SimpleNamespace(
+                config=replace(
+                    _make_config(), kda_kernel_backend="cudnn", kda_cudnn_cp_state_producer="cute"
+                )
+            )
+            if cute_preprocess.unavailable_reason() is None:
+                kernel = KimiDeltaAttention._select_kda_kernel(cute_shell)
+                assert isinstance(kernel, functools.partial) and kernel.func is chunk_kda_cudnn
+                assert kernel.keywords == {"cp_state_producer": "cute"}
+            else:
+                with pytest.raises(ImportError, match="cannot run here"):
+                    KimiDeltaAttention._select_kda_kernel(cute_shell)
         else:
             # cudnn-frontend is installed but this GPU / CuTe DSL cannot run its KDA engines.
             with pytest.raises(RuntimeError, match="cannot run here"):

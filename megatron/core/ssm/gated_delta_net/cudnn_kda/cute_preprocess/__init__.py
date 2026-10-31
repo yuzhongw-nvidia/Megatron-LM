@@ -40,7 +40,8 @@ launch per direction, in place of cuDNN's per-span summaries + ``all_gather`` + 
 importing it imports neither cutlass nor flash-linear-attention.
 
 Toolchain: the kernels were written against nvidia-cutlass-dsl 4.5.x and run on 4.8.x as well --
-the only differences 4.8 brought were deprecated aliases, which the engines no longer use
+4.8 only moved the allocators and ``LayoutEnum`` behind deprecated ``cutlass.utils`` aliases, and
+the engines use neither those nor the 4.5-era deprecated spellings any more
 (validated with nvidia-cutlass-dsl 4.8.1 + cudnn-frontend 1.32.0 on GB300: a four-rank chunkwise
 CP step on packed documents agrees with the ``cudnn`` producer to bf16 precision in the output
 and all seven gradients).  cudnn-frontend 1.32 needs the DSL >= 4.7 anyway, so the cuDNN KDA
@@ -91,8 +92,8 @@ def _probe() -> Optional[str]:
         from . import bwd_ws, fused_ws  # noqa: F401  (imports the engines)
     except Exception as e:  # pragma: no cover - environment dependent
         return (
-            f"the CuTe CP engines do not import under nvidia-cutlass-dsl {version} (validated "
-            f"with 4.5.x and 4.8.1): {e!r}"
+            f"the CuTe CP engines do not import under nvidia-cutlass-dsl {version} (written "
+            f"against 4.5.x, validated with 4.8.1): {e!r}"
         )
     import torch
 
