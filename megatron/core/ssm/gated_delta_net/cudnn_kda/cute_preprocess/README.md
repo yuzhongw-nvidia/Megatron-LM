@@ -46,8 +46,12 @@ count).
 ## Toolchain
 
 The engines (`fused_ws.py`, `bwd_ws.py`, `protocol.py`) were written against
-nvidia-cutlass-dsl 4.5.x and run unchanged on 4.8.x: every CuTe symbol they use resolves in
-4.8.1, and on GB300 with nvidia-cutlass-dsl 4.8.1 + cudnn-frontend 1.32.0 a four-rank chunkwise
+nvidia-cutlass-dsl 4.5.x and run on 4.8.x as well: every CuTe symbol they use resolves in
+4.8.1 (the 4.8 differences were deprecated aliases -- `cutlass.utils.{Smem,Tmem}Allocator`,
+`cutlass.utils.LayoutEnum`, `tcgen05.OperandMajorMode`, `cpasync.LoadCacheMode`, the
+single-dtype `make_trivial_tiled_mma` -- which the engines now spell the canonical way, with a
+4.5 fallback for the moved classes), and on GB300 with nvidia-cutlass-dsl 4.8.1 +
+cudnn-frontend 1.32.0 a four-rank chunkwise
 CP step on packed documents (a document crossing one boundary, one document spanning all ranks,
 one rank holding several documents) agrees with the `cudnn` producer to bf16 precision (relative
 L2 <= 4e-3 in the output and all seven gradients). cudnn-frontend 1.32 needs the DSL >= 4.7, so

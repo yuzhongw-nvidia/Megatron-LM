@@ -39,7 +39,8 @@ launch per direction, in place of cuDNN's per-span summaries + ``all_gather`` + 
 ``cp_state_producer="cute"``; the cuDNN backend never imports this package on its own, and
 importing it imports neither cutlass nor flash-linear-attention.
 
-Toolchain: the kernels were written against nvidia-cutlass-dsl 4.5.x and run unchanged on 4.8.x
+Toolchain: the kernels were written against nvidia-cutlass-dsl 4.5.x and run on 4.8.x as well --
+the only differences 4.8 brought were deprecated aliases, which the engines no longer use
 (validated with nvidia-cutlass-dsl 4.8.1 + cudnn-frontend 1.32.0 on GB300: a four-rank chunkwise
 CP step on packed documents agrees with the ``cudnn`` producer to bf16 precision in the output
 and all seven gradients).  cudnn-frontend 1.32 needs the DSL >= 4.7 anyway, so the cuDNN KDA

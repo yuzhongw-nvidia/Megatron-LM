@@ -27,16 +27,29 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import tcgen05
 
+# CuTe DSL 4.8 moved the shared/tensor-memory allocators to ``cutlass.memory`` and
+# ``LayoutEnum`` to ``cutlass.tensor_utils``, keeping deprecated aliases under
+# ``cutlass.utils``; 4.5.x only has the old homes.  Resolved once here so both engines
+# are warning-free on either release.
+try:  # nvidia-cutlass-dsl >= 4.8
+    from cutlass.memory import SmemAllocator, TmemAllocator
+except ImportError:  # 4.5.x
+    from cutlass.utils import SmemAllocator, TmemAllocator
+try:
+    from cutlass.tensor_utils import LayoutEnum
+except ImportError:
+    from cutlass.utils import LayoutEnum
+
 BT = 64
 
 
 def tmem_alloc_ptr(field):
     """SMEM pointer for ``TmemAllocator``'s ``alloc_result_dst_smem_ptr``.
 
-    The shape of a scalar ``@cute.struct`` field changed across CuTeDSL
-    releases: 4.6.0.dev0 hands back a ``_ScalarData`` wrapper that exposes the
-    pointer as ``.ptr``, while newer releases hand back the ``_Pointer``
-    itself, where ``.ptr`` raises
+    The shape of a scalar ``@cute.struct`` field differs across CuTeDSL
+    builds: the 4.5.x and 4.8.x releases hand back a ``_ScalarData`` wrapper
+    that exposes the pointer as ``.ptr``, while some development builds handed
+    back the ``_Pointer`` itself, where ``.ptr`` raises
     ``AttributeError: '_Pointer' object has no attribute 'ptr'``.
     Both are accepted here so one source tree runs on either toolchain --
     hardcoding either form breaks the other.

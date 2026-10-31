@@ -225,8 +225,9 @@ def _ensure_cutlass_importable() -> bool:
         return True
 
     for distribution_name in (
+        "nvidia-cutlass-dsl-libs-core",  # >= 4.7: owns nvidia_cutlass_dsl/dsl_packages/cutlass
         "nvidia-cutlass-dsl-libs-cu13",
-        "nvidia-cutlass-dsl-libs-base",
+        "nvidia-cutlass-dsl-libs-base",  # 4.5.x: owns nvidia_cutlass_dsl/python_packages/cutlass
         "nvidia-cutlass-dsl",
     ):
         try:
@@ -240,8 +241,10 @@ def _ensure_cutlass_importable() -> bool:
         ]
         candidates = []
         for root in roots:
-            candidates.append(root / "nvidia_cutlass_dsl" / "python_packages")
-            candidates.append(root / "python_packages")
+            # 4.5.x wheels ship the package under python_packages/, >= 4.7 under dsl_packages/.
+            for packages_dir in ("python_packages", "dsl_packages"):
+                candidates.append(root / "nvidia_cutlass_dsl" / packages_dir)
+                candidates.append(root / packages_dir)
 
         for candidate in candidates:
             if not (candidate / "cutlass").is_dir():

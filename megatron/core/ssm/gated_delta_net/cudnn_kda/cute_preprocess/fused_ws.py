@@ -81,14 +81,13 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
-from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu import LoadCacheMode, OperandMajorMode, cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ._host import CPHostCaches, _normalize_gate
-from .protocol import BT, CPProtocolMixin, tmem_alloc_ptr
+from .protocol import BT, CPProtocolMixin, LayoutEnum, SmemAllocator, TmemAllocator, tmem_alloc_ptr
 
 NS = 64  # strip width
 VGS = 2  # V/gate pipeline stages (3 measured 5us WORSE: smem carve-out shrinks L1)
@@ -230,9 +229,10 @@ class PreProcessFwdFusedWS(CPProtocolMixin):
         def mk_mma(amaj, bmaj, shape):
             """Trivial tcgen05 tiled MMA (bf16 in, fp32 acc, CtaGroup.ONE, SMEM operands)."""
             return sm100_utils.make_trivial_tiled_mma(
-                dtype,
-                tcgen05.OperandMajorMode(amaj),
-                tcgen05.OperandMajorMode(bmaj),
+                dtype,  # a_dtype
+                dtype,  # b_dtype
+                OperandMajorMode(amaj),
+                OperandMajorMode(bmaj),
                 cutlass.Float32,
                 tcgen05.CtaGroup.ONE,
                 shape,
@@ -346,7 +346,7 @@ class PreProcessFwdFusedWS(CPProtocolMixin):
         # ---- merge-role machinery (SM80 fold, as in the parent kernel)
         sM_layout = cute.make_layout((K, K), stride=(K + 8, 1))
         atom_g2s_f32 = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            cpasync.CopyG2SOp(cache_mode=LoadCacheMode.GLOBAL),
             cutlass.Float32,
             num_bits_per_copy=128,
         )
@@ -487,7 +487,7 @@ class PreProcessFwdFusedWS(CPProtocolMixin):
         par = step % 2
         stepu = step.to(cutlass.Uint32)
 
-        smem = utils.SmemAllocator()
+        smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         # frozen trace-time descriptors; ops emit at the call sites
         nb_item = pipeline.NamedBarrier(barrier_id=NB_ITEM, num_threads=self.num_threads)
@@ -619,7 +619,7 @@ class PreProcessFwdFusedWS(CPProtocolMixin):
 
             # tmem: NG acc1 strips + NG X strips, 64 cols each
             tmem_bar = pipeline.NamedBarrier(barrier_id=NB_TMEM_ALLOC, num_threads=self.num_threads)
-            tmem = utils.TmemAllocator(
+            tmem = TmemAllocator(
                 tmem_alloc_ptr(storage.tmem_holding_buf),
                 barrier_for_retrieve=tmem_bar,
                 allocator_warp_id=0,
@@ -1187,7 +1187,7 @@ class PreProcessFwdFusedWS(CPProtocolMixin):
         )
         sxt3 = cute.make_tensor(sxt1.iterator, cute.composition(sxt1.layout, pan_xt))
         st_atom_a = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.ROW_MAJOR, dtype, cutlass.Float32, t2r_a1
+            LayoutEnum.ROW_MAJOR, dtype, cutlass.Float32, t2r_a1
         )
         r2s_a = cute.make_tiled_copy_D(st_atom_a, t2r_a1)
         tRS_sxH = []
@@ -1554,10 +1554,10 @@ class PreProcessFwdFusedWS(CPProtocolMixin):
         # stmatrix store path paired to the tmem loads (same thread-value
         # order, so flat register index i lines up across t2r and r2s)
         st_atom_x = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.ROW_MAJOR, dtype, cutlass.Float32, t2r_x
+            LayoutEnum.ROW_MAJOR, dtype, cutlass.Float32, t2r_x
         )
         st_atom_a = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.ROW_MAJOR, dtype, cutlass.Float32, t2r_a1
+            LayoutEnum.ROW_MAJOR, dtype, cutlass.Float32, t2r_a1
         )
         r2s_x = cute.make_tiled_copy_D(st_atom_x, t2r_x)
         r2s_a = cute.make_tiled_copy_D(st_atom_a, t2r_a1)
