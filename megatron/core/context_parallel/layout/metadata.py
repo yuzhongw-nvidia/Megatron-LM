@@ -31,14 +31,26 @@ def finalize_packed_seq_params(
     packed_seq_params: Optional["PackedSeqParams"],
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     *,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     needs_layout_conversion: bool = True,
 ) -> Optional["PackedSeqParams"]:
-    """Resolve CP metadata and prebuild the THD layout route for a microbatch.
+    """Resolve CP metadata and prebuild the THD layout routes for a microbatch.
+
+    The CP-only route is always prebuilt; the fused TP x CP route next to it only when
+    the TP groups are supplied (see ``prebuild_thd_cp_partition_routes``).
 
     Args:
         packed_seq_params: Packed-sequence metadata for the microbatch.
         cp_group: Caller-provided static context-parallel process group. A
             per-microbatch group stored in ``packed_seq_params`` takes precedence.
+        tp_group: Tensor-parallel process group. Only matters under sequence
+            parallelism: only then are the module inputs sequence-parallel shards whose
+            layout conversion exchanges them over the TP x CP group, so pass the TP
+            groups only when set and the prebuild builds the fused TP x CP route as well.
+            A route the prebuild did not anticipate is built lazily from the cached host
+            ``cu_seqlens`` without an extra device-to-host copy.
+        tp_cp_group: The TP x CP process group that pairs with ``cp_group``.
         needs_layout_conversion: Build routes only for batches that will convert layouts.
             Sample-level inter-document masking must not build per-document THD routes.
 
@@ -49,10 +61,16 @@ def finalize_packed_seq_params(
         return None
 
     # Keep these imports local: routes depends on this module for metadata access.
-    from .routes import prebuild_thd_cp_partition_routes
     from megatron.core.packed_seq_params import resolve_cp_group
+
+    from .routes import prebuild_thd_cp_partition_routes
 
     cp_group = resolve_cp_group(static_cp_group=cp_group, packed_seq_params=packed_seq_params)
     if needs_layout_conversion:
-        prebuild_thd_cp_partition_routes(packed_seq_params=packed_seq_params, cp_group=cp_group)
+        prebuild_thd_cp_partition_routes(
+            packed_seq_params=packed_seq_params,
+            cp_group=cp_group,
+            tp_group=tp_group,
+            tp_cp_group=tp_cp_group,
+        )
     return packed_seq_params

@@ -344,6 +344,27 @@ def forward_step(data_iterator, model: HybridModel):
         if cu_seqlens is not None:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 
+        model_config = get_attr_wrapped_model(model, "config")
+        # Prebuild the THD layout routes once per microbatch, on the boundary metadata every
+        # layer receives (the layer copies carry them along), instead of rebuilding them at
+        # each module boundary. Under sequence parallelism the module inputs are
+        # sequence-parallel shards whose THD layout conversion exchanges them over the
+        # TP x CP group; pass the TP groups so the prebuild builds the fused TP x CP route
+        # next to the CP-only one. Without the sequence-packing scheduler the stack's layout
+        # manager converts between the prebuilt layout views over ``cp_batch.thd_plan`` and
+        # the module adapters see their own layout, so no module-boundary route is used.
+        finalize_packed_seq_params(
+            packed_seq_params=packed_seq_params,
+            cp_group=get_context_parallel_group(),
+            tp_group=mpu.get_tensor_model_parallel_group(),
+            tp_cp_group=(
+                mpu.get_tensor_and_context_parallel_group()
+                if model_config.sequence_parallel and model_config.tensor_model_parallel_size > 1
+                else None
+            ),
+            needs_layout_conversion=(model_config.cp_partition_mode != "zigzag"),
+        )
+
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
         # document boundaries so the saver can persist them alongside the
         # logits _forward_hook is about to capture -- required for
