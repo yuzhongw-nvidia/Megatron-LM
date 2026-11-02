@@ -47,7 +47,6 @@ if HAVE_TE:
         fused_topk_with_score_function,
         fused_topk_with_score_function_supports_qb,
         fused_topk_with_score_function_supports_topk_indices,
-        fused_topk_with_score_function_supports_qb,
         fused_unpermute,
         te_general_gemm,
     )

@@ -856,7 +856,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                         or self.pg_collection.dp_cp
                     ),
                     main_hidden_states=hidden_states,
-                    cp_partition_mode=mtp_inputs.cp_partition_mode,
                 )
         sequence_parallel_override = False
         if (

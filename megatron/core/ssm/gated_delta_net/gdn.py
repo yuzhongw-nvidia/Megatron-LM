@@ -12,19 +12,19 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import tensor_parallel
-from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
 from megatron.core.context_parallel import (
     CpPartitionModeConverter,
     convert_module_input_tensors_cp_partition_mode,
 )
+from megatron.core.extensions.transformer_engine import HAVE_TE_GDN, TEGatedDeltaNetAttention
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_masked_update,
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
     a2a_cp_to_hp,

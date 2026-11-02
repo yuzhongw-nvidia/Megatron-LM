@@ -2126,6 +2126,8 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        # Dynamic CP can assign a multi-rank group even when configured CP is one.
+        has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
         self._validate_cp_layouts()
 
         if self.attn_logit_softcapping is not None and not (

@@ -436,6 +436,7 @@ class AbsorbedMLASelfAttention(Attention):
         Derives absorbed q, compressed q, and compressed kv tensors from `hidden_states`.
         """
         # s = sequence length, b = batch size, h = hidden size
+        thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, h], got {hidden_states.ndim}D"
