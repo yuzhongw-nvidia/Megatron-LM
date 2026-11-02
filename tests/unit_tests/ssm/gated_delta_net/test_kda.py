@@ -2,7 +2,9 @@
 
 import copy
 import os
+import warnings
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -168,6 +170,133 @@ def test_kda_rejects_invalid_packed_boundaries():
     with pytest.raises(ValueError, match="at least one sequence in both Q and KV"):
         empty = torch.tensor([0], dtype=torch.int32)
         KimiDeltaAttention._validate_packed_cu_seqlens(empty, empty.clone())
+
+
+def _kda_shell(config: TransformerConfig) -> SimpleNamespace:
+    """Return the attributes ``_GDNBase.__init__`` sets before the variant hooks run."""
+
+    qk_dim = config.linear_key_head_dim * config.linear_num_key_heads
+    v_dim = config.linear_value_head_dim * config.linear_num_value_heads
+    return SimpleNamespace(
+        config=config,
+        qk_dim=qk_dim,
+        qk_dim_local_tp=qk_dim,
+        v_dim_local_tp=v_dim,
+        num_k_heads_local_tp=config.linear_num_key_heads,
+        conv_kernel_dim=config.linear_conv_kernel_dim,
+        _chunkwise_cp_context_cache={},
+    )
+
+
+@pytest.mark.parametrize("backend", ["internal", "fla", "torch", "cudnn"])
+def test_kda_binds_gated_delta_rule_by_backend(backend):
+    from megatron.core.ssm.gated_delta_net import kda as kda_module
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import chunk as internal_backend
+
+    shell = _kda_shell(replace(_make_config(), gdn_gdr_backend=backend))
+    KimiDeltaAttention._setup_variant_attrs(shell)
+
+    if backend == "internal":
+        assert shell.gated_delta_rule.func is internal_backend.chunk_kda
+        assert shell.gated_delta_rule.keywords == {"recompute_h": shell.config.gdn_gdr_recompute_h}
+    else:
+        # Every other backend value keeps FLA's chunk_kda (None when FLA is absent).
+        assert shell.gated_delta_rule is kda_module.chunk_kda
+    assert shell.in_proj_split_names == ["query", "key", "value", "g", "gate"]
+
+
+def test_kda_internal_backend_warns_when_cutedsl_cp_preprocess_cannot_apply():
+    """Under chunkwise CP the internal backend names the layouts the CuTe CP kernels decline."""
+
+    def setup(**overrides):
+        config = replace(
+            _make_config(cp_size=2, linear_cp_mode="chunkwise"),
+            gdn_gdr_backend="internal",
+            **overrides,
+        )
+        shell = _kda_shell(config)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            KimiDeltaAttention._setup_variant_attrs(shell)
+        return [str(w.message) for w in caught if "CuTe DSL context-parallel" in str(w.message)]
+
+    # The test config's 32-dim heads are outside the kernels' K == V == 128 envelope.
+    (message,) = setup()
+    assert "K=32, V=32" in message and "K == V == 128" in message
+    # Kimi's geometry (128-dim heads, a multiple of four heads) raises nothing.
+    assert setup(linear_key_head_dim=128, linear_value_head_dim=128) == []
+    # Headwise CP and CP=1 never reach the CP pre-processing.
+    assert setup(linear_cp_mode="headwise") == []
+    assert setup(context_parallel_size=1) == []
+
+
+@pytest.mark.parametrize("layout", ["sbhd", "thd"])
+@pytest.mark.parametrize("backend", ["internal", "fla"])
+def test_kda_chunkwise_cp_context_carries_internal_metadata(monkeypatch, layout, backend):
+    from megatron.core.ssm.gated_delta_net import kda as kda_module
+
+    config = replace(_make_config(cp_size=2, linear_cp_mode="chunkwise"), gdn_gdr_backend=backend)
+    shell = _kda_shell(config)
+    group = object()
+    built = []
+    prepared = []
+    real_prepare = kda_module.prepare_internal_gdr_cp_context_metadata
+
+    def build_cp_context(*, cu_seqlens, group, conv1d_kernel_size):
+        built.append((cu_seqlens, group, conv1d_kernel_size))
+        return SimpleNamespace(cu_seqlens=cu_seqlens)
+
+    def prepare(context, **kwargs):
+        prepared.append(kwargs)
+        return real_prepare(context, **kwargs)
+
+    monkeypatch.setattr(kda_module, "build_cp_context", build_cp_context)
+    monkeypatch.setattr(kda_module, "prepare_internal_gdr_cp_context_metadata", prepare)
+    monkeypatch.setattr(kda_module.torch.cuda, "current_device", lambda: "cpu")
+    build = KimiDeltaAttention._build_chunkwise_cp_context
+
+    if layout == "thd":
+        global_cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32)
+        cu_seqlens_q, context = build(shell, global_cu_seqlens, group, 64, 1)
+
+        assert cu_seqlens_q is global_cu_seqlens
+        assert built == [(global_cu_seqlens, group, config.linear_conv_kernel_dim)]
+        if backend == "internal":
+            assert len(prepared) == 1
+            assert set(prepared[0]) == {"config", "global_cu_seqlens"}
+            assert prepared[0]["config"] is config
+            # The padded global offsets reach the metadata, not the context's local ones.
+            assert prepared[0]["global_cu_seqlens"] is global_cu_seqlens
+            assert context.global_num_seqs == 2
+            assert context.global_cu_seqlens_cpu.tolist() == [0, 32, 64]
+        else:
+            assert prepared == []
+            assert not hasattr(context, "global_cu_seqlens_cpu")
+        return
+
+    cu_seqlens_q, context = build(shell, None, group, 64, 1)
+
+    assert cu_seqlens_q.dtype == torch.int32
+    assert cu_seqlens_q.tolist() == [0, 64]
+    assert built[0][0] is cu_seqlens_q and built[0][1] is group
+    cached_cu_seqlens, cached_context = shell._chunkwise_cp_context_cache[(64, 1)]
+    assert cached_cu_seqlens is cu_seqlens_q and cached_context is context
+
+    # A cache hit reuses the context and only refreshes the metadata (no new offsets).
+    again_cu_seqlens_q, again_context = build(shell, None, group, 64, 1)
+    assert again_cu_seqlens_q is cu_seqlens_q and again_context is context
+    assert len(built) == 1
+    if backend == "internal":
+        assert len(prepared) == 2
+        assert set(prepared[0]) == {"config", "global_num_sequences", "global_cu_seqlens"}
+        assert prepared[0]["global_num_sequences"] == 1
+        assert prepared[0]["global_cu_seqlens"] is cu_seqlens_q
+        assert set(prepared[1]) == {"config", "global_num_sequences"}
+        assert context.global_num_seqs == 1
+        assert context.global_cu_seqlens_cpu.tolist() == [0, 64]
+    else:
+        assert prepared == []
+        assert not hasattr(context, "global_cu_seqlens_cpu")
 
 
 @pytest.mark.internal
@@ -718,3 +847,60 @@ def test_kda_packed_cu_seqlens_validation_skips_device_sync_during_capture():
         KimiDeltaAttention._validate_packed_cu_seqlens(cu_seqlens, mismatched)
     with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
         KimiDeltaAttention._validate_packed_cu_seqlens(cu_seqlens, mismatched)  # no sync, no raise
+def _fused_kda_bwd_supported() -> bool:
+    import importlib.util
+
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability()[0] == 10
+        and importlib.util.find_spec("cutlass") is not None
+    )
+
+
+@pytest.mark.parametrize(
+    ("sequence_packing", "tp", "sp", "cp", "linear_cp_mode"),
+    [
+        (True, 1, False, 1, "chunkwise"),
+        # Headwise CP hands the kernel whole local sequences, as CP1 does.
+        (False, 1, False, 2, "headwise"),
+        # CP4 has first, middle and last ranks, so it covers chunkwise CP2.
+        (True, 1, False, 4, "chunkwise"),
+    ],
+)
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.skipif(not _fused_kda_bwd_supported(), reason="needs SM100 and the CuTe DSL runtime.")
+def test_parallel_kda_fused_bwd_correctness(
+    monkeypatch, tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, linear_cp_mode
+):
+    """Head dimension 128 runs the fused CuTe DSL backward; check it under CP1, CP2 and CP4."""
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend import kda as kda_adapter
+
+    monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
+    config = replace(
+        _make_config(linear_cp_mode=linear_cp_mode),
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        gdn_gdr_backend="internal",
+    )
+    before = kda_adapter.get_fused_kda_bwd_launch_count()
+    _test_parallel_attention_correctness(
+        transformer_config=config,
+        transformer_layer_spec=hybrid_stack_spec.submodules.kda_layer,
+        tmp_path_dist_ckpt=tmp_path_dist_ckpt,
+        atol=1e-2,
+        rtol=1e-2,
+        input_grad_atol=_KDA_INPUT_GRAD_ATOL,
+        input_grad_rtol=1e-2,
+        # Under CP4 both the fused and the FLA backward move a few BF16 input-grad
+        # values by two bins (relative L2 ~4e-3); bound those outliers globally.
+        cosine_similarity_threshold=0.9999,
+        relative_l2_threshold=1e-2,
+        tp=tp,
+        sp=sp,
+        cp=cp,
+        seed=42,
+        sequence_length=256,
+        micro_batch_size=2,
+        sequence_packing=sequence_packing,
+    )
+    assert kda_adapter.get_fused_kda_bwd_launch_count() > before

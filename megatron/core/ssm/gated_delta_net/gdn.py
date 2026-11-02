@@ -5,7 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-from functools import partial
+from functools import lru_cache, partial
 from typing import Optional
 
 import torch
@@ -634,6 +634,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 "conversion must be handled before calling GatedDeltaNet."
             )
 
+        internal_gdr_global_cu_seqlens = None
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
             assert (
@@ -680,10 +681,11 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             if cu_seqlens_q is None:
                 cache_key = (seq_len_global, batch)
                 cached = self._chunkwise_cp_context_cache.get(cache_key)
+                global_cu_seqlens = None
                 if cached is None:
                     cached_cu_seqlens = (
                         torch.arange(
-                            batch + 1, device=torch.cuda.current_device(), dtype=torch.long
+                            batch + 1, device=torch.cuda.current_device(), dtype=torch.int32
                         )
                         * seq_len_global
                     )
@@ -693,13 +695,30 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                         conv1d_kernel_size=self.conv_kernel_dim,
                     )
                     cached = (cached_cu_seqlens, cached_ctx)
+                    global_cu_seqlens = cached_cu_seqlens
                     self._chunkwise_cp_context_cache[cache_key] = cached
                 cu_seqlens_q, chunkwise_cp_context = cached
+                if global_cu_seqlens is None:
+                    prepare_internal_gdr_cp_context_metadata(
+                        chunkwise_cp_context, config=self.config, global_num_sequences=batch
+                    )
+                else:
+                    prepare_internal_gdr_cp_context_metadata(
+                        chunkwise_cp_context,
+                        config=self.config,
+                        global_num_sequences=batch,
+                        global_cu_seqlens=global_cu_seqlens,
+                    )
             else:
                 chunkwise_cp_context = build_cp_context(
                     cu_seqlens=cu_seqlens_q,
                     group=cp_group_chunkwise,
                     conv1d_kernel_size=self.conv_kernel_dim,
+                )
+                prepare_internal_gdr_cp_context_metadata(
+                    chunkwise_cp_context,
+                    config=self.config,
+                    global_cu_seqlens=internal_gdr_global_cu_seqlens,
                 )
         else:
             chunkwise_cp_context = None
@@ -828,6 +847,28 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="pre_gated_delta_rule")
+
+        if self.config.gdn_gdr_backend == "internal":
+            metadata_cu_seqlens = cu_seqlens_q
+            include_chunk_indices = True
+            if chunkwise_cp_context is not None:
+                metadata_cu_seqlens = getattr(chunkwise_cp_context, "cu_seqlens", None)
+                # Single-local-sequence CP layout: FLA's local chunk primitives run dense
+                # (any sequence length) and only the fused backward needs device chunk
+                # offsets prepared before the profiled GDR scope.
+                include_chunk_indices = not (
+                    metadata_cu_seqlens is not None and metadata_cu_seqlens.numel() == 2
+                )
+            if metadata_cu_seqlens is not None:
+                validated_chunk_indices, validated_chunk_offsets = (
+                    prepare_internal_gdr_chunk_metadata(
+                        metadata_cu_seqlens, include_chunk_indices=include_chunk_indices
+                    )
+                )
+                if validated_chunk_indices is not None:
+                    kernel_inputs["validated_chunk_indices"] = validated_chunk_indices
+                if validated_chunk_offsets is not None:
+                    kernel_inputs["validated_chunk_offsets"] = validated_chunk_offsets
 
         nvtx_range_push(suffix="gated_delta_rule")
         core_attn_out, _ = self.gated_delta_rule(

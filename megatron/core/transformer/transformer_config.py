@@ -677,6 +677,20 @@ class TransformerConfig(ModelParallelConfig):
     """Fuse GDN-family output RMSNorm with SiLU gating for GDN or sigmoid gating for KDA.
     Unsupported configurations and layouts raise on every forward; see
     docs/developer/gdn_ew_fusion.md for requirements."""
+    gdn_gdr_backend: Literal["torch", "fla", "internal", "cudnn"] = "fla"
+    """Backend of the internal GDN/KDA adapter line (PR #6511, fork PR #9).
+
+    On this evaluation branch only ``"internal"`` has an effect, and only on KDA layers with
+    ``kda_kernel_backend="fla"``: they run FLA's forward with the in-tree CuTe DSL chunkwise-CP
+    pre-processing and, on SM100, PR #9's fused backward (``MCORE_KDA_FUSED_BWD=0`` keeps
+    FLA's backward).  GDN layers follow ``gdn_kernel_backend``.
+    """
+
+    gdn_gdr_recompute_h: bool = False
+    """Whether the internal GDR backward recomputes recurrent states instead of saving them.
+
+    This has no effect unless ``gdn_gdr_backend`` is ``"internal"``.
+    """
 
     ####################
     # initialization

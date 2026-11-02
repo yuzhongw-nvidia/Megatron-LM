@@ -3,6 +3,7 @@
 """Kimi Delta Attention, a channel-wise Gated DeltaNet variant."""
 
 import math
+import warnings
 from dataclasses import dataclass
 from functools import partial
 from typing import Optional
@@ -29,6 +30,12 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.transformer.attention import QKVLayout
 from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
+from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
+    chunk_kda as internal_chunk_kda,
+)
+from megatron.core.ssm.gated_delta_net.internal_gdn_backend.chunk import (
+    prepare_cp_context_metadata as prepare_internal_gdr_cp_context_metadata,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -294,6 +301,15 @@ class KimiDeltaAttention(_GDNBase):
         """The ``chunk_kda``-compatible kernel entry point for ``config.kda_kernel_backend``."""
         backend = getattr(self.config, "kda_kernel_backend", "fla")
         if backend == "fla":
+            if getattr(self.config, "gdn_gdr_backend", "fla") == "internal":
+                # The internal backend (PR #6511 / fork PR #9) runs FLA's KDA forward and redirects
+                # the chunkwise-CP boundary pre-processing and, on SM100, the backward to the
+                # in-tree CuTe DSL kernels.
+                self._warn_if_internal_cp_preprocess_cannot_apply()
+                return partial(
+                    internal_chunk_kda,
+                    recompute_h=getattr(self.config, "gdn_gdr_recompute_h", False),
+                )
             return chunk_kda
         if backend == "cudnn":
             # Hybrid stacks can reach this module with experimental_attention_variant unset, which
@@ -335,6 +351,37 @@ class KimiDeltaAttention(_GDNBase):
                 raise ImportError(f"kda_cudnn_cp_state_producer='cute' cannot run here: {reason}")
             return partial(chunk_kda_cudnn, cp_state_producer="cute")
         raise ValueError(f"Unsupported kda_kernel_backend {backend!r}; expected 'fla' or 'cudnn'.")
+
+    def _warn_if_internal_cp_preprocess_cannot_apply(self) -> None:
+        """Warn when the in-tree CuTe DSL CP pre-processing cannot serve this layer.
+
+        The CuTe kernels take ``K == V == 128`` and a multiple of four local value heads.
+        Outside that envelope the ``internal`` backend still runs, but its CP boundary
+        pre-processing is FLA's Triton path (the dispatcher declines and the shims fall
+        back), so the layer is not exercising the in-tree kernels. Headwise CP and CP=1
+        never reach the pre-processing, so nothing is reported for them.
+        """
+        config = self.config
+        if config.linear_cp_mode != "chunkwise" or config.context_parallel_size <= 1:
+            return
+        reasons = []
+        if config.linear_key_head_dim != 128 or config.linear_value_head_dim != 128:
+            reasons.append(
+                f"head dims K={config.linear_key_head_dim}, V={config.linear_value_head_dim} "
+                "(the CuTe CP kernels need K == V == 128)"
+            )
+        if self.num_k_heads_local_tp % 4 != 0:
+            reasons.append(
+                f"{self.num_k_heads_local_tp} local heads (the CuTe CP kernels need a multiple of 4)"
+            )
+        if reasons:
+            warnings.warn(
+                "gdn_gdr_backend='internal': the in-tree CuTe DSL context-parallel "
+                f"pre-processing does not apply to this KDA layer ({'; '.join(reasons)}); "
+                "FLA's Triton pre-processing runs instead. Set MCORE_GDN_INTERNAL_BACKEND=cute "
+                "to turn this fallback into an error.",
+                stacklevel=2,
+            )
 
     def _get_in_proj_qkv_layout(self) -> QKVLayout:
         """Describe KDA's rank-major packed input projection for Muon splitting."""
@@ -574,6 +621,13 @@ class KimiDeltaAttention(_GDNBase):
                     )
                     cached = (cached_cu_seqlens, cached_ctx)
                     self._chunkwise_cp_context_cache[cache_key] = cached
+                    if getattr(self.config, "gdn_gdr_backend", "fla") == "internal":
+                        prepare_internal_gdr_cp_context_metadata(
+                            cached_ctx,
+                            config=self.config,
+                            global_num_sequences=batch,
+                            global_cu_seqlens=cached_cu_seqlens,
+                        )
                 cu_seqlens_q, chunkwise_cp_context = cached
             else:
                 chunkwise_cp_context = build_cp_context(
@@ -581,6 +635,12 @@ class KimiDeltaAttention(_GDNBase):
                     group=cp_group_chunkwise,
                     conv1d_kernel_size=self.conv_kernel_dim,
                 )
+                if getattr(self.config, "gdn_gdr_backend", "fla") == "internal":
+                    # The in-tree CuTe DSL CP pre-processing classifies packed layouts from the
+                    # GLOBAL offsets, which FLA's context does not carry (PR #6511's metadata).
+                    prepare_internal_gdr_cp_context_metadata(
+                        chunkwise_cp_context, config=self.config, global_cu_seqlens=cu_seqlens_q
+                    )
         else:
             chunkwise_cp_context = None
 
@@ -639,6 +699,65 @@ class KimiDeltaAttention(_GDNBase):
             )
 
         return out, out_bias
+
+    def _build_chunkwise_cp_context(
+        self,
+        cu_seqlens_q: torch.Tensor | None,
+        cp_group_chunkwise: torch.distributed.ProcessGroup,
+        seq_len_global: int,
+        batch: int,
+    ) -> tuple[torch.Tensor, object]:
+        """Return the global ``cu_seqlens`` and the FLA CP context for chunkwise CP.
+
+        SBHD inputs (``cu_seqlens_q is None``) cache the context per
+        ``(seq_len_global, batch)``; packed THD inputs rebuild it from the global padded
+        offsets on every call. With ``gdn_gdr_backend="internal"`` the context also carries
+        the chain metadata the in-tree CuTe DSL CP pre-processing classifies packed
+        layouts with, attached exactly as ``GatedDeltaNet`` does.
+        """
+
+        attach_internal_metadata = self.config.gdn_gdr_backend == "internal"
+        if cu_seqlens_q is None:
+            cache_key = (seq_len_global, batch)
+            cached = self._chunkwise_cp_context_cache.get(cache_key)
+            global_cu_seqlens = None
+            if cached is None:
+                cached_cu_seqlens = (
+                    torch.arange(batch + 1, device=torch.cuda.current_device(), dtype=torch.int32)
+                    * seq_len_global
+                )
+                cached_ctx = build_cp_context(
+                    cu_seqlens=cached_cu_seqlens,
+                    group=cp_group_chunkwise,
+                    conv1d_kernel_size=self.conv_kernel_dim,
+                )
+                cached = (cached_cu_seqlens, cached_ctx)
+                global_cu_seqlens = cached_cu_seqlens
+                self._chunkwise_cp_context_cache[cache_key] = cached
+            cu_seqlens_q, chunkwise_cp_context = cached
+            if attach_internal_metadata:
+                if global_cu_seqlens is None:
+                    prepare_internal_gdr_cp_context_metadata(
+                        chunkwise_cp_context, config=self.config, global_num_sequences=batch
+                    )
+                else:
+                    prepare_internal_gdr_cp_context_metadata(
+                        chunkwise_cp_context,
+                        config=self.config,
+                        global_num_sequences=batch,
+                        global_cu_seqlens=global_cu_seqlens,
+                    )
+        else:
+            chunkwise_cp_context = build_cp_context(
+                cu_seqlens=cu_seqlens_q,
+                group=cp_group_chunkwise,
+                conv1d_kernel_size=self.conv_kernel_dim,
+            )
+            if attach_internal_metadata:
+                prepare_internal_gdr_cp_context_metadata(
+                    chunkwise_cp_context, config=self.config, global_cu_seqlens=cu_seqlens_q
+                )
+        return cu_seqlens_q, chunkwise_cp_context
 
     def _forward_compute(
         self,
