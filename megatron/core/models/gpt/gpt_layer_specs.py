@@ -37,7 +37,6 @@ from megatron.core.transformer.transformer_block import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
-    AttnResTransformerLayer,
     HyperConnectionTransformerLayer,
     MlpBuilder,
     TransformerLayer,
@@ -331,6 +330,24 @@ def get_gpt_layer_with_transformer_engine_submodules(
         )
 
 
+def _get_attn_res_transformer_layer():
+    """Resolve the GPT-model attention-residual layer lazily.
+
+    The hybrid stack carries attention residuals through ``AttnResHybridLayer``; the
+    GPT-model layer class (``AttnResTransformerLayer``) has not been carried onto this
+    branch yet, so only requesting it fails instead of every import of this module.
+    """
+    try:
+        from megatron.core.transformer.transformer_layer import AttnResTransformerLayer
+    except ImportError as exc:
+        raise NotImplementedError(
+            "enable_attention_residuals with the GPT model needs AttnResTransformerLayer, which is "
+            "not available on this branch; attention residuals are supported through the hybrid "
+            "stack (AttnResHybridLayer)."
+        ) from exc
+    return AttnResTransformerLayer
+
+
 @copy_signature(get_gpt_layer_with_transformer_engine_submodules)
 def get_gpt_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training)."""
@@ -338,7 +355,7 @@ def get_gpt_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
     enable_attn_res = kwargs.pop('enable_attention_residual', False)
     if enable_attn_res:
         assert not enable_hc, "attention residuals and hyper connections are mutually exclusive"
-        layer_module = AttnResTransformerLayer
+        layer_module = _get_attn_res_transformer_layer()
     else:
         layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
     return ModuleSpec(
@@ -458,7 +475,7 @@ def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
     enable_attn_res = kwargs.pop('enable_attention_residual', False)
     if enable_attn_res:
         assert not enable_hc, "attention residuals and hyper connections are mutually exclusive"
-        layer_module = AttnResTransformerLayer
+        layer_module = _get_attn_res_transformer_layer()
     else:
         layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
     return ModuleSpec(
