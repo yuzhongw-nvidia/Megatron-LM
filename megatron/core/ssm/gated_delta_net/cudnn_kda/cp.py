@@ -22,9 +22,10 @@ cudnn-frontend 1.32.0 exposes exactly those two primitives for its KDA kernels:
 
 This module composes them with ``torch.distributed`` over ``cp_context.group`` and hands the
 folded states to the native ``kda_fwd`` / ``kda_bwd`` (``initial_state`` / ``d_final_state``).
-Only the boundary-crossing sequence is summarised (the token tensors are sliced to it) and one
-entry per rank is exchanged, like FLA's preprocess (``cu_seqlens[-2:]`` forward, ``[:2]``
-backward).  The boundary-state production is behind :class:`BoundaryStateProducer` so an
+Only the boundary-crossing sequence is summarised (the token tensors are sliced to it and padded
+to a power-of-two token bucket with neutral tokens, so cuDNN's shape-specialised engines compile
+a handful of times instead of once per packed micro-batch) and one entry per rank is exchanged,
+like FLA's preprocess (``cu_seqlens[-2:]`` forward, ``[:2]`` backward).  The boundary-state production is behind :class:`BoundaryStateProducer` so an
 alternative producer (for example a fused CuTe DSL preprocess) can replace the summary +
 all_gather + fold stage without touching the kernel calls.
 
@@ -64,6 +65,35 @@ def _host_cu_seqlens(cp_context) -> list[int]:
     return [int(x) for x in cp_context.cu_seqlens.tolist()]
 
 
+# cuDNN's frost engines specialise on the token count of their operands, so a summary over the
+# boundary sequence's exact length would compile anew for every packed micro-batch (the 9L proxy
+# never finished its first step).  The boundary slice is padded to a power-of-two bucket of at least
+# ``_MIN_BUCKET`` tokens with tokens the recurrence ignores: k, v, q and dO zero, beta zero and a
+# gate whose decay is exactly 1 -- a raw logit of -1e4 under the in-kernel bounded gate
+# (``sigmoid(exp(a_log) * (-1e4 + dt_bias)) == 0`` in fp32) or a log-decay of 0 when the caller
+# already applied the gate.  ``(H, M)`` and ``(G, T)`` of the padded sequence equal those of the
+# unpadded one, and the number of distinct shapes the engines see drops to a handful.
+_MIN_BUCKET = 1024
+_NEUTRAL_GATE_LOGIT = -1.0e4
+
+
+def _bucket_len(tokens: int) -> int:
+    """Smallest power of two >= ``tokens`` and >= ``_MIN_BUCKET``."""
+    return max(_MIN_BUCKET, 1 << max(tokens - 1, 0).bit_length())
+
+
+def _pad_window(window: torch.Tensor, length: int, fill: float = 0.0) -> torch.Tensor:
+    """``window`` ``[T, ...]`` -> a contiguous ``[length, ...]`` copy, trailing rows ``fill``."""
+    out = window.new_full((length,) + tuple(window.shape[1:]), fill)
+    out[: window.shape[0]] = window
+    return out
+
+
+def _neutral_gate_fill(gate_kwargs: dict) -> float:
+    """Gate value of a padding token: raw logit or log-decay, depending on the gate form."""
+    return _NEUTRAL_GATE_LOGIT if gate_kwargs.get("safe_gate") else 0.0
+
+
 class BoundaryStateProducer(Protocol):
     """Produces the two cross-rank boundary tensors of a chunkwise-CP step on this rank.
 
@@ -95,14 +125,16 @@ class CudnnSummaryProducer:
         rank = dist.get_rank(group)
         HO, V, K = v.shape[1], v.shape[2], k.shape[2]
         if not cp_context.is_last_rank:
-            # The last local sequence continues on the next rank: summarise it alone.
+            # The last local sequence continues on the next rank: summarise it alone, padded to a
+            # shape bucket with neutral tokens (see _bucket_len).
             start = cu_list[-2]
-            cu_tail = torch.tensor([0, cu_list[-1] - start], dtype=torch.int32, device=k.device)
+            length = _bucket_len(cu_list[-1] - start)
+            cu_tail = torch.tensor([0, length], dtype=torch.int32, device=k.device)
             h, m = ops.kimi_delta_attention_summary(
-                k[start:],
-                v[start:],
-                g[start:],
-                beta[start:],
+                _pad_window(k[start:], length),
+                _pad_window(v[start:], length),
+                _pad_window(g[start:], length, _neutral_gate_fill(gate_kwargs)),
+                _pad_window(beta[start:], length),
                 cu_tail,
                 initial_state=None,
                 use_qk_l2norm_in_kernel=flags["use_qk_l2norm_in_kernel"],
@@ -135,15 +167,17 @@ class CudnnSummaryProducer:
         rank = dist.get_rank(group)
         HO, V, K = do.shape[1], do.shape[2], k.shape[2]
         if not cp_context.is_first_rank:
-            # The first local sequence continues from the previous rank: summarise it alone.
+            # The first local sequence continues from the previous rank: summarise it alone,
+            # padded to a shape bucket with neutral tokens (see _bucket_len).
             end = cu_list[1]
-            cu_head = torch.tensor([0, end], dtype=torch.int32, device=k.device)
+            length = _bucket_len(end)
+            cu_head = torch.tensor([0, length], dtype=torch.int32, device=k.device)
             gsum, tr = ops.kimi_delta_attention_summary_bwd(
-                q[:end],
-                k[:end],
-                g[:end],
-                beta[:end],
-                do[:end],
+                _pad_window(q[:end], length),
+                _pad_window(k[:end], length),
+                _pad_window(g[:end], length, _neutral_gate_fill(gate_kwargs)),
+                _pad_window(beta[:end], length),
+                _pad_window(do[:end], length),
                 cu_head,
                 scale=scale,
                 d_final_state=None,
