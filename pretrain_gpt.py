@@ -410,12 +410,20 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     cp_group=hybrid_cp_group,
                     tokens_per_sample=args.seq_length,
                 )
+        model_config = get_attr_wrapped_model(model, "config")
+        # Under sequence parallelism the module inputs are sequence-parallel shards whose
+        # THD layout conversion exchanges them over the TP x CP group; pass the TP groups
+        # so the batch-time prebuild builds the fused TP x CP route next to the CP-only one.
         finalize_packed_seq_params(
             packed_seq_params=packed_seq_params,
             cp_group=get_context_parallel_group(),
-            needs_layout_conversion=(
-                get_attr_wrapped_model(model, "config").cp_partition_mode != "zigzag"
+            tp_group=mpu.get_tensor_model_parallel_group(),
+            tp_cp_group=(
+                mpu.get_tensor_and_context_parallel_group()
+                if model_config.sequence_parallel and args.tensor_model_parallel_size > 1
+                else None
             ),
+            needs_layout_conversion=(model_config.cp_partition_mode != "zigzag"),
         )
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
