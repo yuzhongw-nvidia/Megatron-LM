@@ -2385,15 +2385,23 @@ class TransformerConfig(ModelParallelConfig):
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
             )
 
-            # Check tensor parallelism compatibility
-            tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
-            assert self.linear_num_key_heads % tp_cp_size == 0, (
+            # Check tensor parallelism compatibility. Headwise CP splits linear-attention heads
+            # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank. GDN2 has no
+            # chunkwise path and always splits its heads across CP ranks.
+            linear_head_parallel_size = self.tensor_model_parallel_size
+            if self.context_parallel_size > 1 and (
+                self.linear_cp_mode == "headwise" or self.experimental_attention_variant == "gdn2"
+            ):
+                linear_head_parallel_size *= self.context_parallel_size
+            assert self.linear_num_key_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_key_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
+                f"and {self.experimental_attention_variant=}."
             )
-            assert self.linear_num_value_heads % tp_cp_size == 0, (
+            assert self.linear_num_value_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_value_heads=} must be a multiple of "
-                f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
+                f"and {self.experimental_attention_variant=}."
             )
         elif self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)

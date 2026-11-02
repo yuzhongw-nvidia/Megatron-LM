@@ -16,6 +16,7 @@ from torch import nn
 from torch.distributed import ProcessGroup
 
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
+from megatron.core.transformer.moe.megakernel.factory import split_megakernel_backend_config
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
 from megatron.core.transformer.moe.megakernel.mok.weights import (
@@ -103,8 +104,9 @@ class MoKMegakernel(MegakernelBackend):
                     "but MOK bypasses that forward path."
                 )
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
+        _, backend_options = split_megakernel_backend_config(config)
         try:
-            self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
+            self.mok_config = MoKConfig(**backend_options)
         except TypeError as exc:
             raise ValueError(f"Invalid MOK option in moe_megakernel_backend_config: {exc}") from exc
 

@@ -15,13 +15,27 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+def split_megakernel_backend_config(config: TransformerConfig) -> tuple[str, dict]:
+    """Separate MCore's shared-expert policy from a copy of the backend-specific options.
+
+    ``shared_expert_mode`` inside ``moe_megakernel_backend_config`` (the form the dev line and
+    its recipes use) takes precedence over the legacy ``moe_megakernel_shared_expert_mode``
+    field; the remaining options are handed to the backend untouched.
+    """
+    options = dict(config.moe_megakernel_backend_config or {})
+    mode = options.pop("shared_expert_mode", config.moe_megakernel_shared_expert_mode)
+    if mode not in ("auto", "fused", "native"):
+        raise ValueError("shared_expert_mode must be auto, fused, or native")
+    return mode, options
+
+
 def megakernel_fuses_shared_expert(config: TransformerConfig) -> bool:
     """Resolve shared execution from structural compatibility, independently of activation."""
     if config.moe_megakernel_backend is None:
         return False
     if config.moe_megakernel_backend != "mok":
         raise ValueError(f"Unsupported MoE megakernel backend: {config.moe_megakernel_backend!r}")
-    mode = config.moe_megakernel_shared_expert_mode
+    mode, _ = split_megakernel_backend_config(config)
     compatible = (
         config.moe_shared_expert_intermediate_size is not None
         and config.tensor_model_parallel_size == 1
