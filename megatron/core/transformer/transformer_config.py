@@ -1898,8 +1898,18 @@ class TransformerConfig(ModelParallelConfig):
         """Validate context-parallel layout settings."""
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
-        if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
-            raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
+        if (
+            self.linear_cp_mode == "chunkwise"
+            and self.linear_cp_layout != "contiguous"
+            # Legacy single-knob CP: cp_partition_mode="contiguous" already hands the
+            # linear-attention layers contiguous shards (the hybrid stack's boundary layout
+            # and the module input converters follow that knob), so chunkwise CP is valid.
+            and self.cp_partition_mode != "contiguous"
+        ):
+            raise ValueError(
+                "linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous' "
+                "(or the legacy cp_partition_mode='contiguous')."
+            )
         if (
             self.context_parallel_size > 1
             and self.attention_cp_layout == "contiguous"
