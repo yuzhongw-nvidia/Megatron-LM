@@ -1,11 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from math import lcm
-from typing import Dict, List, Optional, Sequence, Tuple, TypeVar
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, TypeVar
 
 import torch
 
 from megatron.core.context_parallel.groups import get_valid_dynamic_context_parallel_group_sizes
+from megatron.core.context_parallel.layout.partition import (
+    get_cp_partition_indices,
+    partition_batch,
+)
 from megatron.core.rerun_state_machine import RerunDataIterator
 
 _DYNAMIC_CP_WORKLOAD_CAP_DELTA = 0.05
