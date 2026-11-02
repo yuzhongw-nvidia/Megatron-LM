@@ -1898,6 +1898,11 @@ class TransformerConfig(ModelParallelConfig):
         """Validate context-parallel layout settings."""
         if self.cp_partition_mode not in ("zigzag", "contiguous"):
             raise ValueError(f"Unsupported cp_partition_mode: {self.cp_partition_mode}")
+        if self.linear_cp_mode not in ("headwise", "chunkwise"):
+            raise ValueError(
+                f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
+                f"got {self.linear_cp_mode!r}."
+            )
         if (
             self.linear_cp_mode == "chunkwise"
             and self.linear_cp_layout != "contiguous"
