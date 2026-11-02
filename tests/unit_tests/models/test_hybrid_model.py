@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import dataclasses
+import functools
 import os
 from datetime import timedelta
 from itertools import accumulate
@@ -19,6 +21,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     gated_delta_product_stack_spec,
@@ -34,7 +37,8 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.module import Float16Module, MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
