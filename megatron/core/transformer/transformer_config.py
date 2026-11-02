@@ -1903,13 +1903,17 @@ class TransformerConfig(ModelParallelConfig):
                 f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
                 f"got {self.linear_cp_mode!r}."
             )
+        # Legacy single-knob CP: with the sequence-packing scheduler the hybrid stack takes its
+        # boundary layout from cp_partition_mode and the module input converters follow that
+        # knob (no per-layer layout manager), so cp_partition_mode="contiguous" already hands
+        # the linear-attention layers contiguous shards and chunkwise CP is valid.
+        legacy_single_knob_contiguous_cp = (
+            self.sequence_packing_scheduler is not None and self.cp_partition_mode == "contiguous"
+        )
         if (
             self.linear_cp_mode == "chunkwise"
             and self.linear_cp_layout != "contiguous"
-            # Legacy single-knob CP: cp_partition_mode="contiguous" already hands the
-            # linear-attention layers contiguous shards (the hybrid stack's boundary layout
-            # and the module input converters follow that knob), so chunkwise CP is valid.
-            and self.cp_partition_mode != "contiguous"
+            and not legacy_single_knob_contiguous_cp
         ):
             raise ValueError(
                 "linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous' "
