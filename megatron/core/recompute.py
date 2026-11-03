@@ -48,10 +48,11 @@ def checkpointed_forward(
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
         input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
-        strict_runtime_validation_frequency (str, optional): ``config.strict_runtime_validation_frequency``
-            of the calling stack. When given, per-layer ``strict_runtime_validation`` flags are
-            derived once per checkpointed forward, keyed on the layer config type, so a recompute
-            does not re-validate layers that the first forward already validated.
+        strict_runtime_validation_frequency (str, optional):
+            ``config.strict_runtime_validation_frequency`` of the calling stack. When given,
+            per-layer ``strict_runtime_validation`` flags are derived once per checkpointed
+            forward, keyed on the layer config type, so a recompute does not re-validate
+            layers that the first forward already validated.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor

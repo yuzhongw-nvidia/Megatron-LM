@@ -353,8 +353,9 @@ class TransformerConfig(ModelParallelConfig):
     sigmoid, its cast to the activation dtype and the multiply) into one Triton kernel per
     direction (``megatron.core.fusions.fused_attention_output_gate``). Forward values and
     gradients are bit-identical to the eager composition, which keeps the FP32 sigmoid output
-    and the cast scale alive until backward; the fusion keeps only the two gate inputs. Requires ``attention_output_gate`` with
-    ``gated_attention_proj_granularity='elementwise'``, ``multi_latent_attention`` and Triton;
+    and the cast scale alive until backward; the fusion keeps only the two gate inputs. Requires
+    ``attention_output_gate`` with ``gated_attention_proj_granularity='elementwise'``,
+    ``multi_latent_attention`` and Triton;
     the headwise gate and regular attention are not supported yet.
     """
 
@@ -395,7 +396,8 @@ class TransformerConfig(ModelParallelConfig):
     mla_latent_cp_two_stream: bool = False
     """MLAWithLatentCP only: run alternate ring steps of the forward on a second CUDA stream (TE's
     cp_stream pattern). Off by default: measured neutral at 64K/CP4 and 512K/CP16 on GB300 (the
-    overlapped attention kernels run correspondingly slower); kept for short-sequence experiments."""
+    overlapped attention kernels run correspondingly slower); kept for short-sequence
+    experiments."""
 
     mla_latent_cp_fwd_backend: Optional[AttnBackend] = None
     """MLAWithLatentCP only: core-attention kernel of the forward ring steps, AttnBackend.fused
@@ -4986,8 +4988,9 @@ class TransformerConfig(ModelParallelConfig):
                 "delay_wgrad_compute": self.delay_wgrad_compute,
                 "tp_comm_overlap": self.tp_comm_overlap,
                 "fp8_recipe=delayed": self.fp8 is not None and self.fp8_recipe == "delayed",
-                "experimental_attention_variant dsa/dsv4_hybrid": self.experimental_attention_variant
-                in ("dsa", "dsv4_hybrid"),
+                "experimental_attention_variant dsa/dsv4_hybrid": (
+                    self.experimental_attention_variant in ("dsa", "dsv4_hybrid")
+                ),
                 "mla_down_proj_fusion": getattr(self, "mla_down_proj_fusion", False),
                 # The overridden query up-projection would bypass the fused kernel silently.
                 "use_fused_mla_q_uproj": getattr(self, "use_fused_mla_q_uproj", False),

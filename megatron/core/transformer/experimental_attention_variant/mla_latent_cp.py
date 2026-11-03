@@ -67,6 +67,9 @@ if HAVE_TE:
     )
 else:
     _FUSED_ATTN_API_OK = False
+    LayerNormLinear = Linear = None
+    FusedAttnBackend = fused_attn_bwd = fused_attn_fwd = None
+    activation_recompute_forward = FP8GlobalStateManager = fp8_autocast = None
 
 # FlashAttention-4 has no public split forward/backward API; the module drives the two entry
 # points its own autograd function uses, pinned to the version they were validated against.
@@ -175,11 +178,13 @@ class _Permute(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, perm, inv):
+        """Gather rows by ``perm``; ``inv`` undoes it in backward."""
         ctx.inv = inv
         return x.index_select(0, perm)
 
     @staticmethod
     def backward(ctx, grad):
+        """Scatter the gradient back through the inverse permutation."""
         return grad.index_select(0, ctx.inv), None, None
 
 
@@ -456,6 +461,7 @@ class _BuildKV(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, kv, k_pos, qk):
+        """Split the up-projected latent into key (with positional channels) and value."""
         ctx.qk, ctx.width = qk, kv.shape[-1]
         key = kv.new_empty(*kv.shape[:-1], qk + k_pos.shape[-1])
         key[..., :qk].copy_(kv[..., :qk])
@@ -464,6 +470,7 @@ class _BuildKV(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dk, dv):
+        """Reassemble the key/value gradients into the up-projection output gradient."""
         qk = ctx.qk
         dkv = dk.new_empty(*dk.shape[:-1], ctx.width)
         dkv[..., :qk].copy_(dk[..., :qk])
@@ -483,6 +490,7 @@ class _LatentCPRingAttention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, q, z, module, plan, ring, attn_fwd, attn_bwd, scale, *up_params):
+        """Latent-CP ring forward: pass latents around the ring and attend step by step."""
         fp8 = FP8GlobalStateManager.is_fp8_enabled()
         slab = module._slab  # this rank's rows of the up-projection weight (a2a modes), or None
         rows, valid = plan.rows, plan.valid
@@ -493,6 +501,7 @@ class _LatentCPRingAttention(torch.autograd.Function):
         streams, merged, up_done = _streams(two_stream), torch.cuda.Event(), torch.cuda.Event()
         out = lse = out_u = lse_u = None
         rng_states, reqs = [], []
+        z_nxt = None
         for i, step in enumerate(plan.steps):
             stream, z_cur = streams[i % 2], z if i == 0 else z_nxt
             with torch.cuda.stream(stream):
@@ -542,6 +551,7 @@ class _LatentCPRingAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
+        """Backward of the latent-CP ring: recompute K/V per step and accumulate dq/dz."""
         q, z_last, out, lse = ctx.saved_tensors
         module, plan, ring, scale = ctx.module, ctx.plan, ctx.ring, ctx.scale
         params, slab = ctx.params, ctx.slab
@@ -552,6 +562,7 @@ class _LatentCPRingAttention(torch.autograd.Function):
         rows = plan.rows
         full = (q, out, dout, lse)
         dq = torch.zeros(q.shape, dtype=torch.float32, device=q.device)
+        dq_u = None
         if rows is not None:
             upper = tuple(t.index_select(0, rows) for t in full)
             dq_u = torch.zeros(upper[0].shape, dtype=torch.float32, device=q.device)
@@ -669,7 +680,8 @@ class MLAWithLatentCP(MLASelfAttention):
         if self.cp_comm_type == "a2a":
             self._a2a_group = self.pg_collection.cp
         elif self.cp_comm_type == "a2a+p2p":
-            # hcp = [a2a group of A consecutive CP ranks, p2p group of stride A] (cp rank = p*A + a).
+            # hcp = [a2a group of A consecutive CP ranks, p2p group of stride A]
+            # (cp rank = p*A + a).
             cp, hcp = self.pg_collection.cp, getattr(self.pg_collection, "hcp", None)
             ok = isinstance(hcp, (list, tuple)) and len(hcp) == 2
             if ok:
@@ -685,8 +697,8 @@ class MLAWithLatentCP(MLASelfAttention):
                 )
             if not ok:
                 raise ValueError(
-                    "mla_latent_cp with cp_comm_type='a2a+p2p' needs pg_collection.hcp = [a2a group "
-                    "of consecutive CP ranks, p2p group] covering the CP group."
+                    "mla_latent_cp with cp_comm_type='a2a+p2p' needs pg_collection.hcp = "
+                    "[a2a group of consecutive CP ranks, p2p group] covering the CP group."
                 )
             self._a2a_group = hcp[0]
         if self._a2a_group is not None and self._a2a_group.size() == 1:
