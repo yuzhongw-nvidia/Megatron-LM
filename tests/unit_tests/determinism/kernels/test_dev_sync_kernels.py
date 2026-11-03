@@ -11,7 +11,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from tests.unit_tests.determinism.kernels.harness import (
+    assert_module_replays_bit_exact,
+    assert_replays_bit_exact,
+    seeded,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -96,6 +100,89 @@ def test_mtp_packed_cp1_roll_replays():
 
     assert torch.equal(roll(value), value.new_tensor([2, 3, 0, 5, 0, 0, 0]))
     assert_replays_bit_exact(roll, (value,), contention=True, what="MTP packed CP1 roll")
+
+
+@pytest.mark.parametrize("impl", ["eager", "fla"])
+def test_mtp_attn_res_final_head_replays(impl):
+    """Replay the AttnRes output head an MTP depth applies over the trunk depth-source tuple.
+
+    ``MultiTokenPredictionLayer._postprocess`` aggregates ``[*attn_res_sources, hidden]`` with
+    the depth's ``final_attn_res`` before the final layernorm; the tuple reaches it through
+    ``MultiTokenPredictionInputs.attn_res_sources``.
+    """
+    from megatron.core.transformer.attention_residual import (
+        AttentionResidual,
+        _get_fla_fused_attnres,
+    )
+    from megatron.core.transformer.multi_token_prediction import (
+        MultiTokenPredictionInputs,
+        MultiTokenPredictionLayer,
+    )
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    if impl == "fla" and _get_fla_fused_attnres() is None:
+        pytest.skip("flash-linear-attention with fused AttnRes is unavailable")
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_attention_residuals=True,
+        attn_res_block_layers=2,
+        attn_res_impl=impl,
+        normalization="RMSNorm",
+        layernorm_epsilon=1e-6,
+    )
+
+    class FinalHead(torch.nn.Module):
+        """The attributes ``_postprocess`` reads, built as MultiTokenPredictionLayer builds them."""
+
+        def __init__(self):
+            super().__init__()
+            self.config = config
+            self.attn_res_enabled = config.enable_attention_residuals
+            self.mhc_enabled = False
+            self.final_attn_res = AttentionResidual(config)
+            self.final_layernorm = torch.nn.RMSNorm(
+                config.hidden_size, eps=config.layernorm_epsilon, dtype=torch.bfloat16
+            )
+
+        def forward(self, hidden_states, attn_res_sources):
+            inputs = MultiTokenPredictionInputs(
+                input_ids=None,
+                position_ids=None,
+                hidden_states=hidden_states,
+                decoder_input=None,
+                mhc_multistream=None,
+                labels=None,
+                loss_mask=None,
+                mtp_input_mask=None,
+                packed_seq_params=None,
+                attn_res_sources=attn_res_sources,
+            )
+            assert isinstance(inputs.attn_res_sources, tuple)
+            return MultiTokenPredictionLayer._postprocess(
+                self, inputs.hidden_states, attn_res_sources=inputs.attn_res_sources
+            )
+
+    seeded()
+    head = FinalHead().cuda()
+    with torch.no_grad():
+        head.final_attn_res.pseudo_query.normal_(std=0.05)
+        head.final_attn_res.key_norm_weight.uniform_(0.8, 1.2)
+    sources = tuple(
+        torch.randn(512, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        for _ in range(3)
+    )
+    hidden = torch.randn(512, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    outputs, grads = assert_module_replays_bit_exact(
+        head,
+        {"hidden_states": hidden, "attn_res_sources": sources},
+        contention=True,
+        what=f"MTP AttnRes final head ({impl})",
+    )
+    assert len(outputs) == 1
+    # pseudo_query, key_norm_weight, final_layernorm.weight, the hidden state and 3 sources.
+    assert len(grads) == 7
 
 
 def test_mtp_prefix_replays():
