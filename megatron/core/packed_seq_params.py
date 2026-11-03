@@ -16,9 +16,18 @@ class PackedSeqParams:
     parameters to TEDotProductAttention and fused rope kernels for the
     `thd` (packed) sequence format
 
-    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route.
-    Metadata annotation helpers update the current partition mode in-place while
-    preserving the route identity.
+    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route over the
+    CP group. ``tp_cp_partition_route`` is the same kind of plan for the fused TP x CP
+    conversion of sequence-parallel shards, with split sizes in TP x CP group order.
+    A microbatch always carries the CP-only route and, under sequence parallelism with
+    fusable groups, the fused route as well: a module's sequence-parallel input shard
+    takes the fused exchange while its sequence-gathered core-attention output is
+    restored over the CP-only one (``prebuild_thd_cp_partition_routes`` builds both from
+    one host copy of ``cu_seqlens``). The prebuild also leaves that compact host copy of
+    the THD boundaries on the instance as ``thd_cp_host_cu_seqlens_q`` (an attribute, not a
+    field, so ``dataclasses.replace`` with new boundaries does not carry it along) and lazy
+    route builds reuse it without another device-to-host copy. Metadata annotation helpers
+    update the current partition mode in-place while preserving the route identities.
     '''
 
     qkv_format: str = None
@@ -39,6 +48,7 @@ class PackedSeqParams:
     pad_between_seqs: bool = None
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     cp_partition_route: Optional["ThdCpRoute"] = None
+    tp_cp_partition_route: Optional["ThdCpRoute"] = None
     cp_scatter_cache: object = None
 
     def __post_init__(self):

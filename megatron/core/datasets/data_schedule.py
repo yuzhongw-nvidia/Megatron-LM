@@ -27,6 +27,16 @@ from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_pipeline_rank,
 )
 
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Preserve optional native-kernel registration; no API is called directly here.
+    import transformer_engine_torch as tex  # pylint: disable=unused-import
+except ImportError:
+    # TE isn't installed or the torch wrapper is missing
+    tex = None
+
 
 def _build_thd_padding_mask(
     cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor
