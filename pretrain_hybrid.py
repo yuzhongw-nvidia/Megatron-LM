@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pretrain and SFT Hybrid."""
 
 # Capture the true program start time BEFORE any heavy imports.
@@ -60,7 +60,10 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.global_vars import get_run_config, get_tokenizer, set_run_config
-from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+from megatron.training.training import (
+    update_seqlen_stats_from_cu_seqlens,
+    update_seqlen_stats_from_padding_mask,
+)
 from megatron.training.utils import (
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
@@ -224,6 +227,12 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     )
     # Non-validation TP receivers do not allocate this optional field.
     batch.setdefault("padding_mask", None)
+    if needs_padding_mask and (vp_stage is None or vp_stage == 0):
+        # Padded SBHD validation: feed the real per-sample lengths to the FLOPs
+        # accounting once per pipeline rank and micro-batch (first virtual stage),
+        # using the CP-unsliced [micro_batch_size, seq_length] mask, so the
+        # reported TFLOP/s count useful work only, like the packed THD path.
+        update_seqlen_stats_from_padding_mask(batch['padding_mask'])
 
     batch = flatten_batch_for_packed_sequences(batch)
 
