@@ -1057,6 +1057,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             with self.attn_norm_manager as hidden_states:
                 input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
 
+        if self.config.fine_grained_activation_offloading and self._input_layernorm_checkpoint_active:  # DIAG
+            from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor as _ckm
+            _o = input_layernorm_output[0] if isinstance(input_layernorm_output, tuple) else input_layernorm_output
+            print(f"[LN-DIAG r{torch.distributed.get_rank()}] layer={self.layer_number} cls={type(self).__name__} recorded={getattr(self.input_layernorm_checkpoint, 'outputs', None) is not None} marked={_ckm(_o)} in_req_grad={hidden_states.requires_grad} grad_on={torch.is_grad_enabled()} shape={tuple(_o.shape)}", flush=True)
         if recompute_context is not None and self.config.fine_grained_activation_offloading:
             output = (
                 input_layernorm_output[0]

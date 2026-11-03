@@ -1198,6 +1198,10 @@ class ChunkOffloadHandler:
                 else None
             )
             for tensor_tag, tensor_on_device in group_to_offload._tensors.items():
+                if self.is_warmup and getattr(group_to_offload, '_name', None) == 'qkv_linear':  # DIAG
+                    from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor as _ckm
+                    _t = tensor_on_device
+                    print(f"[OFFLOAD-DIAG r{torch.distributed.get_rank()}] qkv_linear tag={tensor_tag} shape={tuple(_t.shape) if hasattr(_t,'shape') else None} dtype={getattr(_t,'dtype',None)} contig={_t.is_contiguous() if hasattr(_t,'is_contiguous') else None} marked={_ckm(_t) if hasattr(_t,'untyped_storage') else None} need={self.tensor_need_offloading_checker(_t)} te_no={getattr(_t,'_TE_do_not_offload',None)} no={getattr(_t,'_do_not_offload',None)}", flush=True)
                 if self.tensor_need_offloading_checker(tensor_on_device):
                     state = self.offload(
                         tensor_on_device,
