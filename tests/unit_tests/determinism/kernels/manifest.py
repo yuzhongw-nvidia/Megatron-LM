@@ -327,6 +327,24 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "construction and optional latent norms around the registered TE / RoPE / CSA kernels.",
     ),
     KernelEntry(
+        name="mla_latent_cp_ring",
+        sources=("megatron/core/transformer/experimental_attention_variant/mla_latent_cp.py",),
+        tests=(
+            K + "test_mla_latent_cp_kernels.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_mla_latent_cp.py",
+        ),
+        kind="torch.compile",
+        notes="Experimental latent-KV ring attention for MLA. The jit_fuser online-softmax merge, "
+        "the strided key/value assembly (head-sum backward), the integer ring metadata and the a2a "
+        "index_select permutation, the cuDNN THD attention of every ring step kind (and the "
+        "FlashAttention-4 shims where installed) with the backward's deterministic flag, the ring "
+        "autograd function on one GPU with its transport stubbed (per-step KV recompute, "
+        "second-chunk index_select / index_copy_ / unique-row index_add_, padding masks) and "
+        "MLAWithLatentCP at CP1 replay bit-exactly in test_mla_latent_cp_kernels.py. The NCCL "
+        "exchange of the ring (CP > 1) is qualified numerically only, by the multi-rank parity "
+        "tests in test_mla_latent_cp.py.",
+    ),
+    KernelEntry(
         name="attention_residual_aggregation",
         sources=("megatron/core/transformer/attention_residual.py",),
         tests=(K + "test_attn_res_aggregation.py", K + "test_dev_sync_kernels.py"),
