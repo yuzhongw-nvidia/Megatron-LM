@@ -83,6 +83,7 @@ class _LoggingCache(dict):
     def __init__(self, label, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._label = label
+        self._prev_by_shape = {}
 
     def __setitem__(self, key, value):
         if key not in self:
@@ -91,8 +92,19 @@ class _LoggingCache(dict):
             nseq = key[2] if len(key) > 2 else "?"
             import sys
 
+            # When another build already shared this (total, N), name the field(s) that differ -- that
+            # is the hidden leg of the plan key driving a recompile that pinning total/N did not stop.
+            prev = self._prev_by_shape.get((total, nseq))
+            if prev is not None and len(prev) == len(key):
+                diffs = [
+                    f"[{i}] {prev[i]!r}->{key[i]!r}" for i in range(len(key)) if prev[i] != key[i]
+                ]
+                detail = "same-(total,N) diff: " + ("; ".join(diffs) if diffs else "NONE?")
+            else:
+                detail = "key=" + repr(key)
+            self._prev_by_shape[(total, nseq)] = key
             print(
-                f"[MCORE_KDA_COMPILE] {self._label} build #{len(self) + 1}: total={total} N={nseq}",
+                f"[MCORE_KDA_COMPILE] {self._label} build #{len(self) + 1}: total={total} N={nseq} | {detail}",
                 file=sys.stderr,
                 flush=True,
             )
