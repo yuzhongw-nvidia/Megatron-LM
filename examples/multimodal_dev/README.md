@@ -227,9 +227,11 @@ Recorded run (50 iterations, 2026-11-04): 816 TFLOP/s/GPU mean over iterations
 3-50 (820.9 at iteration 50), peak 143.7 GB allocated and 166.2 GB device memory
 used per GPU, no NaN or skipped iterations, lm loss 13.44 -> 12.01. Compared
 with the text recipe, MDP rejects the dp_balanced packing scheduler and
-fine-grained activation offload, and chunked optimizer-state offload is left
-off. The 16 nodes must share one NVLink domain (EP64 spans every GPU and
-HybridEP sizes its domain from the ranks it can reach).
+fine-grained activation offload; that run also left chunked optimizer-state
+offload and the fused MLA output gate off, which the recipe has since aligned
+with the text proxy recipe (results of the aligned recipe are not recorded yet).
+The 16 nodes must share one NVLink domain (EP64 spans every GPU and HybridEP
+sizes its domain from the ranks it can reach).
 
 ## Architecture
 
