@@ -50,6 +50,7 @@ def chunk_kda_cudnn(
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     cp_state_producer: str = "cudnn",
+    cp_pad_nseq: Optional[int] = None,
     **unused,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """KDA chunked forward (autograd) on cuDNN kernels with FLA's ``chunk_kda`` conventions.
@@ -127,6 +128,7 @@ def chunk_kda_cudnn(
             flags=flags,
             gate_kwargs=gate_kwargs,
             producer=cp_state_producer,
+            pad_nseq=cp_pad_nseq,
         )
         return out.reshape(B, T, H, V), None
 

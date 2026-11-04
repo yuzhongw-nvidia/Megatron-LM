@@ -339,19 +339,23 @@ class KimiDeltaAttention(_GDNBase):
             if reason is not None:
                 raise RuntimeError(f"kda_kernel_backend='cudnn' cannot run here: {reason}")
             producer = getattr(self.config, "kda_cudnn_cp_state_producer", "cudnn")
-            if producer == "cudnn":
-                return chunk_kda_cudnn
-            if producer != "cute":
+            if producer not in ("cudnn", "cute"):
                 raise ValueError(
                     f"Unsupported kda_cudnn_cp_state_producer {producer!r}; "
                     "expected 'cudnn' or 'cute'."
                 )
+            # thd_max_packed_sequences caps the packed-document count; under chunkwise CP it also bounds
+            # the per-rank sequence count, so the cuDNN CP path uses it to pin the main-kernel plan key's
+            # sequence-count axis (static shapes -> no per-step recompile).  None leaves the count dynamic.
+            pad_nseq = getattr(self.config, "thd_max_packed_sequences", None)
+            if producer == "cudnn":
+                return partial(chunk_kda_cudnn, cp_pad_nseq=pad_nseq)
             from megatron.core.ssm.gated_delta_net.cudnn_kda import cute_preprocess
 
             reason = cute_preprocess.unavailable_reason()
             if reason is not None:
                 raise ImportError(f"kda_cudnn_cp_state_producer='cute' cannot run here: {reason}")
-            return partial(chunk_kda_cudnn, cp_state_producer="cute")
+            return partial(chunk_kda_cudnn, cp_state_producer="cute", cp_pad_nseq=pad_nseq)
         raise ValueError(f"Unsupported kda_kernel_backend {backend!r}; expected 'fla' or 'cudnn'.")
 
     def _get_in_proj_qkv_layout(self) -> QKVLayout:

@@ -159,6 +159,18 @@ def _param_grad_tol(name: str) -> float:
     return _INPUT_GRAD_TOL
 
 
+def _cudnn_kernel_producer(kernel) -> str:
+    """The boundary-state producer the cuDNN KDA kernel binding carries.
+
+    ``_select_kda_kernel`` binds the cuDNN path as a ``functools.partial`` of ``chunk_kda_cudnn`` that
+    carries the chunkwise-CP boundary-state producer (default ``cudnn``) and the ``cp_pad_nseq`` N-pin
+    derived from ``thd_max_packed_sequences``.  Assert that shape and return the producer.
+    """
+    assert isinstance(kernel, functools.partial) and kernel.func is chunk_kda_cudnn
+    assert set(kernel.keywords) <= {"cp_state_producer", "cp_pad_nseq"}
+    return kernel.keywords.get("cp_state_producer", "cudnn")
+
+
 def _make_backend_config(
     backend: str,
     *,
@@ -401,28 +413,26 @@ def test_kda_cudnn_cp_state_producer_knob():
     assert config.kda_kernel_backend == "fla"
 
 
-def test_cp_static_state_env_knob(monkeypatch):
-    """``MCORE_KDA_CP_STATIC_STATE`` gates the materialised-zero boundary state (CPU, no cudnn-frontend).
+def test_cp_static_shape_helpers():
+    """The chunkwise-CP static-shape helpers (CPU, no cudnn-frontend).
 
-    A chunkwise-CP rank that starts / ends its own document has no folded boundary state, so the producer
-    returns ``None`` and the cuDNN main-kernel plan key's state dtype toggles None<->fp32 as the varlen
-    boundaries move -- a recompile even with ``total`` and ``N`` pinned.  With the knob set, a zero state is
-    materialised instead; it is fp32 and ``[N_local, HO, V, K]`` (the same shape the producer builds on other
-    ranks), so the recurrence is seeded from zero exactly as before while the plan key's state dtype is fixed.
+    A rank that starts / ends its own document has a zero boundary state; the producer returns it
+    materialised (not ``None``) so the cuDNN main-kernel plan key's state dtype stays constant fp32 under
+    varlen packing (``_zeros_boundary_state``).  The rank-local sequence count is pinned by padding the
+    local ``cu_seqlens`` to ``thd_max_packed_sequences`` with zero-length tail segments (``_pad_cu_nseq``),
+    which keeps the plan key's sequence-count axis static without changing the result.
     """
     from megatron.core.ssm.gated_delta_net.cudnn_kda import cp as cudnn_cp
-
-    monkeypatch.delenv("MCORE_KDA_CP_STATIC_STATE", raising=False)
-    assert cudnn_cp._cp_static_state_enabled() is False
-    monkeypatch.setenv("MCORE_KDA_CP_STATIC_STATE", "0")
-    assert cudnn_cp._cp_static_state_enabled() is False
-    monkeypatch.setenv("MCORE_KDA_CP_STATIC_STATE", "1")
-    assert cudnn_cp._cp_static_state_enabled() is True
 
     state = cudnn_cp._zeros_boundary_state(3, 4, _HEAD_DIM, _HEAD_DIM, torch.device("cpu"))
     assert tuple(state.shape) == (3, 4, _HEAD_DIM, _HEAD_DIM)
     assert state.dtype == torch.float32
     assert bool((state == 0).all())
+
+    cu = torch.tensor([0, 5, 12], dtype=torch.int32)  # two sequences
+    padded = cudnn_cp._pad_cu_nseq(cu, 4)
+    assert padded.tolist() == [0, 5, 12, 12, 12]  # padded to four, zero-length tail segments
+    assert torch.equal(cudnn_cp._pad_cu_nseq(cu, 2), cu)  # already >= target -> unchanged
 
 
 def test_select_kda_kernel_binds_backend():
@@ -438,7 +448,9 @@ def test_select_kda_kernel_binds_backend():
         from megatron.core.ssm.gated_delta_net.cudnn_kda.ops import device_unavailable_reason
 
         if device_unavailable_reason() is None:
-            assert KimiDeltaAttention._select_kda_kernel(cudnn_shell) is chunk_kda_cudnn
+            assert (
+                _cudnn_kernel_producer(KimiDeltaAttention._select_kda_kernel(cudnn_shell)) == "cudnn"
+            )
 
             # The binding guards against a bypassed config for the producer knob as well.
             bogus_producer_shell = SimpleNamespace(
@@ -459,8 +471,7 @@ def test_select_kda_kernel_binds_backend():
             )
             if cute_preprocess.unavailable_reason() is None:
                 kernel = KimiDeltaAttention._select_kda_kernel(cute_shell)
-                assert isinstance(kernel, functools.partial) and kernel.func is chunk_kda_cudnn
-                assert kernel.keywords == {"cp_state_producer": "cute"}
+                assert _cudnn_kernel_producer(kernel) == "cute"
             else:
                 with pytest.raises(ImportError, match="cannot run here"):
                     KimiDeltaAttention._select_kda_kernel(cute_shell)
@@ -637,7 +648,7 @@ class TestKdaCudnnModuleParity:
         candidate = _build_kda(_make_backend_config("cudnn", **config_kwargs))
         candidate.load_state_dict(reference.state_dict())
         assert reference.gated_delta_rule is kda_module.chunk_kda
-        assert candidate.gated_delta_rule is chunk_kda_cudnn
+        assert _cudnn_kernel_producer(candidate.gated_delta_rule) == "cudnn"
         return reference, candidate
 
     @pytest.mark.parametrize(
@@ -715,12 +726,7 @@ class TestKdaCudnnChunkwiseCP:
         )
         candidate.load_state_dict(reference.state_dict())
         assert candidate.config.linear_cp_layout == "contiguous"
-        kernel = candidate.gated_delta_rule
-        if producer == "cudnn":
-            assert kernel is chunk_kda_cudnn
-        else:
-            assert isinstance(kernel, functools.partial) and kernel.func is chunk_kda_cudnn
-            assert kernel.keywords == {"cp_state_producer": producer}
+        assert _cudnn_kernel_producer(candidate.gated_delta_rule) == producer
         return reference, candidate
 
     @pytest.mark.parametrize("producer", _CP_STATE_PRODUCERS)

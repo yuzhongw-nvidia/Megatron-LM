@@ -94,29 +94,19 @@ def _neutral_gate_fill(gate_kwargs: dict) -> float:
     return _NEUTRAL_GATE_LOGIT if gate_kwargs.get("safe_gate") else 0.0
 
 
-def _cp_pad_nseq_target() -> Optional[int]:
-    """Fixed rank-local sequence count to pad to, from ``MCORE_KDA_CP_PAD_NSEQ`` (else ``None``).
-
-    The cuDNN main-kernel plan cache keys on ``(total_tokens, num_sequences, ...)``.  Under chunkwise
-    CP the per-rank ``total_tokens`` is static when ``pad_packed_seq_alignment=max``, but the number of
-    local sequences varies every step as packed-document boundaries fall in different places inside this
-    rank's slice (``thd_max_packed_sequences`` pins only the *global* count), so the forward/backward
-    kernels recompile per new local count -- the residual varlen-CP recompile storm.  Setting this env to
-    a fixed count >= the per-rank maximum pads the local ``cu_seqlens`` (and the per-sequence state) with
-    trailing zero-length segments so the plan key is static.  Zero-length segments process no tokens and
-    add no output, so the result is unchanged.
-    """
-    import os
-
-    raw = os.environ.get("MCORE_KDA_CP_PAD_NSEQ")
-    if not raw:
-        return None
-    value = int(raw)
-    return value if value > 0 else None
-
-
 def _pad_cu_nseq(cu: torch.Tensor, target_n: int) -> torch.Tensor:
-    """Pad rank-local ``cu_seqlens`` ``[N+1]`` to ``[target_n+1]`` with zero-length tail segments."""
+    """Pad rank-local ``cu_seqlens`` ``[N+1]`` to ``[target_n+1]`` with zero-length tail segments.
+
+    The cuDNN main-kernel plan cache keys on ``(total_tokens, num_sequences, ...)``.  Under chunkwise CP
+    the per-rank ``total_tokens`` is static when ``pad_packed_seq_alignment=max``, but the number of local
+    sequences varies every step as packed-document boundaries fall in different places inside this rank's
+    slice, so the kernel recompiles per new local count -- the residual varlen-CP recompile storm.  Padding
+    the local ``cu_seqlens`` (and the per-sequence state) to a fixed ``target_n`` with trailing zero-length
+    segments makes the plan key static; zero-length segments process no tokens and add no output, so the
+    result is unchanged.  ``target_n`` is the model's ``thd_max_packed_sequences`` (the global document-count
+    cap), which upper-bounds the per-rank count: a contiguous token slice overlaps at most that many packed
+    documents, so the pad never truncates.
+    """
     n_local = cu.shape[0] - 1
     if n_local >= target_n:
         return cu
@@ -124,49 +114,18 @@ def _pad_cu_nseq(cu: torch.Tensor, target_n: int) -> torch.Tensor:
     return torch.cat([cu, tail])
 
 
-def _cp_prewarm_enabled() -> bool:
-    """Whether to pre-compile all boundary-summary shape buckets up front (``MCORE_KDA_CP_PREWARM``).
-
-    The dominant chunkwise-CP recompile cost is the boundary summary (forward and backward): it is
-    bucketed to a power-of-two token count (see ``_bucket_len``), but a document of a new bucketed
-    length can first reach this rank's boundary at any step, and across the CP/DP ranks that keeps a
-    fresh bucket compiling on most steps, so the storm spreads over the whole run even though each
-    rank compiles only a handful of engines.  Pre-warming compiles every bucket (``_MIN_BUCKET`` up to
-    the per-rank shard) with neutral dummy inputs on the first forward/backward, folding all summary
-    compiles into step 1 so the steady steps are flat.  Enabled by ``MCORE_KDA_CP_PREWARM=1``.
-    """
-    import os
-
-    return os.environ.get("MCORE_KDA_CP_PREWARM") == "1"
-
-
-def _cp_static_state_enabled() -> bool:
-    """Whether to always hand the main kernel a materialised boundary state (``MCORE_KDA_CP_STATIC_STATE``).
-
-    The cuDNN main-kernel plan cache keys (``make_fprop_cache_key`` / ``make_bprop_cache_key``) include the
-    *dtype* of the per-sequence recurrent state operands: ``state_dtype`` (the forward's ``initial_state`` and
-    the backward's reconstructed ``initial_state``) and ``dstate_in_dtype`` (the backward's ``d_final_state``).
-    The :class:`CudnnSummaryProducer` returns ``None`` for those operands on a rank that starts its own first
-    document (``is_first_rank``, no folded initial state) or ends its own last document (``is_last_rank``, no
-    folded final-state gradient), and a tensor otherwise.  Under varlen THD packing the packed-document
-    boundaries fall in different places inside this rank's fixed-size slice every step, so ``is_first_rank`` /
-    ``is_last_rank`` -- and therefore whether the operand is ``None`` or an fp32 tensor -- *toggle step to
-    step on the same rank*.  Each ``None<->fp32`` toggle is a new plan key even when ``total`` and ``N`` are
-    pinned (by ``pad_packed_seq_alignment=max`` and ``MCORE_KDA_CP_PAD_NSEQ``), so the forward re-plans across
-    two keys and the backward across up to four -- the residual varlen-CP recompile storm that pinning the
-    token count and the sequence count does not remove.  A rank that starts/ends its own document has a *zero*
-    boundary state by definition, so materialising an all-zero ``[N_local, HO, V, K]`` fp32 tensor instead of
-    ``None`` is numerically identical (the recurrence already starts from zero / receives no successor
-    gradient) and makes ``state_dtype`` / ``dstate_in_dtype`` constant fp32.  Combined with the token-count and
-    sequence-count pins the main-kernel plan key is then fully static.  Enabled by ``MCORE_KDA_CP_STATIC_STATE=1``.
-    """
-    import os
-
-    return os.environ.get("MCORE_KDA_CP_STATIC_STATE") == "1"
-
-
 def _zeros_boundary_state(n_local: int, ho: int, v: int, k: int, device) -> torch.Tensor:
-    """An all-zero per-sequence boundary state ``[n_local, HO, V, K]`` (cuDNN fp32 V-major layout)."""
+    """An all-zero per-sequence boundary state ``[n_local, HO, V, K]`` (cuDNN fp32 V-major layout).
+
+    The chunkwise-CP producer hands this to the main kernel on a rank that starts its own first document
+    (forward ``initial_state``) or ends its own last document (backward ``d_final_state``): such a boundary
+    is zero by definition -- the recurrence starts from zero / receives no successor gradient -- so returning
+    it materialised instead of ``None`` is numerically identical.  It also keeps the cuDNN main-kernel plan
+    key constant: ``make_fprop_cache_key`` / ``make_bprop_cache_key`` include the state-operand *dtype*, and
+    ``None`` vs fp32 are different keys.  Under varlen THD packing the per-step document boundaries make
+    ``is_first_rank`` / ``is_last_rank`` -- and so the ``None`` vs tensor choice -- toggle step to step on the
+    same rank, which would otherwise re-plan the main kernel every step (the varlen-CP recompile storm).
+    """
     return torch.zeros((n_local, ho, v, k), dtype=torch.float32, device=device)
 
 
@@ -276,8 +235,9 @@ class CudnnSummaryProducer:
     def initial_state(self, k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags):
         """Summarise the crossing-out sequence, exchange, fold the predecessors' blocks."""
         ops = _ops.ops()
-        if _cp_prewarm_enabled():
-            _prewarm_summary_fwd(ops, k, v, g, beta, cu_list[-1], gate_kwargs, flags)
+        # Fold every boundary-summary shape bucket's compile into the first forward (self-guards to
+        # once, see _prewarm_summary_fwd) so the steady steps are flat -- always on, no numerical effect.
+        _prewarm_summary_fwd(ops, k, v, g, beta, cu_list[-1], gate_kwargs, flags)
         group = cp_context.group
         rank = dist.get_rank(group)
         HO, V, K = v.shape[1], v.shape[2], k.shape[2]
@@ -305,7 +265,10 @@ class CudnnSummaryProducer:
             m = torch.zeros((HO, K, K), dtype=torch.float32, device=k.device)
         hs, ms = _all_gather_one(h, group), _all_gather_one(m, group)
         if cp_context.is_first_rank:
-            return None
+            # No predecessor to fold: this rank's own first document starts from a zero state.  Return it
+            # materialised (not None) so the main kernel's plan-key state dtype stays constant fp32 and does
+            # not re-plan step to step under varlen packing (see _zeros_boundary_state).
+            return _zeros_boundary_state(len(cu_list) - 1, HO, V, K, k.device)
         state = torch.zeros_like(h)
         for r in range(rank - cp_context.pre_num_ranks, rank):  # ascending, document start first
             state = torch.matmul(state, ms[r]) + hs[r]
@@ -320,8 +283,9 @@ class CudnnSummaryProducer:
     ):
         """Reverse-summarise the crossing-in sequence, exchange, fold the successors' blocks."""
         ops = _ops.ops()
-        if _cp_prewarm_enabled():
-            _prewarm_summary_bwd(ops, q, k, g, beta, do, cu_list[-1], scale, gate_kwargs, flags)
+        # Fold every backward boundary-summary bucket's compile into the first backward (self-guards to
+        # once, see _prewarm_summary_bwd) so the steady steps are flat -- always on, no numerical effect.
+        _prewarm_summary_bwd(ops, q, k, g, beta, do, cu_list[-1], scale, gate_kwargs, flags)
         group = cp_context.group
         rank = dist.get_rank(group)
         HO, V, K = do.shape[1], do.shape[2], k.shape[2]
@@ -352,7 +316,10 @@ class CudnnSummaryProducer:
             tr = torch.zeros((HO, K, K), dtype=torch.float32, device=k.device)
         gs, ts = _all_gather_one(gsum, group), _all_gather_one(tr, group)
         if cp_context.is_last_rank:
-            return None
+            # No successor gradient: this rank's own last document has a zero final-state gradient.  Return
+            # it materialised (not None) so the backward plan-key dstate dtype stays constant fp32 and does
+            # not re-plan step to step under varlen packing (see _zeros_boundary_state).
+            return _zeros_boundary_state(len(cu_list) - 1, HO, V, K, k.device)
         grad = torch.zeros_like(gsum)
         for r in range(
             rank + cp_context.post_num_ranks, rank, -1
@@ -409,6 +376,7 @@ class ChunkwiseCPKDAFunction(torch.autograd.Function):
         flags,
         gate_kwargs_static,
         producer,
+        pad_nseq,
     ):
         """``kda_fwd`` of this rank's shard seeded with the folded boundary state."""
         ops = _ops.ops()
@@ -420,17 +388,10 @@ class ChunkwiseCPKDAFunction(torch.autograd.Function):
         initial_state = producer.initial_state(
             k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags
         )
-        # Pin the main-kernel plan key's state dtype: a first-rank's own document starts from a zero
-        # state, so materialise it (instead of leaving it None) to stop state_dtype toggling None<->fp32
-        # as boundaries move between steps (see _cp_static_state_enabled).  Same [N_local, HO, V, K] shape
-        # as the folded state the producer builds on other ranks, so the downstream padding is unchanged.
-        if initial_state is None and _cp_static_state_enabled():
-            initial_state = _zeros_boundary_state(
-                len(cu_list) - 1, v.shape[1], v.shape[2], k.shape[2], k.device
-            )
         # Pin the main-kernel plan key's sequence count: pad the rank-local cu_seqlens and the
-        # per-sequence initial state with zero-length tail segments (see _cp_pad_nseq_target).
-        target_n = _cp_pad_nseq_target()
+        # per-sequence initial state with zero-length tail segments (see _pad_cu_nseq).  ``pad_nseq``
+        # is the model's ``thd_max_packed_sequences`` (None when unset -> no padding).
+        target_n = pad_nseq
         cu_kernel = _pad_cu_nseq(cu, target_n) if target_n is not None else cu
         initial_state_kernel = (
             _pad_state_nseq(initial_state, target_n) if target_n is not None else initial_state
@@ -465,6 +426,7 @@ class ChunkwiseCPKDAFunction(torch.autograd.Function):
         ctx.save_for_backward(*saved)
         ctx.cu_list, ctx.cp_context, ctx.scale = cu_list, cp_context, float(scale)
         ctx.flags, ctx.gate_kwargs_static, ctx.producer = flags, gate_kwargs_static, producer
+        ctx.pad_nseq = pad_nseq
         return out
 
     @staticmethod
@@ -490,16 +452,8 @@ class ChunkwiseCPKDAFunction(torch.autograd.Function):
         d_final_state = ctx.producer.final_state_grad(
             q, k, g, beta, do, cu, ctx.cu_list, ctx.cp_context, ctx.scale, gate_kwargs, ctx.flags
         )
-        # Pin the backward plan key's dstate_in dtype: a last-rank's own document has no successor
-        # gradient, so its final-state gradient is zero -- materialise it (instead of None) to stop
-        # dstate_in_dtype toggling None<->fp32 between steps (see _cp_static_state_enabled).  initial_state
-        # is already materialised whenever the forward was (ctx.has_initial_state), pinning state_dtype too.
-        if d_final_state is None and _cp_static_state_enabled():
-            d_final_state = _zeros_boundary_state(
-                len(ctx.cu_list) - 1, do.shape[1], do.shape[2], k.shape[2], k.device
-            )
         # Pin the backward plan key's sequence count the same way as the forward.
-        target_n = _cp_pad_nseq_target()
+        target_n = ctx.pad_nseq
         if target_n is not None:
             cu = _pad_cu_nseq(cu, target_n)
             initial_state = _pad_state_nseq(initial_state, target_n)
@@ -530,13 +484,14 @@ class ChunkwiseCPKDAFunction(torch.autograd.Function):
             dbeta,
             d_a_log if ctx.has_a_log else None,
             d_dt_bias if ctx.has_dt_bias else None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # cu
+            None,  # cu_list
+            None,  # cp_context
+            None,  # scale
+            None,  # flags
+            None,  # gate_kwargs_static
+            None,  # producer
+            None,  # pad_nseq
         )
 
 
@@ -555,10 +510,12 @@ def chunk_kda_cudnn_cp(
     flags: dict,
     gate_kwargs: dict,
     producer: str = "cudnn",
+    pad_nseq: Optional[int] = None,
 ) -> torch.Tensor:
     """THD chunkwise-CP KDA on cuDNN kernels.
 
-    Operands are already in cuDNN's conventions (see ``ops``).
+    Operands are already in cuDNN's conventions (see ``ops``).  ``pad_nseq`` (the model's
+    ``thd_max_packed_sequences``) pins the rank-local sequence count so the cuDNN plan key is static.
     """
     cu_list = _host_cu_seqlens(cp_context)
     static = {key: value for key, value in gate_kwargs.items() if key not in ("a_log", "dt_bias")}
@@ -577,4 +534,5 @@ def chunk_kda_cudnn_cp(
         flags,
         static,
         get_boundary_state_producer(producer),
+        pad_nseq,
     )
