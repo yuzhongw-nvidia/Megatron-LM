@@ -412,12 +412,17 @@ def _triton_prepare_kda_tail(
     num_heads: int,
     head_dim: int,
     stream: Optional["torch.cuda.Stream"] = None,
+    gate_out_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Prepare explicit KDA F-decay, output-gate, and beta tensors."""
 
     seq_len, batch, _ = raw_g.shape
     device = raw_g.device
-    raw_g_out = torch.empty((batch, seq_len, num_heads, head_dim), dtype=raw_g.dtype, device=device)
+    raw_g_out = torch.empty(
+        (batch, seq_len, num_heads, head_dim),
+        dtype=gate_out_dtype if gate_out_dtype is not None else raw_g.dtype,
+        device=device,
+    )
     gate_out = torch.empty_like(raw_g_out, dtype=gate.dtype)
     beta_out = torch.empty((batch, seq_len, num_heads), dtype=torch.float32, device=device)
     grid = lambda meta: (batch * num_heads, triton.cdiv(seq_len, meta["BLOCK_S"]))
@@ -581,10 +586,19 @@ def _triton_pre_kda_forward(
     cu_seqlens: Optional[Tensor] = None,
     cp_group=None,
     cp_size: int = 1,
+    gate_out_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[
     Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor], int, int
 ]:
-    """Run the shared QKV kernels and the KDA-specific tail kernel."""
+    """Run the shared QKV kernels and the KDA-specific tail kernel.
+
+    ``gate_out_dtype`` overrides the dtype of the emitted decay gate ``raw_g_out`` (``None`` keeps
+    ``raw_g``'s dtype). A consumer whose kernel takes a fp32 gate (the cuDNN KDA backend) can ask for
+    ``torch.float32`` here so the bf16->fp32 cast folds into this kernel's store instead of running as
+    a separate elementwise before the kernel; the tail kernel's ``tl.store`` casts on write and the
+    backward's ``tl.load`` reads whatever dtype the incoming gradient carries, so no kernel changes
+    are needed.
+    """
 
     seq_len, batch, total_channels = qkv.shape
     is_packed_thd = cu_seqlens is not None
@@ -647,7 +661,13 @@ def _triton_pre_kda_forward(
         stream.wait_stream(main_stream)
 
     raw_g_out, gate_out, beta_out = _triton_prepare_kda_tail(
-        raw_g, gate, beta, num_heads=num_heads, head_dim=head_dim, stream=tail_stream
+        raw_g,
+        gate,
+        beta,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        stream=tail_stream,
+        gate_out_dtype=gate_out_dtype,
     )
     _wait_distributed_ops(left_boundary_recv_ops)
 
@@ -881,6 +901,7 @@ class FusedPreKDAFunction(torch.autograd.Function):
         cp_size,
         num_heads,
         head_dim,
+        gate_out_dtype,
     ):
         """Run fused KDA preprocessing and save the minimum backward state."""
 
@@ -932,6 +953,7 @@ class FusedPreKDAFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             cp_group=cp_group,
             cp_size=cp_size,
+            gate_out_dtype=gate_out_dtype,
         )
         assert silu_qk_save is not None
         ctx.has_left_boundary = left_boundary is not None
@@ -1000,7 +1022,7 @@ class FusedPreKDAFunction(torch.autograd.Function):
             global_seq_len=ctx.global_seq_len,
             cp_group=ctx.cp_group if ctx.cp_active else None,
         )
-        return (d_qkv, d_raw_g, d_gate, d_beta, d_weight, None, None, None, None, None, None)
+        return (d_qkv, d_raw_g, d_gate, d_beta, d_weight, None, None, None, None, None, None, None)
 
 
 def _validate_fused_streamed_pre_kda_inputs(
@@ -1110,6 +1132,7 @@ def fused_streamed_pre_kda(
     seq_idx: Optional[Tensor] = None,
     cp_group=None,
     strict_runtime_validation: bool = True,
+    gate_out_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Run streamed fused preprocessing for explicit KDA projection tensors.
 
@@ -1158,6 +1181,7 @@ def fused_streamed_pre_kda(
             cu_seqlens=cu_seqlens,
             cp_group=cp_group,
             cp_size=cp_size,
+            gate_out_dtype=gate_out_dtype,
         )
         return query, key, value, gate_out, beta_out, raw_g_out
 
@@ -1173,4 +1197,5 @@ def fused_streamed_pre_kda(
         cp_size,
         num_heads,
         head_dim,
+        gate_out_dtype,
     )

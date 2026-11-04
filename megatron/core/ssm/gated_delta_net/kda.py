@@ -290,6 +290,24 @@ class KimiDeltaAttention(_GDNBase):
         self.gate_params_dtype = torch.float32
         self.gated_delta_rule = self._select_kda_kernel()
 
+    @staticmethod
+    def _kda_gate_out_dtype(config):
+        """Dtype the pre-KDA fusion should emit the decay gate (``raw_g``) in, per the KDA backend.
+
+        The cuDNN KDA frost kernel takes a fp32 gate operand, so emitting the gate in fp32 from the
+        pre-KDA fusion folds the otherwise-separate bf16->fp32 cast (``cudnn_kda.ops.prepare_gate``'s
+        ``g.float()``) into the fusion's output write, removing a standalone elementwise kernel and a
+        gate-sized memory round-trip at the start of the gated-delta-rule forward.  FLA and the
+        internal backend take the raw bf16 gate and cast it per element inside their own kernels, so
+        ``None`` keeps the gate in its natural dtype for them.  The fusion itself stays backend-
+        agnostic -- it only sees the dtype decided here.
+        """
+        return (
+            torch.float32
+            if getattr(config, "kda_kernel_backend", "fla") == "cudnn"
+            else None
+        )
+
     def _select_kda_kernel(self):
         """The ``chunk_kda``-compatible kernel entry point for ``config.kda_kernel_backend``."""
         backend = getattr(self.config, "kda_kernel_backend", "fla")
@@ -991,6 +1009,13 @@ class KimiDeltaAttention(_GDNBase):
 
         gate = kernel_inputs.pop("gate")
 
+        # Match the fused path: hand the KDA kernel its gate in the dtype the backend wants. The
+        # unfused path has no kernel to fold the cast into, so this is a plain cast (a no-op for the
+        # FLA/internal backends, which keep the bf16 gate), kept for behavioural consistency.
+        gate_out_dtype = self._kda_gate_out_dtype(self.config)
+        if gate_out_dtype is not None and kernel_inputs["g"].dtype != gate_out_dtype:
+            kernel_inputs["g"] = kernel_inputs["g"].to(gate_out_dtype)
+
         return (
             kernel_inputs["q"],
             kernel_inputs["k"],
@@ -1065,6 +1090,7 @@ class KimiDeltaAttention(_GDNBase):
             seq_idx=seq_idx,
             cp_group=cp_group,
             strict_runtime_validation=strict_runtime_validation,
+            gate_out_dtype=self._kda_gate_out_dtype(self.config),
         )
         return (*outputs, A_log, dt_bias)
 

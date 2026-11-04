@@ -778,3 +778,67 @@ def test_cudnn_chunkwise_cp_matches_single_rank(
         micro_batch_size=micro_batch_size,
         sequence_packing=sequence_packing,
     )
+
+
+def test_kda_gate_out_dtype_follows_backend():
+    """``_kda_gate_out_dtype`` reads only the config (no GPU): cuDNN wants fp32, FLA keeps bf16.
+
+    The cuDNN KDA frost kernel takes a fp32 gate operand, so the pre-KDA fusion is asked to emit the
+    decay gate in fp32 (folding the bf16->fp32 cast into its store); FLA and the internal backend cast
+    the raw bf16 gate inside their own kernels, so the fusion keeps the natural dtype (``None``).
+    """
+    assert (
+        KimiDeltaAttention._kda_gate_out_dtype(
+            replace(_make_config(), kda_kernel_backend="cudnn")
+        )
+        is torch.float32
+    )
+    assert (
+        KimiDeltaAttention._kda_gate_out_dtype(
+            replace(_make_config(), kda_kernel_backend="fla")
+        )
+        is None
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the pre-KDA fusion needs a CUDA device.")
+def test_fused_pre_kda_gate_out_dtype_is_neutral():
+    """``gate_out_dtype`` only changes the emitted gate's dtype, not its value.
+
+    The fp32 gate output, rounded back to bf16, must bit-match the default bf16 gate output: both come
+    from the same fused compute and differ only in the output buffer dtype (the tail kernel casts on
+    ``tl.store``). This is the invariant that lets the cuDNN path drop ``prepare_gate``'s ``g.float()``.
+    """
+    from megatron.core.fusions.fused_pre_gated_delta_rule import causal_conv1d_bwd_function
+    from megatron.core.fusions.fused_pre_kda import fused_streamed_pre_kda
+
+    if causal_conv1d_bwd_function is None:
+        pytest.skip("the pre-KDA fusion needs causal-conv1d.")
+
+    device = "cuda"
+    num_heads, head_dim = 2, _HEAD_DIM  # head_dim must be a power of two
+    seq_len, batch = 16, 1
+    conv_dim = 3 * num_heads * head_dim
+    gen = torch.Generator().manual_seed(7)
+
+    def _rand(*shape):
+        return torch.randn(*shape, generator=gen).to(device=device, dtype=torch.bfloat16)
+
+    qkv = _rand(seq_len, batch, conv_dim)
+    raw_g = _rand(seq_len, batch, num_heads * head_dim)
+    gate = _rand(seq_len, batch, num_heads * head_dim)
+    beta = _rand(seq_len, batch, num_heads)
+    conv1d_weight = _rand(conv_dim, 1, 4)  # KDA conv weight is [3*num_heads*head_dim, 1, kernel_width]
+
+    common = dict(num_heads=num_heads, head_dim=head_dim, use_qk_l2norm=True)
+    with torch.no_grad():
+        *_, raw_g_bf16 = fused_streamed_pre_kda(
+            qkv, raw_g, gate, beta, conv1d_weight, None, gate_out_dtype=None, **common
+        )
+        *_, raw_g_fp32 = fused_streamed_pre_kda(
+            qkv, raw_g, gate, beta, conv1d_weight, None, gate_out_dtype=torch.float32, **common
+        )
+
+    assert raw_g_bf16.dtype == torch.bfloat16
+    assert raw_g_fp32.dtype == torch.float32
+    torch.testing.assert_close(raw_g_fp32.to(torch.bfloat16), raw_g_bf16, rtol=0, atol=0)
