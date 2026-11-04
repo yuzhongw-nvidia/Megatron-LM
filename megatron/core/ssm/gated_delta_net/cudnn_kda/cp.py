@@ -140,6 +140,36 @@ def _cp_prewarm_enabled() -> bool:
     return os.environ.get("MCORE_KDA_CP_PREWARM") == "1"
 
 
+def _cp_static_state_enabled() -> bool:
+    """Whether to always hand the main kernel a materialised boundary state (``MCORE_KDA_CP_STATIC_STATE``).
+
+    The cuDNN main-kernel plan cache keys (``make_fprop_cache_key`` / ``make_bprop_cache_key``) include the
+    *dtype* of the per-sequence recurrent state operands: ``state_dtype`` (the forward's ``initial_state`` and
+    the backward's reconstructed ``initial_state``) and ``dstate_in_dtype`` (the backward's ``d_final_state``).
+    The :class:`CudnnSummaryProducer` returns ``None`` for those operands on a rank that starts its own first
+    document (``is_first_rank``, no folded initial state) or ends its own last document (``is_last_rank``, no
+    folded final-state gradient), and a tensor otherwise.  Under varlen THD packing the packed-document
+    boundaries fall in different places inside this rank's fixed-size slice every step, so ``is_first_rank`` /
+    ``is_last_rank`` -- and therefore whether the operand is ``None`` or an fp32 tensor -- *toggle step to
+    step on the same rank*.  Each ``None<->fp32`` toggle is a new plan key even when ``total`` and ``N`` are
+    pinned (by ``pad_packed_seq_alignment=max`` and ``MCORE_KDA_CP_PAD_NSEQ``), so the forward re-plans across
+    two keys and the backward across up to four -- the residual varlen-CP recompile storm that pinning the
+    token count and the sequence count does not remove.  A rank that starts/ends its own document has a *zero*
+    boundary state by definition, so materialising an all-zero ``[N_local, HO, V, K]`` fp32 tensor instead of
+    ``None`` is numerically identical (the recurrence already starts from zero / receives no successor
+    gradient) and makes ``state_dtype`` / ``dstate_in_dtype`` constant fp32.  Combined with the token-count and
+    sequence-count pins the main-kernel plan key is then fully static.  Enabled by ``MCORE_KDA_CP_STATIC_STATE=1``.
+    """
+    import os
+
+    return os.environ.get("MCORE_KDA_CP_STATIC_STATE") == "1"
+
+
+def _zeros_boundary_state(n_local: int, ho: int, v: int, k: int, device) -> torch.Tensor:
+    """An all-zero per-sequence boundary state ``[n_local, HO, V, K]`` (cuDNN fp32 V-major layout)."""
+    return torch.zeros((n_local, ho, v, k), dtype=torch.float32, device=device)
+
+
 _PREWARMED_FWD = False
 _PREWARMED_BWD = False
 
@@ -390,6 +420,14 @@ class ChunkwiseCPKDAFunction(torch.autograd.Function):
         initial_state = producer.initial_state(
             k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags
         )
+        # Pin the main-kernel plan key's state dtype: a first-rank's own document starts from a zero
+        # state, so materialise it (instead of leaving it None) to stop state_dtype toggling None<->fp32
+        # as boundaries move between steps (see _cp_static_state_enabled).  Same [N_local, HO, V, K] shape
+        # as the folded state the producer builds on other ranks, so the downstream padding is unchanged.
+        if initial_state is None and _cp_static_state_enabled():
+            initial_state = _zeros_boundary_state(
+                len(cu_list) - 1, v.shape[1], v.shape[2], k.shape[2], k.device
+            )
         # Pin the main-kernel plan key's sequence count: pad the rank-local cu_seqlens and the
         # per-sequence initial state with zero-length tail segments (see _cp_pad_nseq_target).
         target_n = _cp_pad_nseq_target()
@@ -452,6 +490,14 @@ class ChunkwiseCPKDAFunction(torch.autograd.Function):
         d_final_state = ctx.producer.final_state_grad(
             q, k, g, beta, do, cu, ctx.cu_list, ctx.cp_context, ctx.scale, gate_kwargs, ctx.flags
         )
+        # Pin the backward plan key's dstate_in dtype: a last-rank's own document has no successor
+        # gradient, so its final-state gradient is zero -- materialise it (instead of None) to stop
+        # dstate_in_dtype toggling None<->fp32 between steps (see _cp_static_state_enabled).  initial_state
+        # is already materialised whenever the forward was (ctx.has_initial_state), pinning state_dtype too.
+        if d_final_state is None and _cp_static_state_enabled():
+            d_final_state = _zeros_boundary_state(
+                len(ctx.cu_list) - 1, do.shape[1], do.shape[2], k.shape[2], k.device
+            )
         # Pin the backward plan key's sequence count the same way as the forward.
         target_n = _cp_pad_nseq_target()
         if target_n is not None:

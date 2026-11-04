@@ -401,6 +401,30 @@ def test_kda_cudnn_cp_state_producer_knob():
     assert config.kda_kernel_backend == "fla"
 
 
+def test_cp_static_state_env_knob(monkeypatch):
+    """``MCORE_KDA_CP_STATIC_STATE`` gates the materialised-zero boundary state (CPU, no cudnn-frontend).
+
+    A chunkwise-CP rank that starts / ends its own document has no folded boundary state, so the producer
+    returns ``None`` and the cuDNN main-kernel plan key's state dtype toggles None<->fp32 as the varlen
+    boundaries move -- a recompile even with ``total`` and ``N`` pinned.  With the knob set, a zero state is
+    materialised instead; it is fp32 and ``[N_local, HO, V, K]`` (the same shape the producer builds on other
+    ranks), so the recurrence is seeded from zero exactly as before while the plan key's state dtype is fixed.
+    """
+    from megatron.core.ssm.gated_delta_net.cudnn_kda import cp as cudnn_cp
+
+    monkeypatch.delenv("MCORE_KDA_CP_STATIC_STATE", raising=False)
+    assert cudnn_cp._cp_static_state_enabled() is False
+    monkeypatch.setenv("MCORE_KDA_CP_STATIC_STATE", "0")
+    assert cudnn_cp._cp_static_state_enabled() is False
+    monkeypatch.setenv("MCORE_KDA_CP_STATIC_STATE", "1")
+    assert cudnn_cp._cp_static_state_enabled() is True
+
+    state = cudnn_cp._zeros_boundary_state(3, 4, _HEAD_DIM, _HEAD_DIM, torch.device("cpu"))
+    assert tuple(state.shape) == (3, 4, _HEAD_DIM, _HEAD_DIM)
+    assert state.dtype == torch.float32
+    assert bool((state == 0).all())
+
+
 def test_select_kda_kernel_binds_backend():
     """``_select_kda_kernel`` reads only the config, so a module shell suffices (no GPU)."""
     fla_shell = SimpleNamespace(config=replace(_make_config(), kda_kernel_backend="fla"))
