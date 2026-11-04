@@ -16,9 +16,12 @@ def _fused_kda_bwd_available() -> bool:
     return True
 
 
-pytestmark = pytest.mark.skipif(
-    not _fused_kda_bwd_available(), reason="needs SM100, FLA and the CuTe DSL runtime"
-)
+pytestmark = [
+    pytest.mark.launch_on_gb200,
+    pytest.mark.skipif(
+        not _fused_kda_bwd_available(), reason="needs SM100, FLA and the CuTe DSL runtime"
+    ),
+]
 
 _HEADS = 4
 _DIM = 128
@@ -28,6 +31,15 @@ def _adapter():
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend import kda as adapter
 
     return adapter
+
+
+def _force_path(monkeypatch, path):
+    """Pin the backward to the tape pipeline or the fused recurrence."""
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_kda_bwd_cute import (
+        launcher,
+    )
+
+    monkeypatch.setattr(launcher, "prefer_tape", lambda *args: path == "tape")
 
 
 def _inputs(batch, seq_len, gate_range, seed=0):
@@ -79,12 +91,14 @@ def _grads(chunk_kda, leaves, do, cu_seqlens, safe_gate, lower_bound):
     ],
     ids=["unbounded", "bounded", "strong_unbounded", "dense_batch2"],
 )
-def test_fused_bwd_matches_fla(monkeypatch, lengths, safe_gate, lower_bound, A_log_range):
+@pytest.mark.parametrize("path", ["tape", "fused"])
+def test_fused_bwd_matches_fla(monkeypatch, path, lengths, safe_gate, lower_bound, A_log_range):
     from fla.ops.kda import chunk_kda as fla_chunk_kda
 
     adapter = _adapter()
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
     monkeypatch.delenv("MCORE_KDA_FUSED_BWD", raising=False)
+    _force_path(monkeypatch, path)
     if lengths is None:
         leaves, do = _inputs(2, 192, A_log_range)
         cu_seqlens = None
@@ -120,7 +134,8 @@ def test_fused_bwd_can_be_disabled(monkeypatch):
     assert adapter.get_fused_kda_bwd_launch_count() == before
 
 
-def test_fused_bwd_compiles_once_across_packings(monkeypatch):
+@pytest.mark.parametrize("path", ["tape", "fused"])
+def test_fused_bwd_compiles_once_across_packings(monkeypatch, path):
     from fla.ops.kda import chunk_kda as fla_chunk_kda
 
     from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_kda_bwd_cute import (
@@ -130,8 +145,10 @@ def test_fused_bwd_compiles_once_across_packings(monkeypatch):
     adapter = _adapter()
     monkeypatch.setenv("MCORE_GDN_INTERNAL_BACKEND", "auto")
     monkeypatch.delenv("MCORE_KDA_FUSED_BWD", raising=False)
-    # Token count, chunk count, tail lengths and sequence count all change.
-    packings = ([64], [130, 64, 257], [1, 63, 65, 128, 200], [512, 77])
+    _force_path(monkeypatch, path)
+    # Token count, chunk count, tail lengths and sequence count all change, and
+    # with a tape so does the number of CTAs per (sequence, head).
+    packings = ([64], [130, 64, 257], [1, 63, 65, 128, 200], [512, 0, 77])
     sizes = []
     for seed, lengths in enumerate(packings):
         leaves, do = _inputs(1, sum(lengths), (-1.0, 1.0), seed=seed)
