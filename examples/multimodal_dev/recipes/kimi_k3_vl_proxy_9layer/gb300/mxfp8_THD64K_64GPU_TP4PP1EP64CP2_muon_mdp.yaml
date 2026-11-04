@@ -9,20 +9,21 @@
 # The 16 nodes must share one NVLink domain: EP64 spans every GPU and HybridEP sizes its
 # domain from the ranks it can reach (on Slurm block topologies, e.g. --segment=16).
 #
-# Differences from the text proxy recipe:
+# Decoder arguments are kept identical to that text proxy recipe (2026-10-28 settings: fused
+# MLA output gate, MoK, fused attention residuals, chunked optimizer-state offload, no NaN
+# checks); only the multimodal data path and the MDP restrictions differ:
 # - Data: mdp_mock, fixed 65536-token samples with a per-sample vision share, instead of
 #   LongAlign-10k packed by sequence_packing_scheduler; MDP rejects MCore's packing schedulers
-#   (they drop the pixel payload) and packs with static THD padding instead.
+#   (they drop the pixel payload) and packs with static THD padding instead. Mock data forces
+#   balanced routing, like the text 512K proxy recipe.
 # - fine_grained_activation_offloading is off: MDP rejects activation offload. The recompute
 #   set (gdn, moe, mlp) is unchanged.
-# - chunked_optimizer_state_offload is off (memory only; peak device use is 166 GB).
 # - The container additionally pins flash-attn-4 4.0.0b11 with the nvidia-cutlass-dsl 4.5.x
 #   family it imports (mla_latent_cp requires b11).
 DEPENDENCIES:
   pytorch_base_image: nvcr.io/nvidia/pytorch:26.04-py3
   dockerfile_path: examples/moe_recipes/kimi_k3/Dockerfile
 ENV_VARS:
-  CUDA_DEVICE_MAX_CONNECTIONS: '1'
   TORCH_NCCL_AVOID_RECORD_STREAMS: '0'
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: '0'
@@ -80,6 +81,8 @@ ARGS:
   attention_latent_norm_epsilon: 1.0e-06
   attention_output_gate: true
   gated_attention_proj_granularity: elementwise
+  attention_output_gate_fusion: true
+  mla_down_proj_fusion: false
   no_rope_freq: 1
   position_embedding_type: none
   enable_attention_residuals: true
@@ -104,6 +107,9 @@ ARGS:
   moe_aux_loss_coeff: 0.0
   moe_router_quantile_balancing_estimation_scope: global_batch
   moe_router_qb_num_bins: 1000
+  moe_router_pre_softmax: false
+  moe_router_enable_expert_bias: false
+  moe_enable_routing_replay: false
   # Mock data: force balanced routing.
   moe_router_force_load_balancing: true
   mtp_num_layers: 1
@@ -135,6 +141,7 @@ ARGS:
   thd_max_packed_sequences: 2
   pad_packed_seq_alignment: max
   calculate_per_token_loss: true
+  no_check_for_nan_in_loss_and_grad: true
   moe_hybridep_pad_variable_tokens: false
   bf16: true
   transformer_impl: transformer_engine
@@ -197,6 +204,14 @@ ARGS:
   muon_nesterov: false
   overlap_grad_reduce: true
   overlap_param_gather: true
+  # Chunked optimizer-state offload as in the text recipes (the Muon states through the
+  # LayerWise optimizer, the encoder's Adam states through its DistributedOptimizer member).
+  chunked_optimizer_state_offload: true
+  optimizer_state_offload_fraction: 1.0
+  optimizer_state_offload_chunk_size_mb: 256
+  optimizer_cpu_offload: false
+  optimizer_offload_fraction: 0.0
+  overlap_cpu_optimizer_d2h_h2d: false
   no_create_attention_mask_in_dataloader: true
   lr: 1.0e-04
   min_lr: 1.0e-05
