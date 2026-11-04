@@ -94,6 +94,45 @@ def _neutral_gate_fill(gate_kwargs: dict) -> float:
     return _NEUTRAL_GATE_LOGIT if gate_kwargs.get("safe_gate") else 0.0
 
 
+def _cp_pad_nseq_target() -> Optional[int]:
+    """Fixed rank-local sequence count to pad to, from ``MCORE_KDA_CP_PAD_NSEQ`` (else ``None``).
+
+    The cuDNN main-kernel plan cache keys on ``(total_tokens, num_sequences, ...)``.  Under chunkwise
+    CP the per-rank ``total_tokens`` is static when ``pad_packed_seq_alignment=max``, but the number of
+    local sequences varies every step as packed-document boundaries fall in different places inside this
+    rank's slice (``thd_max_packed_sequences`` pins only the *global* count), so the forward/backward
+    kernels recompile per new local count -- the residual varlen-CP recompile storm.  Setting this env to
+    a fixed count >= the per-rank maximum pads the local ``cu_seqlens`` (and the per-sequence state) with
+    trailing zero-length segments so the plan key is static.  Zero-length segments process no tokens and
+    add no output, so the result is unchanged.
+    """
+    import os
+
+    raw = os.environ.get("MCORE_KDA_CP_PAD_NSEQ")
+    if not raw:
+        return None
+    value = int(raw)
+    return value if value > 0 else None
+
+
+def _pad_cu_nseq(cu: torch.Tensor, target_n: int) -> torch.Tensor:
+    """Pad rank-local ``cu_seqlens`` ``[N+1]`` to ``[target_n+1]`` with zero-length tail segments."""
+    n_local = cu.shape[0] - 1
+    if n_local >= target_n:
+        return cu
+    tail = cu.new_full((target_n - n_local,), int(cu[-1].item()))
+    return torch.cat([cu, tail])
+
+
+def _pad_state_nseq(state: Optional[torch.Tensor], target_n: int) -> Optional[torch.Tensor]:
+    """Pad a per-sequence state ``[N_local, ...]`` to ``[target_n, ...]`` with zero rows."""
+    if state is None or state.shape[0] >= target_n:
+        return state
+    out = state.new_zeros((target_n,) + tuple(state.shape[1:]))
+    out[: state.shape[0]] = state
+    return out
+
+
 class BoundaryStateProducer(Protocol):
     """Produces the two cross-rank boundary tensors of a chunkwise-CP step on this rank.
 
@@ -261,15 +300,22 @@ class ChunkwiseCPKDAFunction(torch.autograd.Function):
         initial_state = producer.initial_state(
             k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags
         )
+        # Pin the main-kernel plan key's sequence count: pad the rank-local cu_seqlens and the
+        # per-sequence initial state with zero-length tail segments (see _cp_pad_nseq_target).
+        target_n = _cp_pad_nseq_target()
+        cu_kernel = _pad_cu_nseq(cu, target_n) if target_n is not None else cu
+        initial_state_kernel = (
+            _pad_state_nseq(initial_state, target_n) if target_n is not None else initial_state
+        )
         out, _, _ = ops.kda_fwd(
             q,
             k,
             v,
             g,
             beta,
-            cu,
+            cu_kernel,
             float(scale),
-            initial_state=initial_state,
+            initial_state=initial_state_kernel,
             output_final_state=False,
             checkpoint_every_n_tokens=0,
             use_qk_l2norm_in_kernel=flags["use_qk_l2norm_in_kernel"],
@@ -316,6 +362,12 @@ class ChunkwiseCPKDAFunction(torch.autograd.Function):
         d_final_state = ctx.producer.final_state_grad(
             q, k, g, beta, do, cu, ctx.cu_list, ctx.cp_context, ctx.scale, gate_kwargs, ctx.flags
         )
+        # Pin the backward plan key's sequence count the same way as the forward.
+        target_n = _cp_pad_nseq_target()
+        if target_n is not None:
+            cu = _pad_cu_nseq(cu, target_n)
+            initial_state = _pad_state_nseq(initial_state, target_n)
+            d_final_state = _pad_state_nseq(d_final_state, target_n)
         dq, dk, dv, dg, dbeta, _d_initial_state, d_a_log, d_dt_bias = ops.kda_bwd(
             do,
             q,

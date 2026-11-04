@@ -66,7 +66,49 @@ def _probe() -> tuple[Any, Optional[str]]:
     missing = [name for name in _REQUIRED_OPS if not hasattr(ops, name)]
     if missing:
         return None, f"cudnn-frontend {version} lacks {missing}"
+    _install_compile_logger(ops)
     return ops, None
+
+
+class _LoggingCache(dict):
+    """A plan cache that logs every new key (= a frost-engine build) for diagnostics.
+
+    cudnn-frontend builds a cuDNN graph once per unique ``make_*_cache_key`` tuple and reuses it
+    across steps.  A recompile is therefore a new key insertion.  Enabling ``MCORE_KDA_LOG_COMPILES``
+    swaps the module-level ``fprop_cache`` / ``bprop_cache`` / ``summary_cache`` for this subclass so
+    each build prints ``total`` (operand token count) and ``N`` (number of sequences) -- the two
+    shape legs of the key -- to confirm which one drives a varlen-CP recompile storm.
+    """
+
+    def __init__(self, label, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._label = label
+
+    def __setitem__(self, key, value):
+        if key not in self:
+            # key tuples are (tag, total, N, ...) for fprop/bprop/summary.
+            total = key[1] if len(key) > 1 else "?"
+            nseq = key[2] if len(key) > 2 else "?"
+            import sys
+
+            print(
+                f"[MCORE_KDA_COMPILE] {self._label} build #{len(self) + 1}: total={total} N={nseq}",
+                file=sys.stderr,
+                flush=True,
+            )
+        super().__setitem__(key, value)
+
+
+def _install_compile_logger(ops_module) -> None:
+    """Swap the plan caches for logging ones when ``MCORE_KDA_LOG_COMPILES`` is set (diagnostic)."""
+    import os
+
+    if os.environ.get("MCORE_KDA_LOG_COMPILES") != "1":
+        return
+    for name in ("fprop_cache", "bprop_cache", "summary_cache"):
+        existing = getattr(ops_module, name, None)
+        if isinstance(existing, dict) and not isinstance(existing, _LoggingCache):
+            setattr(ops_module, name, _LoggingCache(name, existing))
 
 
 def unavailable_reason() -> Optional[str]:
