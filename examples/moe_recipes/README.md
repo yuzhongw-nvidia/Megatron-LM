@@ -1,10 +1,13 @@
 # MoE Recipes
 
-This directory contains self-contained MoE training recipes. Each YAML file includes:
+This directory contains MoE training recipes. Each YAML file includes:
 
-- `DEPENDENCIES`: PyTorch base image and Dockerfile content used for the recipe.
+- `DEPENDENCIES`: PyTorch base image and either Dockerfile content (`dockerfile`)
+  or a Dockerfile path relative to the repository root (`dockerfile_path`).
 - `ENV_VARS`: Environment variables expected by the runtime.
 - `ARGS`: Megatron-LM training arguments.
+
+See the [Kimi-K3 guide](kimi_k3/README.md) for the decoder recipes, measurement revisions and ARM64 build.
 
 ## Recipe Index
 
@@ -21,6 +24,60 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td>Kimi-K3</td>
+      <td><a href="kimi_k3/gb300/mxfp8_THD64K_256GPU_TP1PP4EP64CP8_muon.yaml">GB300 MXFP8 THD 64K</a></td>
+      <td>256</td>
+      <td>1/4/64/8/1</td>
+      <td>1/256/65536</td>
+      <td>cuDNN KDA, MLA a2a8</td>
+      <td>877.9</td>
+    </tr>
+    <tr>
+      <td>Kimi-K3</td>
+      <td><a href="kimi_k3/gb300/mxfp8_THD256K_256GPU_TP1PP4EP64CP32_muon.yaml">GB300 MXFP8 THD 256K</a></td>
+      <td>256</td>
+      <td>1/4/64/32/1</td>
+      <td>1/64/262144</td>
+      <td>cuDNN KDA, MLA a2a8 + ring4</td>
+      <td>860.5</td>
+    </tr>
+    <tr>
+      <td>Kimi-K3</td>
+      <td><a href="kimi_k3/gb300/mxfp8_THD1M_512GPU_TP4PP4EP64CP32_muon.yaml">GB300 MXFP8 THD 1M</a></td>
+      <td>512</td>
+      <td>4/4/64/32/1</td>
+      <td>1/32/1048576</td>
+      <td>cuDNN KDA configuration, MLA a2a8 + ring4</td>
+      <td>813 (historical FLA KDA, 2026-10-28, <code>5d15f3590</code>)</td>
+    </tr>
+    <tr>
+      <td>Kimi-K3 9L proxy</td>
+      <td><a href="kimi_k3_proxy_9layer/gb300/mxfp8_THD64K_64GPU_TP1PP1EP64CP8_muon.yaml">GB300 MXFP8 THD 64K</a></td>
+      <td>64</td>
+      <td>1/1/64/8/1</td>
+      <td>1/256/65536</td>
+      <td>cuDNN KDA, MLA a2a8, variable-length mock</td>
+      <td>775.1</td>
+    </tr>
+    <tr>
+      <td>Kimi-K3 9L proxy</td>
+      <td><a href="kimi_k3_proxy_9layer/gb300/mxfp8_THD512K_64GPU_TP4PP1EP64CP16_muon.yaml">GB300 MXFP8 THD 512K</a></td>
+      <td>64</td>
+      <td>4/1/64/16/1</td>
+      <td>1/32/524288</td>
+      <td>cuDNN KDA configuration, MLA a2a8 + ring2</td>
+      <td>984.4 (historical FLA KDA, <code>d223af3eb</code>)</td>
+    </tr>
+    <tr>
+      <td>Kimi-K3 9L proxy</td>
+      <td><a href="kimi_k3_proxy_9layer/gb300/mxfp8_THD64K_64GPU_TP4PP1EP64CP2_muon.yaml">GB300 MXFP8 THD 64K</a></td>
+      <td>64</td>
+      <td>4/1/64/2/1</td>
+      <td>1/256/65536</td>
+      <td>LongAlign-10k continuation</td>
+      <td>—</td>
+    </tr>
     <tr>
       <td>DeepSeek-V4-Pro</td>
       <td><a href="deepseek_v4_pro/gb300/mxfp8_SL4K_256GPU_TP1PP4EP64.yaml">GB300 MXFP8</a></td>
