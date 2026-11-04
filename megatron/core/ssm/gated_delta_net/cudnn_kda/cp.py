@@ -124,6 +124,92 @@ def _pad_cu_nseq(cu: torch.Tensor, target_n: int) -> torch.Tensor:
     return torch.cat([cu, tail])
 
 
+def _cp_prewarm_enabled() -> bool:
+    """Whether to pre-compile all boundary-summary shape buckets up front (``MCORE_KDA_CP_PREWARM``).
+
+    The dominant chunkwise-CP recompile cost is the boundary summary (forward and backward): it is
+    bucketed to a power-of-two token count (see ``_bucket_len``), but a document of a new bucketed
+    length can first reach this rank's boundary at any step, and across the CP/DP ranks that keeps a
+    fresh bucket compiling on most steps, so the storm spreads over the whole run even though each
+    rank compiles only a handful of engines.  Pre-warming compiles every bucket (``_MIN_BUCKET`` up to
+    the per-rank shard) with neutral dummy inputs on the first forward/backward, folding all summary
+    compiles into step 1 so the steady steps are flat.  Enabled by ``MCORE_KDA_CP_PREWARM=1``.
+    """
+    import os
+
+    return os.environ.get("MCORE_KDA_CP_PREWARM") == "1"
+
+
+_PREWARMED_FWD = False
+_PREWARMED_BWD = False
+
+
+def _buckets_up_to(total: int) -> list:
+    """Power-of-two buckets ``[_MIN_BUCKET, ..., _bucket_len(total)]`` the summary can see."""
+    top = _bucket_len(total)
+    out, b = [], _MIN_BUCKET
+    while b <= top:
+        out.append(b)
+        b *= 2
+    return out
+
+
+def _prewarm_summary_fwd(ops, k, v, g, beta, total, gate_kwargs, flags) -> None:
+    """Compile the forward boundary-summary engine for every bucket once (neutral dummy inputs)."""
+    global _PREWARMED_FWD
+    if _PREWARMED_FWD:
+        return
+    _PREWARMED_FWD = True
+    HK, K = k.shape[1], k.shape[2]
+    HV, V = v.shape[1], v.shape[2]
+    HO = g.shape[1]
+    fill_g = _neutral_gate_fill(gate_kwargs)
+    for length in _buckets_up_to(total):
+        cu = torch.tensor([0, length], dtype=torch.int32, device=k.device)
+        ops.kimi_delta_attention_summary(
+            torch.zeros((length, HK, K), dtype=k.dtype, device=k.device),
+            torch.zeros((length, HV, V), dtype=v.dtype, device=v.device),
+            torch.full((length, HO, K), fill_g, dtype=g.dtype, device=g.device),
+            torch.zeros((length, HO), dtype=beta.dtype, device=beta.device),
+            cu,
+            initial_state=None,
+            use_qk_l2norm_in_kernel=flags["use_qk_l2norm_in_kernel"],
+            use_beta_sigmoid_in_kernel=flags["use_beta_sigmoid_in_kernel"],
+            allow_neg_eigval=flags["allow_neg_eigval"],
+            **gate_kwargs,
+        )
+
+
+def _prewarm_summary_bwd(ops, q, k, g, beta, do, total, scale, gate_kwargs, flags) -> None:
+    """Compile the backward boundary-summary engine for every bucket once (neutral dummy inputs)."""
+    global _PREWARMED_BWD
+    if _PREWARMED_BWD:
+        return
+    _PREWARMED_BWD = True
+    H, K = q.shape[1], q.shape[2]
+    HK = k.shape[1]
+    HO = g.shape[1]
+    V = do.shape[2]
+    fill_g = _neutral_gate_fill(gate_kwargs)
+    for length in _buckets_up_to(total):
+        cu = torch.tensor([0, length], dtype=torch.int32, device=k.device)
+        ops.kimi_delta_attention_summary_bwd(
+            torch.zeros((length, H, K), dtype=q.dtype, device=q.device),
+            torch.zeros((length, HK, K), dtype=k.dtype, device=k.device),
+            torch.full((length, HO, K), fill_g, dtype=g.dtype, device=g.device),
+            torch.zeros((length, HO), dtype=beta.dtype, device=beta.device),
+            torch.zeros((length, HO, V), dtype=do.dtype, device=do.device),
+            cu,
+            scale=scale,
+            d_final_state=None,
+            output_transition=True,
+            use_qk_l2norm_in_kernel=flags["use_qk_l2norm_in_kernel"],
+            use_beta_sigmoid_in_kernel=flags["use_beta_sigmoid_in_kernel"],
+            allow_neg_eigval=flags["allow_neg_eigval"],
+            **gate_kwargs,
+        )
+
+
 def _pad_state_nseq(state: Optional[torch.Tensor], target_n: int) -> Optional[torch.Tensor]:
     """Pad a per-sequence state ``[N_local, ...]`` to ``[target_n, ...]`` with zero rows."""
     if state is None or state.shape[0] >= target_n:
@@ -160,6 +246,8 @@ class CudnnSummaryProducer:
     def initial_state(self, k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags):
         """Summarise the crossing-out sequence, exchange, fold the predecessors' blocks."""
         ops = _ops.ops()
+        if _cp_prewarm_enabled():
+            _prewarm_summary_fwd(ops, k, v, g, beta, cu_list[-1], gate_kwargs, flags)
         group = cp_context.group
         rank = dist.get_rank(group)
         HO, V, K = v.shape[1], v.shape[2], k.shape[2]
@@ -202,6 +290,8 @@ class CudnnSummaryProducer:
     ):
         """Reverse-summarise the crossing-in sequence, exchange, fold the successors' blocks."""
         ops = _ops.ops()
+        if _cp_prewarm_enabled():
+            _prewarm_summary_bwd(ops, q, k, g, beta, do, cu_list[-1], scale, gate_kwargs, flags)
         group = cp_context.group
         rank = dist.get_rank(group)
         HO, V, K = do.shape[1], do.shape[2], k.shape[2]
