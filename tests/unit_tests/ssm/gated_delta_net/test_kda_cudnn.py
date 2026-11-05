@@ -856,6 +856,41 @@ def test_fused_affine_fold_matches_oracle(step):
     _assert_relative_l2(out[0], reference, 2e-3, f"fused fold (step={step})")
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the padded-copy kernel is a CUDA Triton kernel."
+)
+@pytest.mark.parametrize("fill", [0.0, -1.0e4], ids=["zero", "neutral-gate"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_padded_copy_matches_reference(fill, dtype):
+    """The single masked-write ``_padded_copy`` reproduces ``_pad_window``'s new_full + copy exactly.
+
+    This is the stage-4 bucket padding before each frost summary: one kernel instead of a fill plus a
+    copy, numerically identical for every (length, operand shape, fill) the summary hands it.
+    """
+    from megatron.core.ssm.gated_delta_net.cudnn_kda.cp import HAVE_TRITON, _padded_copy
+
+    if not HAVE_TRITON:
+        pytest.skip("Triton is required for the padded-copy kernel.")
+    device = torch.cuda.current_device()
+    gen = torch.Generator().manual_seed(17)
+    # (T, bucket length, trailing dims): a boundary window below the bucket, an already-bucket window,
+    # and a few operand layouts (k/v [HK, K], gate [HO, K], beta [HO]).
+    cases = [
+        (300, 1024, (4, _HEAD_DIM)),
+        (812, 1024, (3, _HEAD_DIM)),
+        (7, 1024, (2, 16)),
+        (1024, 1024, (4,)),
+        (500, 2048, (6,)),
+    ]
+    for t_rows, length, rest in cases:
+        window = torch.randn(t_rows, *rest, generator=gen).to(device=device, dtype=dtype)
+        got = _padded_copy(window, length, fill)
+        ref = window.new_full((length,) + rest, fill)
+        ref[:t_rows] = window
+        assert got.shape == ref.shape and got.dtype == ref.dtype
+        assert torch.equal(got, ref), f"t_rows={t_rows} length={length} rest={rest}"
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the symm-mem exchange needs CUDA.")
 @pytest.mark.skipif(

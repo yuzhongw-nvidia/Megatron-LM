@@ -108,8 +108,53 @@ def _bucket_len(tokens: int) -> int:
     return max(_MIN_BUCKET, 1 << max(tokens - 1, 0).bit_length())
 
 
+if HAVE_TRITON:
+
+    @triton.jit
+    def _padded_copy_kernel(win_ptr, out_ptr, t_rows, inner, total, fill, BLOCK: tl.constexpr):
+        """One masked write of a ``[T, inner]`` window into a ``[length, inner]`` output.
+
+        Flat over the output: a lane whose row ``offs // inner`` is ``< t_rows`` copies the window
+        element (same flat index -- both are ``inner``-strided and share the leading rows); the rest
+        read ``fill`` through the masked load's ``other``.  One launch replaces ``new_full`` (the
+        elementwise fill of every row) + the copy of the first ``T`` rows.
+        """
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < total
+        in_window = (offs // inner) < t_rows
+        val = tl.load(win_ptr + offs, mask=mask & in_window, other=fill)
+        tl.store(out_ptr + offs, val, mask=mask)
+
+
+def _padded_copy(window: torch.Tensor, length: int, fill: float = 0.0) -> torch.Tensor:
+    """``window`` ``[T, ...]`` -> contiguous ``[length, ...]`` in ONE masked-write kernel."""
+    t_rows = window.shape[0]
+    rest = tuple(window.shape[1:])
+    if t_rows >= length:
+        return window.contiguous()
+    inner = 1
+    for dim in rest:
+        inner *= dim
+    out = torch.empty((length,) + rest, dtype=window.dtype, device=window.device)
+    win = window.contiguous()
+    total = length * inner
+    block = 1024
+    grid = (triton.cdiv(total, block),)
+    _padded_copy_kernel[grid](win, out, t_rows, inner, total, float(fill), BLOCK=block)
+    return out
+
+
 def _pad_window(window: torch.Tensor, length: int, fill: float = 0.0) -> torch.Tensor:
-    """``window`` ``[T, ...]`` -> a contiguous ``[length, ...]`` copy, trailing rows ``fill``."""
+    """``window`` ``[T, ...]`` -> a contiguous ``[length, ...]`` copy, trailing rows ``fill``.
+
+    The bucket padding before each frost summary: one masked-write kernel on CUDA when Triton is
+    available (``_padded_copy``), instead of a ``new_full`` fill plus a copy of the live rows -- the
+    4 (forward) / 5 (backward) per-operand ``new_full`` + ``copy`` pairs collapse to one kernel each.
+    Falls back to the ``new_full`` + copy on CPU or without Triton (numerically identical).
+    """
+    if HAVE_TRITON and window.is_cuda:
+        return _padded_copy(window, length, fill)
     out = window.new_full((length,) + tuple(window.shape[1:]), fill)
     out[: window.shape[0]] = window
     return out
