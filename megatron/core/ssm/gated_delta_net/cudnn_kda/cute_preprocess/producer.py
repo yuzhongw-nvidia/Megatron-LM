@@ -357,13 +357,23 @@ class CuTeRawPreprocessProducer(CuTePreprocessProducer):
 
     @staticmethod
     def _front_half():
-        """The forward front-half implementation: fused CuTe kernel or torch oracle."""
+        """The forward front-half implementation: fused CuTe kernel(s) or torch oracle.
+
+        ``MCORE_KDA_CUTE_RAW_FUSED_FWD=1`` selects the fused CuTe kernel -- the
+        tensor-core one (``front_fwd_tc``: solve + w/u on the MMA) by default, or
+        the SIMT one (``front_fwd``) when ``MCORE_KDA_CUTE_RAW_SIMT=1``.  Unset
+        keeps the torch oracle (the CP2 parity reference).
+        """
         import os
 
         if os.environ.get("MCORE_KDA_CUTE_RAW_FUSED_FWD") == "1":
-            from .front_fwd import front_half_fwd_cute
+            if os.environ.get("MCORE_KDA_CUTE_RAW_SIMT") == "1":
+                from .front_fwd import front_half_fwd_cute
 
-            return front_half_fwd_cute
+                return front_half_fwd_cute
+            from .front_fwd_tc import front_half_fwd_tc
+
+            return front_half_fwd_tc
         from .eat_raw_ref import front_half_fwd
 
         return front_half_fwd
