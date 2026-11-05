@@ -128,6 +128,14 @@ def test_subchunk_solve_matches_direct(bc):
     assert _rel_l2(eat_raw_ref.solve_tril_subchunked(a, bc), eat_raw_ref.solve_tril(a)) < _TOL
 
 
+def test_solve_tril_gemm_matches_direct():
+    """The squaring/matmul inverse (tensor-core kernel shape) == forward substitution."""
+    gen = torch.Generator().manual_seed(5)
+    raw = torch.randn(2, 3, _BT, _BT, dtype=_F64, generator=gen) * 0.1
+    a = raw.masked_fill(torch.triu(torch.ones(_BT, _BT, dtype=torch.bool), 0), 0)
+    assert _rel_l2(eat_raw_ref.solve_tril_gemm(a), eat_raw_ref.solve_tril(a)) < _TOL
+
+
 def test_wy_representation_shapes_and_kg():
     """``wy_representation`` returns right-shaped w/u/kg; kg is unit at the chunk end."""
     k, v, g, beta = _rand_inputs(1)

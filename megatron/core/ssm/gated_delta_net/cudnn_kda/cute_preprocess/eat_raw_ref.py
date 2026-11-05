@@ -125,6 +125,26 @@ def solve_tril_subchunked(a: torch.Tensor, bc: int = 16) -> torch.Tensor:
     return x - torch.eye(bt, dtype=a.dtype, device=a.device)
 
 
+def solve_tril_gemm(a: torch.Tensor) -> torch.Tensor:
+    """``(I - A)^{-1} - I`` for a strictly-lower ``A``, as a product of matmuls (no row loop).
+
+    ``A`` is nilpotent (``A^BT == 0``), so ``(I - A)^{-1} = sum_k A^k =
+    prod_{i=0}^{ceil(log2 BT)-1} (I + A^(2^i))`` -- the Neumann series collapsed by
+    repeated squaring: ``ceil(log2 BT)`` (6 at ``BT == 64``) squarings of ``A`` and
+    as many products.  This is the gemm form the tensor-core kernel runs (vs
+    :func:`solve_tril`'s sequential forward substitution); equal to it up to fp
+    reassociation (``test_solve_tril_gemm``).
+    """
+    bt = a.shape[-1]
+    eye = torch.eye(bt, dtype=a.dtype, device=a.device)
+    inv = eye + a
+    p = a
+    for _ in range(1, (bt - 1).bit_length()):
+        p = p @ p
+        inv = inv @ (eye + p)
+    return inv - eye
+
+
 def wy_representation(
     kc: torch.Tensor, vc: torch.Tensor, gc: torch.Tensor, bc: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -133,10 +153,12 @@ def wy_representation(
     ``Akk = (I - stril(A))^{-1}`` with column ``i`` scaled by ``beta_i``;
     ``w = Akk @ (k * 2^g)``, ``u = Akk @ v``, ``kg = k * 2^(g_last - g)``.
     Shapes: ``kc/gc`` ``[..., BT, K]``, ``vc`` ``[..., BT, V]``, ``bc`` ``[..., BT]``.
+    The inverse uses the gemm form (:func:`solve_tril_gemm`), so the whole front
+    half is batched matmuls (the tensor-core kernel's shape), no per-row loop.
     """
     bt = kc.shape[-2]
     eye = torch.eye(bt, dtype=kc.dtype, device=kc.device)
-    akk = (solve_tril(_intra_A(kc, gc, bc)) + eye) * bc[..., None, :]
+    akk = (solve_tril_gemm(_intra_A(kc, gc, bc)) + eye) * bc[..., None, :]
     w = akk @ (gc.exp() * kc)
     u = akk @ vc
     g_last = gc[..., -1:, :]
