@@ -117,6 +117,9 @@ _CP_STATE_PRODUCERS = [
     # Same frost summaries + all-gather as "cudnn", one fused Triton kernel for the fp32 fold; runs
     # wherever the cuDNN backend does (no extra toolchain), so it carries the shared GPU marks only.
     "cudnn_fused",
+    # Same summaries + fused fold, but the all-gather x2 becomes a symmetric-memory push + signal
+    # exchange (needs torch.distributed._symmetric_memory with P2P, available on the GB200/GB300 CI).
+    "cudnn_symm",
     pytest.param(
         "cute",
         marks=pytest.mark.skipif(
@@ -388,7 +391,7 @@ def test_kda_cudnn_backend_rejects_deterministic_mode():
 def test_kda_cudnn_cp_state_producer_knob():
     """The boundary-state producer knob: default, both values, and its two rejections."""
     assert _make_config().kda_cudnn_cp_state_producer == "cudnn"
-    for producer in ("cudnn", "cudnn_fused", "cute"):
+    for producer in ("cudnn", "cudnn_fused", "cudnn_symm", "cute"):
         config = replace(
             _make_config(), kda_kernel_backend="cudnn", kda_cudnn_cp_state_producer=producer
         )
@@ -396,14 +399,15 @@ def test_kda_cudnn_cp_state_producer_knob():
         assert config.cuda_graph_impl == "none"
     with pytest.raises(ValueError, match="kda_cudnn_cp_state_producer must be"):
         replace(_make_config(), kda_cudnn_cp_state_producer="triton")
-    # The CuTe producer spins on symmetric-memory flags and runs host collectives: no CUDA graphs.
-    with pytest.raises(ValueError, match="CUDA-graph"):
-        replace(
-            _make_config(),
-            kda_kernel_backend="cudnn",
-            kda_cudnn_cp_state_producer="cute",
-            cuda_graph_impl="local",
-        )
+    # The CuTe and symm producers exchange states through symmetric memory: no CUDA graphs.
+    for symm_producer in ("cute", "cudnn_symm"):
+        with pytest.raises(ValueError, match="CUDA-graph"):
+            replace(
+                _make_config(),
+                kda_kernel_backend="cudnn",
+                kda_cudnn_cp_state_producer=symm_producer,
+                cuda_graph_impl="local",
+            )
     # The conflict check only applies to the cuDNN backend; FLA ignores the producer knob.
     # (``replace`` carries the resolved inference_cuda_graph_scope of the cuda_graph_impl="none"
     # base config over, so it is reset to let __post_init__ derive the one for "local".)
@@ -850,6 +854,65 @@ def test_fused_affine_fold_matches_oracle(step):
         [h[r].double() for r in order], [m[r].double() for r in order]
     )[0].float()
     _assert_relative_l2(out[0], reference, 2e-3, f"fused fold (step={step})")
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the symm-mem exchange needs CUDA.")
+@pytest.mark.skipif(
+    Utils.world_size < 2, reason="the symm-mem exchange needs >= 2 distributed ranks."
+)
+def test_cudnn_symm_exchange_stress():
+    """Hammer the ``cudnn_symm`` (H, M) symmetric-memory exchange to pin its cross-rank memory order.
+
+    Isolates ``cp._SymmHMExchange`` (no summary, no fold): each rank writes a known, iteration-varying
+    value into its consumers' buffer slots, signals, waits on its producers, and asserts every
+    predecessor (forward) / successor (backward) slot of its OWN buffer holds that producer's exact
+    value. Run x100 so a missing ``put_signal`` release / ``wait_signal`` acquire would surface as a
+    stale or absent slot on some iteration rather than passing by luck once.
+    """
+    from megatron.core.ssm.gated_delta_net.cudnn_kda.cp import _SymmHMExchange
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=Utils.world_size,
+    )
+    try:
+        group = parallel_state.get_context_parallel_group()
+        rank = torch.distributed.get_rank(group)
+        world = torch.distributed.get_world_size(group)
+        device = torch.cuda.current_device()
+        ho, v, k = 4, _HEAD_DIM, _HEAD_DIM
+        try:
+            exchange = _SymmHMExchange(group, ho, v, k, torch.device("cuda", device))
+        except Exception as reason:  # pragma: no cover - environment dependent
+            pytest.skip(f"torch symmetric memory is unavailable here: {reason}")
+
+        def value(producer_rank, iteration):
+            return 1000.0 * (producer_rank + 1) + iteration
+
+        for iteration in range(100):
+            h = torch.full((ho, v, k), value(rank, iteration), device=device, dtype=torch.float32)
+            m = torch.full((ho, k, k), value(rank, iteration), device=device, dtype=torch.float32)
+
+            par = exchange.exchange_forward(h, m)
+            forward_buffer = exchange.buf[par]  # [world, ho, v+k, k], predecessor slots live
+            for producer in range(rank):  # every earlier rank pushed into this rank's buffer
+                expected = value(producer, iteration)
+                assert torch.allclose(
+                    forward_buffer[producer], torch.full_like(forward_buffer[producer], expected)
+                ), f"forward iter={iteration} rank={rank}: predecessor {producer} slot stale/missing"
+
+            par = exchange.exchange_backward(h, m)
+            backward_buffer = exchange.buf[par]  # successor slots live
+            for producer in range(rank + 1, world):  # every later rank pushed into this buffer
+                expected = value(producer, iteration)
+                assert torch.allclose(
+                    backward_buffer[producer], torch.full_like(backward_buffer[producer], expected)
+                ), f"backward iter={iteration} rank={rank}: successor {producer} slot stale/missing"
+        torch.cuda.synchronize()
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_kda_gate_out_dtype_follows_backend():

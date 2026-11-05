@@ -552,7 +552,176 @@ class CudnnFusedFoldProducer(CudnnSummaryProducer):
         )
 
 
-_PRODUCERS: dict[str, Any] = {"cudnn": CudnnSummaryProducer, "cudnn_fused": CudnnFusedFoldProducer}
+class _SymmHMExchange:
+    """One rendezvoused fp32 symmetric buffer that exchanges the per-rank (H, M) over NVLink.
+
+    Replaces ``_all_gather_one`` x2: each rank PUSHES its packed ``[HO, V+K, K]`` summary straight
+    into its consumers' buffer slots and signals them; a consumer waits for its producers' signals
+    and then folds its own (now-populated) buffer.  The payload is fp32 -- the symmetric tensor is
+    fp32 natively (cuDNN's summary and the cute producer's ``hm_sym`` are both fp32; cute's bf16 is
+    only an internal fold detail).  Correctness of the write-before-read across ranks rides torch's
+    own ``put_signal`` (release) / ``wait_signal`` (acquire), NOT ``dist.barrier`` (a CPU/NCCL
+    collective that does not order a peer-visible NVLink write).  The buffer is parity-buffered on
+    ``step % 2`` so a step's writes do not clobber the previous step's unread slots.  One instance
+    per ``(group, HO, V, K)`` serves every KDA layer (its ``step`` advances in the collective order
+    the autograd function guarantees); constructing it is a collective ``rendezvous``.
+    """
+
+    _FWD, _BWD = 0, 1
+
+    def __init__(self, group, ho: int, v: int, k: int, device):
+        import torch.distributed._symmetric_memory as symm_mem
+
+        self.group = group
+        self.R = dist.get_world_size(group)
+        self.rank = dist.get_rank(group)
+        self.ho, self.v, self.k, self.width = ho, v, k, v + k
+        self._shape = (2, self.R, ho, self.width, k)
+        self.buf = symm_mem.empty(self._shape, dtype=torch.float32, device=device)
+        self.buf.zero_()
+        self.handle = symm_mem.rendezvous(self.buf, group)
+        torch.cuda.synchronize()
+        dist.barrier(
+            group=group
+        )  # buffer zeroed everywhere before any peer write (construction only)
+        # Separate forward/backward step counters so each direction's parity ALTERNATES across its own
+        # consecutive calls (a shared counter would make forward always land on one parity -- the two
+        # directions interleave -- and lose the cross-step protection).  Forward writes a consumer's
+        # predecessor slots and backward its successor slots, which are disjoint, so the two directions
+        # safely share one buffer even when their parities coincide.
+        self.fwd_step = 0
+        self.bwd_step = 0
+
+    def _write_peer(self, consumer: int, par: int, h: torch.Tensor, m: torch.Tensor) -> None:
+        """Write this rank's (H, M) into ``consumer``'s buffer slot ``[par, self.rank]`` (NVLink)."""
+        slot = self.handle.get_buffer(consumer, self._shape, torch.float32)[par, self.rank]
+        slot[:, : self.v, :] = h
+        slot[:, self.v :, :] = m
+
+    def exchange_forward(self, h: torch.Tensor, m: torch.Tensor) -> int:
+        """Push (H, M) to every later rank + wait every earlier rank's push; return the parity.
+
+        A producer signals, and a consumer waits on, EVERY earlier/later rank (one matched
+        signal per pair), so no signal is left dangling; the fold then reads only its
+        ``[rank-pre, rank)`` sub-range of the populated buffer.
+        """
+        self.fwd_step += 1
+        par = self.fwd_step % 2
+        for consumer in range(self.rank + 1, self.R):
+            self._write_peer(consumer, par, h, m)
+            self.handle.put_signal(consumer, channel=self._FWD)
+        for producer in range(0, self.rank):
+            self.handle.wait_signal(producer, channel=self._FWD)
+        return par
+
+    def exchange_backward(self, g: torch.Tensor, t: torch.Tensor) -> int:
+        """Mirror of :meth:`exchange_forward`: push to every earlier rank, wait every later rank."""
+        self.bwd_step += 1
+        par = self.bwd_step % 2
+        for consumer in range(0, self.rank):
+            self._write_peer(consumer, par, g, t)
+            self.handle.put_signal(consumer, channel=self._BWD)
+        for producer in range(self.rank + 1, self.R):
+            self.handle.wait_signal(producer, channel=self._BWD)
+        return par
+
+
+_SYMM_EXCHANGES: dict[tuple, _SymmHMExchange] = {}
+
+
+def _get_symm_hm_exchange(group, ho: int, v: int, k: int, device) -> _SymmHMExchange:
+    """The cached per-``(group, HO, V, K)`` symmetric exchange (``rendezvous`` runs once)."""
+    key = (id(group), ho, v, k, getattr(device, "index", device))
+    exch = _SYMM_EXCHANGES.get(key)
+    if exch is None:
+        exch = _SymmHMExchange(group, ho, v, k, device)
+        _SYMM_EXCHANGES[key] = exch
+    return exch
+
+
+def _symm_fold(
+    hm_par: torch.Tensor, v: int, *, n_local: int, live_slot: int, start: int, count: int, step: int
+) -> torch.Tensor:
+    """Fold the live boundary slot straight from the symm buffer's populated parity slab.
+
+    ``hm_par`` is ``[R, HO, V+K, K]`` (this rank's buffer after the exchange).  Its ``H`` / ``M``
+    halves are strided views (rows ``[0,V)`` and ``[V,V+K)``), handed to the SAME verified stage-2
+    ``_affine_fold_kernel`` -- no gather, no staging copy, the fold reads the exchanged state in
+    place.
+    """
+    _, ho, _width, k = hm_par.shape
+    h_view = hm_par[:, :, :v, :]  # [R, HO, V, K] (strided)
+    m_view = hm_par[:, :, v:, :]  # [R, HO, K, K] (strided)
+    out = torch.empty((n_local, ho, v, k), dtype=torch.float32, device=hm_par.device)
+    if n_local > 1:
+        if live_slot == 0:
+            out[1:].zero_()
+        else:
+            out[:-1].zero_()
+    _launch_affine_fold(h_view, m_view, out[live_slot], start, count, step)
+    return out
+
+
+class CudnnSymmFoldProducer(CudnnFusedFoldProducer):
+    """cuDNN frost summaries, a SYMMETRIC-MEMORY exchange (no ``all_gather``), and the fused fold.
+
+    Keeps the frost summary (``_summarize_fwd/_bwd``) and the stage-2 fp32 fold kernel, and replaces
+    the ``_all_gather_one`` x2 exchange with :class:`_SymmHMExchange`: each rank pushes its (H, M)
+    into its consumers' buffers over NVLink, waits on its producers' ``put_signal`` releases, and
+    folds the populated buffer in place.  Numerically identical to ``cudnn`` / ``cudnn_fused`` (same
+    summary, same fp32 composition); the exchange's cross-rank memory ordering is pinned by the
+    ``test_cudnn_symm_exchange_stress`` round-trip.  Not CUDA-graphable (the signals spin), like the
+    cute producer.
+    """
+
+    def initial_state(self, k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags):
+        """Summarise + symmetric-memory exchange + fused fp32 fold of the predecessors' blocks."""
+        h, m, HO, V, K = self._summarize_fwd(k, v, g, beta, cu_list, cp_context, gate_kwargs, flags)
+        n_local = len(cu_list) - 1
+        exch = _get_symm_hm_exchange(cp_context.group, HO, V, K, k.device)
+        par = exch.exchange_forward(h, m)
+        if cp_context.is_first_rank:
+            return _zeros_boundary_state(n_local, HO, V, K, k.device)
+        rank = exch.rank
+        return _symm_fold(
+            exch.buf[par],
+            V,
+            n_local=n_local,
+            live_slot=0,
+            start=rank - cp_context.pre_num_ranks,  # ascending, document start first
+            count=cp_context.pre_num_ranks,
+            step=1,
+        )
+
+    def final_state_grad(
+        self, q, k, g, beta, do, cu, cu_list, cp_context, scale, gate_kwargs, flags
+    ):
+        """Reverse-summarise + symmetric-memory exchange + fused fp32 fold of the successors' blocks."""
+        gsum, tr, HO, V, K = self._summarize_bwd(
+            q, k, g, beta, do, cu_list, cp_context, scale, gate_kwargs, flags
+        )
+        n_local = len(cu_list) - 1
+        exch = _get_symm_hm_exchange(cp_context.group, HO, V, K, k.device)
+        par = exch.exchange_backward(gsum, tr)
+        if cp_context.is_last_rank:
+            return _zeros_boundary_state(n_local, HO, V, K, k.device)
+        rank = exch.rank
+        return _symm_fold(
+            exch.buf[par],
+            V,
+            n_local=n_local,
+            live_slot=n_local - 1,
+            start=rank + cp_context.post_num_ranks,  # descending, document end first
+            count=cp_context.post_num_ranks,
+            step=-1,
+        )
+
+
+_PRODUCERS: dict[str, Any] = {
+    "cudnn": CudnnSummaryProducer,
+    "cudnn_fused": CudnnFusedFoldProducer,
+    "cudnn_symm": CudnnSymmFoldProducer,
+}
 
 
 def register_boundary_state_producer(name: str, factory) -> None:
