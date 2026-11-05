@@ -331,16 +331,38 @@ class CuTeRawPreprocessProducer(CuTePreprocessProducer):
     the RAW ``k`` / ``v`` / ``g`` / ``beta`` directly, the terminal state being a
     single CuTe kernel that also runs the scan.
 
-    The front-half here is the device-independent torch reference: correct by
-    construction (the CP2 parity oracle) but not the fused tcgen05 kernel, so it
-    trades the FLA Triton glue for torch ops rather than fusing them into the scan
-    launch.  It validates the eat-raw interface, the boundary window / ragged
-    handling and CP parity end to end; the fused forward kernel replaces this
-    ``front_half_fwd`` call in place.  The backward is inherited unchanged from
-    ``CuTePreprocessProducer`` (FLA glue) -- forward first.
+    Two front-half implementations, selected by the ``MCORE_KDA_CUTE_RAW_FUSED_FWD``
+    environment variable:
+
+    * unset / "0" (default): the device-independent torch reference
+      :func:`eat_raw_ref.front_half_fwd` -- correct by construction (the CP2
+      parity oracle, verified to FLA's ``naive_chunk_kda`` by
+      ``test_kda_cute_eat_raw``), but trades the FLA Triton glue for torch ops
+      rather than fusing them into one launch.  Use it to validate the eat-raw
+      interface / window / ragged handling / CP parity with zero kernel risk.
+    * "1": the fused CuTe DSL kernel :func:`front_fwd.front_half_fwd_cute` -- one
+      launch replacing the glue (chunk cumsum + ``A`` + ``solve_tril`` +
+      ``w`` / ``u`` / ``kg``).  First-draft, GPU-validation pending; the oracle
+      above is its numerical target.
+
+    Either way the backward is inherited unchanged from ``CuTePreprocessProducer``
+    (FLA glue) -- forward first.
     """
 
     name = "cute_raw"
+
+    @staticmethod
+    def _front_half():
+        """The forward front-half implementation: fused CuTe kernel or torch oracle."""
+        import os
+
+        if os.environ.get("MCORE_KDA_CUTE_RAW_FUSED_FWD") == "1":
+            from .front_fwd import front_half_fwd_cute
+
+            return front_half_fwd_cute
+        from .eat_raw_ref import front_half_fwd
+
+        return front_half_fwd
 
     def initial_state(
         self, k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags
@@ -355,7 +377,7 @@ class CuTeRawPreprocessProducer(CuTePreprocessProducer):
             raise NotImplementedError(
                 "the CuTe raw CP preprocess producer cannot run under CUDA-graph capture"
             )
-        from .eat_raw_ref import front_half_fwd
+        front_half_fwd = self._front_half()
 
         _check_envelope(k, v, flags)
         ensure_cp_context_metadata(cp_context)
