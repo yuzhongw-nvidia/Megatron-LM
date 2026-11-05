@@ -46,19 +46,34 @@ def _chunk(x: torch.Tensor, nt: int, last: int) -> torch.Tensor:
     return x.permute(1, 0, 2).reshape(hv, nt, CHUNK_SIZE, last)
 
 
-def _intra_A(kc: torch.Tensor, gc: torch.Tensor, bc: torch.Tensor) -> torch.Tensor:
-    """Strictly-lower intra-chunk matrix.
+def _intra_A(
+    kc: torch.Tensor, gc: torch.Tensor, bc: torch.Tensor, bc_block: int = 16
+) -> torch.Tensor:
+    """Strictly-lower intra-chunk matrix (sub-chunk referenced, overflow-safe).
 
     ``A[..., c, i] = -beta_c * <k_c * 2^(g_c - g_i), k_i>`` for ``c > i`` (else 0),
-    with ``gc`` the chunk-local gate cumsum.  Written as a single decayed gemm
-    ``A = -tril(beta_c * (k e^{g}) @ (k e^{-g})^T, -1)``; the kernel bounds the
-    ``e^{-g}`` range by sub-chunking (``BC = 16``), which does not change the
-    result (``test_subchunk_solve_matches_direct``).
+    with ``gc`` the chunk-local gate cumsum.  The naive single-gemm factorisation
+    ``(k e^{g}) @ (k e^{-g})^T`` overflows in fp32 once the cumulative chunk decay
+    is large (the bounded gate reaches ``-5`` per token, so ``e^{-g}`` can exceed
+    fp32's ``e^88`` over a 64-chunk).  The kernel -- and FLA -- bound the range by
+    building ``A`` over ``bc_block`` (16) blocks, each referenced to its row
+    block's leading cumsum ``gc_ref``: ``e^{g_c - g_ref}`` and ``e^{g_ref - g_i}``
+    then both stay within one block's decay span.  Algebraically exact
+    (``e^{g_c - g_ref} e^{g_ref - g_i} = e^{g_c - g_i}``), so the result equals the
+    direct build up to fp reassociation.
     """
-    bt = kc.shape[-2]
-    kd = kc * gc.exp()  # k * e^{g}
-    ke = kc * (-gc).exp()  # k * e^{-g}
-    a = (kd @ ke.transpose(-1, -2)) * bc[..., None]  # [..., BT, BT], row-scaled by beta
+    bt, kdim = kc.shape[-2], kc.shape[-1]
+    nb = bt // bc_block
+    a = kc.new_zeros(tuple(kc.shape[:-1]) + (bt,))
+    for r in range(nb):
+        rs = slice(r * bc_block, (r + 1) * bc_block)
+        ref = gc[..., r * bc_block, :].unsqueeze(-2)  # [..., 1, K] row-block leader
+        kd_r = kc[..., rs, :] * (gc[..., rs, :] - ref).exp()  # e^{g_c - g_ref} <= 1
+        for c in range(r + 1):  # only row block >= col block can be non-zero
+            cs = slice(c * bc_block, (c + 1) * bc_block)
+            ke_c = kc[..., cs, :] * (ref - gc[..., cs, :]).exp()
+            a[..., rs, cs] = kd_r @ ke_c.transpose(-1, -2)
+    a = a * bc[..., None]  # row scale by beta_c
     mask_incl = torch.triu(torch.ones(bt, bt, dtype=torch.bool, device=a.device), diagonal=0)
     return -a.masked_fill(mask_incl, 0)
 
@@ -157,6 +172,107 @@ def eat_raw_summary_fwd(
         big_h = big_h * gamma + kg.transpose(-1, -2) @ xh
         big_m = big_m * gamma + kg.transpose(-1, -2) @ xm
     return big_h, big_m
+
+
+_RCP_LN2 = 1.4426950408889634  # 1 / ln(2); FLA's log-decay -> log2 scale
+
+
+def _apply_gate(g: torch.Tensor, gate_kwargs: dict) -> torch.Tensor:
+    """Raw cuDNN gate operand ``g`` ``[T, HV, K]`` -> per-token log-decay (fp32).
+
+    Mirrors ``producer._gate_cumsum`` / FLA's ``kda_gate_chunk_cumsum`` pre-cumsum
+    step: the bounded ("safe") gate ``lower_bound * sigmoid(exp(a_log)*(g+dt_bias))``,
+    or ``g`` already the log decay otherwise.  The softplus (unbounded) form has no
+    fused kernel in this backend and is applied upstream, so it arrives here as the
+    log decay too (``safe_gate`` false).
+    """
+    g = g.float()
+    if not gate_kwargs.get("safe_gate"):
+        return g
+    a_log = gate_kwargs.get("a_log")
+    lower_bound = gate_kwargs.get("gate_lower_bound")
+    if a_log is None or lower_bound is None:
+        raise ValueError("front_half_fwd safe_gate needs a_log and gate_lower_bound")
+    hv, kdim = g.shape[-2], g.shape[-1]
+    inner = g
+    dt_bias = gate_kwargs.get("dt_bias")
+    if dt_bias is not None:
+        inner = inner + dt_bias.float().reshape(hv, kdim)
+    return float(lower_bound) * torch.sigmoid(a_log.float().reshape(hv, 1).exp() * inner)
+
+
+def _chunk_cumsum(ld: torch.Tensor) -> torch.Tensor:
+    """Chunk-local (BT=64) cumsum of the log-decay ``ld`` ``[Tpad, HV, K]`` (fp32).
+
+    ``Tpad`` is a multiple of 64; the cumsum restarts at every chunk boundary.
+    """
+    tpad, hv, kdim = ld.shape
+    nt = tpad // CHUNK_SIZE
+    return ld.reshape(nt, CHUNK_SIZE, hv, kdim).cumsum(1).reshape(tpad, hv, kdim)
+
+
+def front_half_fwd(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    gate_kwargs: dict,
+    io_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused forward front-half: raw window operands -> ``(w, u, kg, gk)``.
+
+    Torch reference of the work the eat-raw kernel does, replacing FLA's
+    ``kda_gate_chunk_cumsum`` + ``chunk_kda_fwd_intra`` glue.  Inputs are the
+    boundary window (THD, ``B == 1`` dropped): ``k`` ``[T, HV, K]``, ``v``
+    ``[T, HV, V]``, ``g`` ``[T, HV, K]`` the raw gate operand, ``beta`` ``[T, HV]``
+    post-sigmoid; ``HV == H`` (the backend refuses grouped value attention).
+    Returns the operands the fused CP scan kernel consumes, with the chunk/batch
+    layout it expects: ``w`` ``[1, T, HV, K]`` io-dtype, ``u`` ``[1, T, HV, V]``
+    io-dtype, ``kg`` ``[1, T, HV, K]`` io-dtype, ``gk`` ``[1, T, HV, K]`` fp32.
+
+    A ragged last chunk is padded to 64 with neutral tokens (``k = v = beta = 0``,
+    log-decay 0): the pad rows add nothing to the real rows' WY transform and are
+    trimmed from the outputs, matching FLA's own chunk kernels.
+    """
+    t, hv, kdim = k.shape
+    vdim = v.shape[-1]
+    nt = (t + CHUNK_SIZE - 1) // CHUNK_SIZE
+    tpad = nt * CHUNK_SIZE
+
+    def _pad(x):
+        if x.shape[0] == tpad:
+            return x.float()
+        out = x.new_zeros((tpad,) + tuple(x.shape[1:]), dtype=torch.float32)
+        out[:t] = x.float()
+        return out
+
+    ld = _apply_gate(g, gate_kwargs)  # [T, HV, K] log-decay
+    ld_p = _pad(ld)  # pad rows: log-decay 0 (decay == 1, neutral)
+    gc = _chunk_cumsum(ld_p)  # [Tpad, HV, K] natural-log chunk cumsum
+    k_p, v_p, b_p = _pad(k), _pad(v), _pad(beta)
+
+    # [HV, NT, BT, .]
+    kc = k_p.permute(1, 0, 2).reshape(hv, nt, CHUNK_SIZE, kdim)
+    vc = v_p.permute(1, 0, 2).reshape(hv, nt, CHUNK_SIZE, vdim)
+    gcc = gc.permute(1, 0, 2).reshape(hv, nt, CHUNK_SIZE, kdim)
+    bcc = b_p.permute(1, 0).reshape(hv, nt, CHUNK_SIZE)
+
+    w_c, u_c, kg_c = wy_representation(
+        kc.reshape(hv * nt, CHUNK_SIZE, kdim),
+        vc.reshape(hv * nt, CHUNK_SIZE, vdim),
+        gcc.reshape(hv * nt, CHUNK_SIZE, kdim),
+        bcc.reshape(hv * nt, CHUNK_SIZE),
+    )
+
+    def _unchunk(x, last):
+        x = x.reshape(hv, nt, CHUNK_SIZE, last).permute(1, 2, 0, 3).reshape(tpad, hv, last)
+        return x[:t]
+
+    w = _unchunk(w_c, kdim).to(io_dtype).unsqueeze(0).contiguous()
+    u = _unchunk(u_c, vdim).to(io_dtype).unsqueeze(0).contiguous()
+    kg = _unchunk(kg_c, kdim).to(io_dtype).unsqueeze(0).contiguous()
+    gk = (gc[:t] * _RCP_LN2).unsqueeze(0).contiguous()  # [1, T, HV, K] fp32
+    return w, u, kg, gk
 
 
 # The backward boundary-gradient summary (G, Tr) is the reverse-scan mirror of

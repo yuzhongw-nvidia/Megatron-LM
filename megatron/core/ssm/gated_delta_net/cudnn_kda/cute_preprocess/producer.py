@@ -316,3 +316,72 @@ class CuTePreprocessProducer:
         if cp_context.is_last_rank:
             return None
         return _ops.fla_state_to_cudnn(dht, state_v_first=False)
+
+
+class CuTeRawPreprocessProducer(CuTePreprocessProducer):
+    """Eat-raw forward variant: the WY front-half runs here, not in FLA's Triton glue.
+
+    The ``"cute"`` producer above still hands the fused CP scan kernel FLA's chunk
+    intermediates (``w`` / ``u`` / ``kg`` / ``gk``), produced by the
+    ``kda_gate_chunk_cumsum`` + ``chunk_kda_fwd_intra`` Triton stack and
+    materialised to HBM.  This ``"cute_raw"`` variant replaces that forward glue
+    with :func:`eat_raw_ref.front_half_fwd` -- the gate cumsum + intra-chunk
+    ``A`` + ``solve_tril`` + ``w`` / ``u`` / ``kg`` derivation, verified to FLA's
+    ``naive_chunk_kda`` by ``test_kda_cute_eat_raw`` -- so the forward consumes
+    the RAW ``k`` / ``v`` / ``g`` / ``beta`` directly, the terminal state being a
+    single CuTe kernel that also runs the scan.
+
+    The front-half here is the device-independent torch reference: correct by
+    construction (the CP2 parity oracle) but not the fused tcgen05 kernel, so it
+    trades the FLA Triton glue for torch ops rather than fusing them into the scan
+    launch.  It validates the eat-raw interface, the boundary window / ragged
+    handling and CP parity end to end; the fused forward kernel replaces this
+    ``front_half_fwd`` call in place.  The backward is inherited unchanged from
+    ``CuTePreprocessProducer`` (FLA glue) -- forward first.
+    """
+
+    name = "cute_raw"
+
+    def initial_state(
+        self, k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags
+    ) -> Optional[torch.Tensor]:
+        """Forward boundary state with the WY front-half run from raw operands.
+
+        Collective over ``cp_context.group``; returns the fp32 ``[N_local, HO, V, K]``
+        cuDNN-layout state (slot 0 live) or ``None`` on ``is_first_rank``; refuses
+        CUDA-graph capture.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                "the CuTe raw CP preprocess producer cannot run under CUDA-graph capture"
+            )
+        from .eat_raw_ref import front_half_fwd
+
+        _check_envelope(k, v, flags)
+        ensure_cp_context_metadata(cp_context)
+
+        # The LAST local sequence is the only one that can continue onto a later rank
+        # (FLA / the dispatcher narrow to `cu_seqlens[-2:]`).  Slice without the FLA
+        # batch dim: front_half_fwd takes THD `[T, HV, .]` and re-adds the `[1, ...]`
+        # the scan kernel expects.
+        bos, eos = int(cu_list[-2]), int(cu_list[-1])
+        w, u, kg, gk = front_half_fwd(
+            k[bos:eos], v[bos:eos], g[bos:eos], beta[bos:eos], gate_kwargs
+        )
+        state = _backend.chunk_gated_delta_rule_fwd_h_pre_process_cutedsl(
+            k=kg,
+            w=w,
+            u=u,
+            g=None,
+            gk=gk,
+            bg=None,
+            v=None,
+            chunk_size=CHUNK_SIZE,
+            state_v_first=False,
+            cu_seqlens=cu,
+            context=cp_context,
+            windowed=True,
+        )
+        if cp_context.is_first_rank:
+            return None
+        return _ops.fla_state_to_cudnn(state, state_v_first=False)

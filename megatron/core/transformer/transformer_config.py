@@ -656,13 +656,17 @@ class TransformerConfig(ModelParallelConfig):
     stays required for the causal convolution, L2 norm and the CP context.
     """
 
-    kda_cudnn_cp_state_producer: Literal["cudnn", "cute"] = "cudnn"
+    kda_cudnn_cp_state_producer: Literal["cudnn", "cute", "cute_raw"] = "cudnn"
     """How the cuDNN KDA backend produces the chunkwise-CP boundary states.
 
     ``cudnn`` (default): cuDNN's per-span summaries, an all-gather and a transition fold.
     ``cute``: the fused CuTe DSL preprocess ported from PR #6511 (experimental; needs the CuTe DSL
-    the cuDNN engines need anyway, validated with nvidia-cutlass-dsl 4.8.1).  Only used with
-    ``kda_kernel_backend="cudnn"`` and ``linear_cp_mode="chunkwise"``.
+    the cuDNN engines need anyway, validated with nvidia-cutlass-dsl 4.8.1); it still consumes FLA's
+    ``w`` / ``u`` / ``kg`` / ``gk`` chunk intermediates.  ``cute_raw``: the same fused CP scan, but the
+    forward WY front-half (gate cumsum + ``A`` + ``solve_tril`` + ``w`` / ``u`` / ``kg``) is run from
+    the raw operands instead of FLA's Triton glue (experimental, forward only; the backward uses the
+    ``cute`` path).  All non-``cudnn`` values only apply with ``kda_kernel_backend="cudnn"`` and
+    ``linear_cp_mode="chunkwise"``.
     """
 
     gdn_pre_gated_delta_rule_fusion: bool = False
@@ -2892,20 +2896,20 @@ class TransformerConfig(ModelParallelConfig):
                         "kda_kernel_backend='cudnn' is not deterministic; use 'fla' with "
                         "deterministic_mode=True."
                     )
-                if self.kda_cudnn_cp_state_producer not in ("cudnn", "cute"):
+                if self.kda_cudnn_cp_state_producer not in ("cudnn", "cute", "cute_raw"):
                     raise ValueError(
-                        "kda_cudnn_cp_state_producer must be 'cudnn' or 'cute', "
+                        "kda_cudnn_cp_state_producer must be 'cudnn', 'cute' or 'cute_raw', "
                         f"got {self.kda_cudnn_cp_state_producer!r}."
                     )
                 if (
                     self.kda_kernel_backend == "cudnn"
-                    and self.kda_cudnn_cp_state_producer == "cute"
+                    and self.kda_cudnn_cp_state_producer in ("cute", "cute_raw")
                     and self.cuda_graph_impl != "none"
                 ):
                     raise ValueError(
-                        "kda_cudnn_cp_state_producer='cute' exchanges states through symmetric "
-                        "memory and cannot be CUDA-graphed; use cuda_graph_impl='none' or the "
-                        "'cudnn' producer."
+                        f"kda_cudnn_cp_state_producer={self.kda_cudnn_cp_state_producer!r} exchanges "
+                        "states through symmetric memory and cannot be CUDA-graphed; use "
+                        "cuda_graph_impl='none' or the 'cudnn' producer."
                     )
 
             if (

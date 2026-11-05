@@ -341,10 +341,10 @@ def register_boundary_state_producer(name: str, factory) -> None:
 
 
 def get_boundary_state_producer(name: str) -> BoundaryStateProducer:
-    """Instantiate the registered producer ``name`` (the optional ``cute`` one loads lazily)."""
-    if name == "cute" and name not in _PRODUCERS:
-        # Optional producer (PR #6511's fused CuTe DSL preprocess); registers itself when its
-        # kernels can be imported, else raises with the reason.
+    """Instantiate the registered producer ``name`` (the optional ``cute`` ones load lazily)."""
+    if name in ("cute", "cute_raw") and name not in _PRODUCERS:
+        # Optional producers (PR #6511's fused CuTe DSL preprocess, and its eat-raw forward
+        # variant); register themselves when the kernels import, else raise with the reason.
         from .cute_preprocess import register
 
         register()

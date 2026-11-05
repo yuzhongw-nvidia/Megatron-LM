@@ -121,6 +121,15 @@ _CP_STATE_PRODUCERS = [
             reason=f"cute boundary-state producer unavailable: {_CUTE_PRODUCER_UNAVAILABLE}",
         ),
     ),
+    # Same fused CuTe CP scan as "cute", but the forward WY front-half is run from the raw operands
+    # (eat_raw_ref.front_half_fwd) instead of FLA's Triton glue; shares the cute toolchain gate.
+    pytest.param(
+        "cute_raw",
+        marks=pytest.mark.skipif(
+            _CUTE_PRODUCER_UNAVAILABLE is not None,
+            reason=f"cute_raw boundary-state producer unavailable: {_CUTE_PRODUCER_UNAVAILABLE}",
+        ),
+    ),
 ]
 
 
@@ -385,7 +394,7 @@ def test_kda_cudnn_backend_rejects_deterministic_mode():
 def test_kda_cudnn_cp_state_producer_knob():
     """The boundary-state producer knob: default, both values, and its two rejections."""
     assert _make_config().kda_cudnn_cp_state_producer == "cudnn"
-    for producer in ("cudnn", "cute"):
+    for producer in ("cudnn", "cute", "cute_raw"):
         config = replace(
             _make_config(), kda_kernel_backend="cudnn", kda_cudnn_cp_state_producer=producer
         )
@@ -393,14 +402,15 @@ def test_kda_cudnn_cp_state_producer_knob():
         assert config.cuda_graph_impl == "none"
     with pytest.raises(ValueError, match="kda_cudnn_cp_state_producer must be"):
         replace(_make_config(), kda_cudnn_cp_state_producer="triton")
-    # The CuTe producer spins on symmetric-memory flags and runs host collectives: no CUDA graphs.
-    with pytest.raises(ValueError, match="CUDA-graph"):
-        replace(
-            _make_config(),
-            kda_kernel_backend="cudnn",
-            kda_cudnn_cp_state_producer="cute",
-            cuda_graph_impl="local",
-        )
+    # The CuTe producers spin on symmetric-memory flags and run host collectives: no CUDA graphs.
+    for producer in ("cute", "cute_raw"):
+        with pytest.raises(ValueError, match="CUDA-graph"):
+            replace(
+                _make_config(),
+                kda_kernel_backend="cudnn",
+                kda_cudnn_cp_state_producer=producer,
+                cuda_graph_impl="local",
+            )
     # The conflict check only applies to the cuDNN backend; FLA ignores the producer knob.
     # (``replace`` carries the resolved inference_cuda_graph_scope of the cuda_graph_impl="none"
     # base config over, so it is reset to let __post_init__ derive the one for "local".)

@@ -339,10 +339,10 @@ class KimiDeltaAttention(_GDNBase):
             if reason is not None:
                 raise RuntimeError(f"kda_kernel_backend='cudnn' cannot run here: {reason}")
             producer = getattr(self.config, "kda_cudnn_cp_state_producer", "cudnn")
-            if producer not in ("cudnn", "cute"):
+            if producer not in ("cudnn", "cute", "cute_raw"):
                 raise ValueError(
                     f"Unsupported kda_cudnn_cp_state_producer {producer!r}; "
-                    "expected 'cudnn' or 'cute'."
+                    "expected 'cudnn', 'cute' or 'cute_raw'."
                 )
             # thd_max_packed_sequences caps the packed-document count; under chunkwise CP it also bounds
             # the per-rank sequence count, so the cuDNN CP path uses it to pin the main-kernel plan key's
@@ -354,8 +354,12 @@ class KimiDeltaAttention(_GDNBase):
 
             reason = cute_preprocess.unavailable_reason()
             if reason is not None:
-                raise ImportError(f"kda_cudnn_cp_state_producer='cute' cannot run here: {reason}")
-            return partial(chunk_kda_cudnn, cp_state_producer="cute", cp_pad_nseq=pad_nseq)
+                raise ImportError(
+                    f"kda_cudnn_cp_state_producer={producer!r} cannot run here: {reason}"
+                )
+            # 'cute_raw' shares the fused CuTe CP scan with 'cute'; only the forward WY front-half
+            # differs (run from raw operands vs FLA's glue), so the same availability gate applies.
+            return partial(chunk_kda_cudnn, cp_state_producer=producer, cp_pad_nseq=pad_nseq)
         raise ValueError(f"Unsupported kda_kernel_backend {backend!r}; expected 'fla' or 'cudnn'.")
 
     def _get_in_proj_qkv_layout(self) -> QKVLayout:

@@ -62,8 +62,9 @@ import functools
 from typing import Optional
 
 PRODUCER_NAME = "cute"
+RAW_PRODUCER_NAME = "cute_raw"  # the eat-raw forward variant (producer.CuTeRawPreprocessProducer)
 
-__all__ = ["PRODUCER_NAME", "is_available", "register", "unavailable_reason"]
+__all__ = ["PRODUCER_NAME", "RAW_PRODUCER_NAME", "is_available", "register", "unavailable_reason"]
 
 
 @functools.lru_cache(maxsize=1)
@@ -124,6 +125,7 @@ def register() -> None:
     """
     from megatron.core.ssm.gated_delta_net.cudnn_kda.cp import register_boundary_state_producer
 
-    from .producer import CuTePreprocessProducer
+    from .producer import CuTePreprocessProducer, CuTeRawPreprocessProducer
 
     register_boundary_state_producer(PRODUCER_NAME, CuTePreprocessProducer)
+    register_boundary_state_producer(RAW_PRODUCER_NAME, CuTeRawPreprocessProducer)
