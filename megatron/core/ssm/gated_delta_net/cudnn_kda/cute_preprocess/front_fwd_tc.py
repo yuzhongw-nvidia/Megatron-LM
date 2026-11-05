@@ -5,22 +5,27 @@
 The SIMT :mod:`front_fwd` kernel is correct (passed CP2 parity on GB300) but slow
 by construction -- every A / solve / w / u reduction is a register loop, so the
 batched-torch and SIMT paths both regress KDA step time (+65% vs FLA at the GDR
-level).  This kernel does the two heaviest reductions -- the ``solve_tril``
-(6 squarings) and ``w`` / ``u`` -- on the tensor cores, through the one
-both-operands-from-smem SM80 warp-MMA gemm validated in isolation against torch
+level).  This kernel moves the two heaviest ``w`` / ``u`` reductions onto the
+tensor cores, through the one both-operands-from-smem SM80 warp-MMA gemm validated
+in isolation against torch
 (worklog ``gemm_ss_probe.py``: A@B^T / A@B, (64,64,64)/(64,64,128)/(64,128,64),
 rel-L2 ~3e-8 on Blackwell).  The intra-chunk ``A`` build stays SIMT for now (it is
 overflow-safe via the direct ``exp2`` of the gate difference and needs the
 sub-chunk-referenced block gemms to tensor-core-ise; that is the next step).
 
-Numerics: bf16 operands, fp32 MMA accumulate.  The high solve powers (``A^4``
-onward, entries ``<1e-4``) are ~``I`` so the 6-factor Neumann product
-``(I-A)^{-1} = prod_i (I + A^(2^i))`` keeps its precision from the first two
-factors; if CP2 parity needs more, the bf16 hi/lo 3-pass (``protocol._fold_gemms``)
-drops in per gemm.
+Solve numerics: the ``(I-A)^{-1}`` solve runs the SIMT fp32 forward-substitution
+(ported from :mod:`front_fwd`), NOT a tensor-core Neumann squaring.  The earlier
+bf16 full-[64,64] Neumann product ``(I-A)^{-1} = prod_i (I + A^(2^i))`` was unstable
+on real (weak-decay) training gates: the intermediate powers ``A^16`` / ``A^32``
+overflow bf16 even though the true inverse is well-conditioned (``inv_max ~1``), so
+the weak-decay T=64 windows diverged (rel-L2 1e6..1e12).  The forward-sub is done
+once in fp32 on a scratch tile and the full inverse is rounded into bf16 ``sInv``
+for the ``w`` / ``u`` matmuls (sweep: fp32-solve -> bf16-inv -> bf16 TC w/u worst
+rel-L2 6.4e-3, within the bf16 tolerance).  Numerics elsewhere: bf16 operands, fp32
+MMA accumulate.
 
-Standard matmuls (``p@p``, ``inv@(I+p)``, ``Akk@X``) feed the MMA's ``A@B^T`` with
-the second operand's transpose MATERIALISED contiguous (SIMT), staying on the
+The ``w`` / ``u`` matmuls (``Akk@X``) feed the MMA's ``A@B^T`` with the second
+operand's transpose MATERIALISED contiguous (SIMT), staying on the
 ``transpose=False`` ldmatrix path the probe validated (not a strided view).
 
 Selected by ``MCORE_KDA_CUTE_RAW_FUSED_FWD=1`` (the SIMT kernel stays available
@@ -102,13 +107,12 @@ class FrontHalfFwdTC:
             sv: cute.struct.MemRange[F32, BT * V]
             sgk: cute.struct.MemRange[F32, BT * K]
             sbeta: cute.struct.MemRange[F32, BT]
-            # bf16 [BT,BT] matrices (A / power / inverse / I+p / transpose scratch)
+            # fp32 solve working set: A -> (I-A)^{-1} - I in place, plus the row snapshot
+            sAf: cute.struct.MemRange[F32, BT * BT]
+            srowf: cute.struct.MemRange[F32, BT]
+            # bf16 [BT,BT] matrices: sAb = A-build output, sInv = full inverse for the w/u MMA
             sAb: cute.struct.Align[cute.struct.MemRange[bf16, BT * BT], 1024]
-            sP: cute.struct.Align[cute.struct.MemRange[bf16, BT * BT], 1024]
-            sPn: cute.struct.Align[cute.struct.MemRange[bf16, BT * BT], 1024]
             sInv: cute.struct.Align[cute.struct.MemRange[bf16, BT * BT], 1024]
-            sIp: cute.struct.Align[cute.struct.MemRange[bf16, BT * BT], 1024]
-            sTt: cute.struct.Align[cute.struct.MemRange[bf16, BT * BT], 1024]
             # bf16 [BT,K] operand/result tiles for w/u (sXb beta-scaled X, sScr gemm result,
             # sXbt the materialised transpose [K,BT])
             sXb: cute.struct.Align[cute.struct.MemRange[bf16, BT * K], 1024]
@@ -161,12 +165,10 @@ class FrontHalfFwdTC:
         sv = st.sv.get_tensor(cute.make_layout((BT, V), stride=(V, 1)))
         sgk = st.sgk.get_tensor(cute.make_layout((BT, K), stride=(K, 1)))
         sbeta = st.sbeta.get_tensor(cute.make_layout(BT))
+        sAf = st.sAf.get_tensor(cute.make_layout((BT, BT), stride=(BT, 1)))
+        srowf = st.srowf.get_tensor(cute.make_layout(BT))
         sAb = st.sAb.get_tensor(cute.make_layout((BT, BT), stride=(BT, 1)))
-        sP = st.sP.get_tensor(cute.make_layout((BT, BT), stride=(BT, 1)))
-        sPn = st.sPn.get_tensor(cute.make_layout((BT, BT), stride=(BT, 1)))
         sInv = st.sInv.get_tensor(cute.make_layout((BT, BT), stride=(BT, 1)))
-        sIp = st.sIp.get_tensor(cute.make_layout((BT, BT), stride=(BT, 1)))
-        sTt = st.sTt.get_tensor(cute.make_layout((BT, BT), stride=(BT, 1)))
         sXb = st.sXb.get_tensor(cute.make_layout((BT, K), stride=(K, 1)))
         sScr = st.sScr.get_tensor(cute.make_layout((BT, K), stride=(K, 1)))
         sXbt = st.sXbt.get_tensor(cute.make_layout((K, BT), stride=(BT, 1)))
@@ -232,48 +234,44 @@ class FrontHalfFwdTC:
                 sAb[c, i] = val.to(bf16)
             bar.arrive_and_wait()
 
-            # ---- solve: sInv = (I-A)^{-1} (full inverse) via 6 squarings [tensor-core] ----
-            # sInv = I + A ; sP = A.  The [BT,BT] matrices have only BT (64) columns, so
-            # their column-d SIMT ops must be guarded to threads d < BT (threads BT..2BT-1
-            # still join every barrier + every gemm, which needs all 128 for the 4 warps).
+            # ---- solve: sInv = (I-A)^{-1} (full inverse) via fp32 forward-substitution ----
+            # bf16 full-[64,64] Neumann squaring blows up on real (weak-decay) training
+            # gates -- the intermediate powers A^16 / A^32 overflow bf16 even though the WY
+            # inverse is well-conditioned (inv_max ~1) -- so the solve runs the SIMT fp32
+            # forward-substitution (ported from front_fwd) on an fp32 scratch tile, then
+            # rounds the full inverse into bf16 sInv for the tensor-core w/u matmuls.
+            # The [BT,BT] matrices have only BT (64) columns, so their column-d SIMT ops are
+            # guarded to threads d < BT; threads BT..2BT-1 still join every barrier so the
+            # full 128-thread CTA stays in lock-step.
             if d < BT:
                 for c in cutlass.range(BT, unroll=1):
-                    sP[c, d] = sAb[c, d]
-                    sInv[c, d] = sAb[c, d]
-                sInv[d, d] = (sInv[d, d].to(f32) + f32(1.0)).to(bf16)  # +I on the diagonal
+                    sAf[c, d] = sAb[c, d].to(f32)  # sAf <- A (fp32), updated in place below
             bar.arrive_and_wait()
-            for _it in cutlass.range_constexpr(5):
-                # sPn = sP @ sP : materialise sP^T (contiguous) then gemm_ss(sP, sP^T)
+            # forward substitution: row i gains sum_{j < kk < i} A_old[i,kk] * M[kk,j],
+            # leaving sAf = (I - stril(A))^{-1} - I (strictly lower, diagonal 0).
+            for ii in cutlass.range(BT - 1, unroll=1):
+                i = ii + 1  # rows 1 .. BT-1
                 if d < BT:
-                    for c in cutlass.range(BT, unroll=1):
-                        sTt[d, c] = sP[c, d]  # sTt = sP^T
+                    srowf[d] = sAf[i, d]  # snapshot old row i (fp32)
                 bar.arrive_and_wait()
-                acc, thr_mma = self._gemm_ss(tiled_mma, tc_a, tc_b, sP, sTt, BT, BT)
-                tC = thr_mma.partition_C(sPn)
-                for i in cutlass.range_constexpr(cute.size(acc)):
-                    tC[i] = acc[i].to(bf16)
+                j = d
+                if j < i:
+                    acc = srowf[j]
+                    for kk in cutlass.range(BT, unroll=1):
+                        if (kk > j) & (kk < i):
+                            acc = acc + srowf[kk] * sAf[kk, j]
+                    sAf[i, j] = acc
                 bar.arrive_and_wait()
-                # sIp = I + sPn ; sTt = sIp^T
-                if d < BT:
-                    for c in cutlass.range(BT, unroll=1):
-                        sIp[c, d] = sPn[c, d]
-                    sIp[d, d] = (sIp[d, d].to(f32) + f32(1.0)).to(bf16)
-                bar.arrive_and_wait()
-                if d < BT:
-                    for c in cutlass.range(BT, unroll=1):
-                        sTt[d, c] = sIp[c, d]
-                bar.arrive_and_wait()
-                # sInv = sInv @ (I + sPn)
-                acc, thr_mma = self._gemm_ss(tiled_mma, tc_a, tc_b, sInv, sTt, BT, BT)
-                tC = thr_mma.partition_C(sInv)
-                for i in cutlass.range_constexpr(cute.size(acc)):
-                    tC[i] = acc[i].to(bf16)
-                bar.arrive_and_wait()
-                # sP <- sPn
-                if d < BT:
-                    for c in cutlass.range(BT, unroll=1):
-                        sP[c, d] = sPn[c, d]
-                bar.arrive_and_wait()
+            # write the full inverse (I-A)^{-1} into sInv (bf16): diagonal 1, lower = sAf, upper 0.
+            if d < BT:
+                for c in cutlass.range(BT, unroll=1):
+                    val = f32(0.0)
+                    if c > d:
+                        val = sAf[c, d]
+                    if c == d:
+                        val = f32(1.0)
+                    sInv[c, d] = val.to(bf16)
+            bar.arrive_and_wait()
             # sInv is now the full inverse (I - A)^{-1}
 
             # ---- w = sInv @ Xb ; u = sInv @ Vb  [tensor-core], kg [SIMT] ----
