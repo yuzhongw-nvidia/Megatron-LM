@@ -271,7 +271,89 @@ def rank_chains(global_cu_cpu: list[int], world_size: int) -> Optional[list[tupl
 
 
 # --------------------------------------------------------------------------------------------
-# Self-test (CPU, fp64): recurrence == WY, fold == full recurrence.
+# Symmetric-memory exchange spec (stage 3): fp32 (H, M) payload + push-all / emit-flag fold.
+# --------------------------------------------------------------------------------------------
+
+
+def pack_hm(h: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+    """Pack ``H`` ``[HO, V, K]`` and ``M`` ``[HO, K, K]`` into one ``[HO, V+K, K]`` fp32 payload.
+
+    The symmetric-memory exchange carries this contiguous per-rank payload (cuDNN's summary is
+    already fp32 -- the cute producer's ``hm_sym`` is fp32 too; its bf16 hi/lo is only an internal
+    fold-kernel detail, not the wire format).  ``H`` occupies rows ``[0, V)``, ``M`` rows
+    ``[V, V+K)``; :func:`unpack_hm` is the inverse.
+    """
+    return torch.cat([h, m], dim=-2).contiguous()
+
+
+def unpack_hm(packed: torch.Tensor, v: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Inverse of :func:`pack_hm`: ``[HO, V+K, K]`` -> ``(H [HO, V, K], M [HO, K, K])``."""
+    return packed[..., :v, :], packed[..., v:, :]
+
+
+def emit_flags_fwd(
+    chains: list[tuple[int, int]], singles: list[bool]
+) -> tuple[list[bool], list[bool]]:
+    """Per-rank forward ``(emit_h, emit_m)`` from the chain topology (``backend._emit_flags``).
+
+    A producer pushes to every later rank and each consumer folds every earlier one -- one chain
+    shape -- so a packed boundary is expressed by suppressing a producer's halves rather than by
+    shortening the chain.  ``emit_h = post > 0`` (does anything continue past this rank);
+    ``emit_m = emit_h and pre > 0 and single`` (is this rank's window one uninterrupted
+    continuation).  A cleared ``emit_m`` makes a consumer's fold ``state <- 0 @ state + H``, i.e. it
+    TRUNCATES the running composition at this rank -- what a sequence boundary at/inside the window
+    means.
+    """
+    emit_h, emit_m = [], []
+    for (pre, post), single in zip(chains, singles):
+        eh = post > 0
+        emit_h.append(eh)
+        emit_m.append(eh and pre > 0 and single)
+    return emit_h, emit_m
+
+
+def fold_with_emit_flags(
+    h_list: list[torch.Tensor],
+    m_list: list[torch.Tensor],
+    rank: int,
+    emit_h: list[bool],
+    emit_m: list[bool],
+) -> torch.Tensor:
+    """Push-all + emit-flag forward fold the symm-mem kernel runs: fold ranks ``0..rank-1``.
+
+    Every earlier rank is folded; a producer ``j`` with ``emit_h[j]`` cleared contributes ``H=0`` and
+    with ``emit_m[j]`` cleared contributes ``M=0`` (which truncates the running composition at ``j``).
+    This is numerically identical to the range-based :func:`fold_initial_state_fwd` (which the
+    stage-2 kernel and ``CudnnSummaryProducer`` use) -- the lowest cleared ``emit_m`` at/above a
+    consumer's document start truncates the sum to exactly its ``pre_num_ranks`` sources
+    (``_selftest`` check 5, single and packed chains).  Returns ``[HO, V, K]`` (zero when ``rank==0``).
+    """
+    state = torch.zeros_like(h_list[0])
+    for j in range(rank):
+        h_j = h_list[j] if emit_h[j] else torch.zeros_like(h_list[j])
+        m_j = m_list[j] if emit_m[j] else torch.zeros_like(m_list[j])
+        state = state @ m_j + h_j
+    return state
+
+
+def _local_seq_singles(global_cu_cpu: list[int], world_size: int) -> list[bool]:
+    """Whether each rank's contiguous shard overlaps exactly one document (``single`` per rank)."""
+    total = global_cu_cpu[-1]
+    part = total // world_size
+    singles = []
+    for r in range(world_size):
+        lo, hi = part * r, part * r + part
+        overlap = sum(
+            1
+            for d in range(len(global_cu_cpu) - 1)
+            if not (global_cu_cpu[d + 1] <= lo or global_cu_cpu[d] >= hi)
+        )
+        singles.append(overlap == 1)
+    return singles
+
+
+# --------------------------------------------------------------------------------------------
+# Self-test (CPU, fp64): recurrence == WY, fold == full recurrence, emit-flag == range fold.
 # --------------------------------------------------------------------------------------------
 
 
@@ -292,7 +374,9 @@ def _random_operands(t_len, hv, kdim, *, seed, dtype=torch.float64, device="cpu"
 def _selftest() -> None:
     """Validate the recurrence, the summary and the fold composition in fp64."""
     torch.manual_seed(0)
-    hv, kdim = 3, 128
+    # Small sizes keep this dev self-test fast; the math is head-dim-independent and the on-device
+    # parity (test_fused_affine_fold_matches_oracle, TestKdaCudnnChunkwiseCP) exercises K == 128.
+    hv, kdim = 2, 32
 
     # 1. naive summary == chunk-parallel WY summary (both cuDNN domain).
     k, v, g, beta = _random_operands(128, hv, kdim, seed=1)
@@ -316,7 +400,7 @@ def _selftest() -> None:
     # 3. end-to-end CP emulation: a single global sequence split into R equal shards;
     #    each rank's fold over its predecessors must equal the naive recurrence over the
     #    true prefix (the single-sequence chain `chains = [(r, R-r-1)]`).
-    world_size, part = 4, 96
+    world_size, part = 4, 64
     kg_, vg_, gg_, bg_ = _random_operands(world_size * part, hv, kdim, seed=4)
     shards = [
         (
@@ -345,7 +429,51 @@ def _selftest() -> None:
     # 4. chain topology derivation matches the single-sequence expectation.
     chains = rank_chains([0, world_size * part], world_size)
     assert chains == [(r, world_size - r - 1) for r in range(world_size)], "chain topology wrong"
-    print("boundary_fold_ref self-test PASSED (fp64: recurrence==WY, fold==truth)")
+
+    # 5. push-all + emit-flag fold (the symm-mem kernel) == range-based fold, for the single
+    #    sequence and packed chains -- the stage-3 wire protocol's correctness invariant.
+    def _rand_hm(seed):
+        gen = torch.Generator().manual_seed(seed)
+        h = [torch.randn(hv, kdim, kdim, generator=gen, dtype=torch.float64) for _ in range(4)]
+        m = [
+            torch.eye(kdim, dtype=torch.float64) * 0.9
+            + 0.01 * torch.randn(hv, kdim, kdim, generator=gen, dtype=torch.float64)
+            for _ in range(4)
+        ]
+        return h, m
+
+    for gcu, label in (
+        ([0, 4 * part], "single"),  # one global sequence
+        ([0, int(1.5 * part), 4 * part], "packed-2doc"),  # a doc crossing one boundary
+        ([0, part, 3 * part, 4 * part], "packed-3doc"),  # several docs, varied pre/post
+    ):
+        ch = rank_chains(gcu, 4)
+        singles = _local_seq_singles(gcu, 4)
+        emit_h, emit_m = emit_flags_fwd(ch, singles)
+        hh, mm = _rand_hm(hash(label) & 0xFFFF)
+        for rank in range(4):
+            pre = ch[rank][0]
+            emit_out = fold_with_emit_flags(hh, mm, rank, emit_h, emit_m)
+            range_out = fold_initial_state_fwd(hh, mm, rank, pre)
+            if pre == 0:
+                assert range_out is None and torch.allclose(
+                    emit_out, torch.zeros_like(emit_out), atol=1e-9
+                ), f"{label} rank {rank}: non-zero fold with no predecessor"
+            else:
+                assert torch.allclose(
+                    emit_out, range_out, atol=1e-9, rtol=1e-6
+                ), f"{label} rank {rank}: emit-flag fold != range fold"
+
+    # 6. the fp32 (H, M) symm payload packing round-trips.
+    h6 = torch.randn(hv, kdim, kdim, dtype=torch.float64)
+    m6 = torch.randn(hv, kdim, kdim, dtype=torch.float64)
+    h6b, m6b = unpack_hm(pack_hm(h6, m6), kdim)
+    assert torch.equal(h6, h6b) and torch.equal(m6, m6b), "pack/unpack is not an identity"
+
+    print(
+        "boundary_fold_ref self-test PASSED "
+        "(fp64: recurrence==WY, fold==truth, emit-flag==range, pack round-trips)"
+    )
 
 
 if __name__ == "__main__":
