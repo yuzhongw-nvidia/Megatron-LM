@@ -656,10 +656,13 @@ class TransformerConfig(ModelParallelConfig):
     stays required for the causal convolution, L2 norm and the CP context.
     """
 
-    kda_cudnn_cp_state_producer: Literal["cudnn", "cute"] = "cudnn"
+    kda_cudnn_cp_state_producer: Literal["cudnn", "cudnn_fused", "cute"] = "cudnn"
     """How the cuDNN KDA backend produces the chunkwise-CP boundary states.
 
-    ``cudnn`` (default): cuDNN's per-span summaries, an all-gather and a transition fold.
+    ``cudnn`` (default): cuDNN's per-span summaries, an all-gather and a Python transition fold.
+    ``cudnn_fused``: the same per-span summaries and all-gather, but one fused Triton kernel for the
+    fp32 affine fold instead of the ``zeros_like`` seed + Python ``matmul`` loop + slot copy
+    (numerically identical to ``cudnn``; no CUDA-graph restriction).
     ``cute``: the fused CuTe DSL preprocess ported from PR #6511 (experimental; needs the CuTe DSL
     the cuDNN engines need anyway, validated with nvidia-cutlass-dsl 4.8.1).  Only used with
     ``kda_kernel_backend="cudnn"`` and ``linear_cp_mode="chunkwise"``.
@@ -2892,9 +2895,9 @@ class TransformerConfig(ModelParallelConfig):
                         "kda_kernel_backend='cudnn' is not deterministic; use 'fla' with "
                         "deterministic_mode=True."
                     )
-                if self.kda_cudnn_cp_state_producer not in ("cudnn", "cute"):
+                if self.kda_cudnn_cp_state_producer not in ("cudnn", "cudnn_fused", "cute"):
                     raise ValueError(
-                        "kda_cudnn_cp_state_producer must be 'cudnn' or 'cute', "
+                        "kda_cudnn_cp_state_producer must be 'cudnn', 'cudnn_fused', or 'cute', "
                         f"got {self.kda_cudnn_cp_state_producer!r}."
                     )
                 if (

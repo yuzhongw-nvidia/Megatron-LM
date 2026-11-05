@@ -302,11 +302,7 @@ class KimiDeltaAttention(_GDNBase):
         ``None`` keeps the gate in its natural dtype for them.  The fusion itself stays backend-
         agnostic -- it only sees the dtype decided here.
         """
-        return (
-            torch.float32
-            if getattr(config, "kda_kernel_backend", "fla") == "cudnn"
-            else None
-        )
+        return torch.float32 if getattr(config, "kda_kernel_backend", "fla") == "cudnn" else None
 
     def _select_kda_kernel(self):
         """The ``chunk_kda``-compatible kernel entry point for ``config.kda_kernel_backend``."""
@@ -339,10 +335,10 @@ class KimiDeltaAttention(_GDNBase):
             if reason is not None:
                 raise RuntimeError(f"kda_kernel_backend='cudnn' cannot run here: {reason}")
             producer = getattr(self.config, "kda_cudnn_cp_state_producer", "cudnn")
-            if producer not in ("cudnn", "cute"):
+            if producer not in ("cudnn", "cudnn_fused", "cute"):
                 raise ValueError(
                     f"Unsupported kda_cudnn_cp_state_producer {producer!r}; "
-                    "expected 'cudnn' or 'cute'."
+                    "expected 'cudnn', 'cudnn_fused', or 'cute'."
                 )
             # thd_max_packed_sequences caps the packed-document count; under chunkwise CP it also bounds
             # the per-rank sequence count, so the cuDNN CP path uses it to pin the main-kernel plan key's
@@ -350,6 +346,12 @@ class KimiDeltaAttention(_GDNBase):
             pad_nseq = getattr(self.config, "thd_max_packed_sequences", None)
             if producer == "cudnn":
                 return partial(chunk_kda_cudnn, cp_pad_nseq=pad_nseq)
+            if producer == "cudnn_fused":
+                # Same frost summary + all_gather as 'cudnn', but the cross-rank fold runs in one fused
+                # Triton kernel instead of a Python matmul loop + staging (cp.CudnnFusedFoldProducer).
+                return partial(
+                    chunk_kda_cudnn, cp_state_producer="cudnn_fused", cp_pad_nseq=pad_nseq
+                )
             from megatron.core.ssm.gated_delta_net.cudnn_kda import cute_preprocess
 
             reason = cute_preprocess.unavailable_reason()

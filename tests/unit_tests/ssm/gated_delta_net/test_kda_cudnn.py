@@ -114,6 +114,9 @@ _CUTE_PRODUCER_UNAVAILABLE = _cute_producer_unavailable_reason()
 # DSL preprocess) needs its engines to import and an SM100 GPU.
 _CP_STATE_PRODUCERS = [
     "cudnn",
+    # Same frost summaries + all-gather as "cudnn", one fused Triton kernel for the fp32 fold; runs
+    # wherever the cuDNN backend does (no extra toolchain), so it carries the shared GPU marks only.
+    "cudnn_fused",
     pytest.param(
         "cute",
         marks=pytest.mark.skipif(
@@ -385,7 +388,7 @@ def test_kda_cudnn_backend_rejects_deterministic_mode():
 def test_kda_cudnn_cp_state_producer_knob():
     """The boundary-state producer knob: default, both values, and its two rejections."""
     assert _make_config().kda_cudnn_cp_state_producer == "cudnn"
-    for producer in ("cudnn", "cute"):
+    for producer in ("cudnn", "cudnn_fused", "cute"):
         config = replace(
             _make_config(), kda_kernel_backend="cudnn", kda_cudnn_cp_state_producer=producer
         )
@@ -449,7 +452,8 @@ def test_select_kda_kernel_binds_backend():
 
         if device_unavailable_reason() is None:
             assert (
-                _cudnn_kernel_producer(KimiDeltaAttention._select_kda_kernel(cudnn_shell)) == "cudnn"
+                _cudnn_kernel_producer(KimiDeltaAttention._select_kda_kernel(cudnn_shell))
+                == "cudnn"
             )
 
             # The binding guards against a bypassed config for the producer knob as well.
@@ -810,6 +814,44 @@ def test_cudnn_chunkwise_cp_matches_single_rank(
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the fused boundary fold is a CUDA Triton kernel."
+)
+@pytest.mark.parametrize("step", [1, -1], ids=["fwd-ascending", "bwd-descending"])
+def test_fused_affine_fold_matches_oracle(step):
+    """The fused Triton fold kernel reproduces ``boundary_fold_ref``'s affine composition (fp32).
+
+    Directly exercises ``cp._fused_affine_fold`` (the ``cudnn_fused`` producer's fold) on random
+    per-rank summaries, with no distributed setup, and compares its live slot to the device-
+    independent oracle (walked in the same rank order). fp32 tolerance: the kernel folds in fp32
+    (``allow_tf32=False``) against the oracle's fp64 composition.
+    """
+    from megatron.core.ssm.gated_delta_net.cudnn_kda import boundary_fold_ref
+    from megatron.core.ssm.gated_delta_net.cudnn_kda.cp import HAVE_TRITON, _fused_affine_fold
+
+    if not HAVE_TRITON:
+        pytest.skip("Triton is required for the fused boundary fold.")
+    device = torch.cuda.current_device()
+    R, HO, K = 4, 3, _HEAD_DIM
+    gen = torch.Generator().manual_seed(11)
+    # Mild-contraction transitions keep the composition well conditioned (real frost M decays < 1).
+    h = torch.randn(R, HO, K, K, generator=gen).to(device=device, dtype=torch.float32)
+    m = (torch.eye(K)[None, None] * 0.9 + 0.01 * torch.randn(R, HO, K, K, generator=gen)).to(
+        device=device, dtype=torch.float32
+    )
+
+    if step == 1:  # forward: rank R-1 folds predecessors 0..R-2 ascending into slot 0
+        out = _fused_affine_fold(h, m, n_local=1, live_slot=0, start=0, count=R - 1, step=1)
+        order = list(range(0, R - 1))
+    else:  # backward: rank 0 folds successors R-1..1 descending into slot 0
+        out = _fused_affine_fold(h, m, n_local=1, live_slot=0, start=R - 1, count=R - 1, step=-1)
+        order = list(range(R - 1, 0, -1))
+    reference = boundary_fold_ref.compose_spans_fwd(
+        [h[r].double() for r in order], [m[r].double() for r in order]
+    )[0].float()
+    _assert_relative_l2(out[0], reference, 2e-3, f"fused fold (step={step})")
+
+
 def test_kda_gate_out_dtype_follows_backend():
     """``_kda_gate_out_dtype`` reads only the config (no GPU): cuDNN wants fp32, FLA keeps bf16.
 
@@ -818,15 +860,11 @@ def test_kda_gate_out_dtype_follows_backend():
     the raw bf16 gate inside their own kernels, so the fusion keeps the natural dtype (``None``).
     """
     assert (
-        KimiDeltaAttention._kda_gate_out_dtype(
-            replace(_make_config(), kda_kernel_backend="cudnn")
-        )
+        KimiDeltaAttention._kda_gate_out_dtype(replace(_make_config(), kda_kernel_backend="cudnn"))
         is torch.float32
     )
     assert (
-        KimiDeltaAttention._kda_gate_out_dtype(
-            replace(_make_config(), kda_kernel_backend="fla")
-        )
+        KimiDeltaAttention._kda_gate_out_dtype(replace(_make_config(), kda_kernel_backend="fla"))
         is None
     )
 
@@ -858,7 +896,9 @@ def test_fused_pre_kda_gate_out_dtype_is_neutral():
     raw_g = _rand(seq_len, batch, num_heads * head_dim)
     gate = _rand(seq_len, batch, num_heads * head_dim)
     beta = _rand(seq_len, batch, num_heads)
-    conv1d_weight = _rand(conv_dim, 1, 4)  # KDA conv weight is [3*num_heads*head_dim, 1, kernel_width]
+    conv1d_weight = _rand(
+        conv_dim, 1, 4
+    )  # KDA conv weight is [3*num_heads*head_dim, 1, kernel_width]
 
     common = dict(num_heads=num_heads, head_dim=head_dim, use_qk_l2norm=True)
     with torch.no_grad():

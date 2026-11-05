@@ -43,6 +43,16 @@ import torch.distributed as dist
 
 from . import ops as _ops
 
+try:
+    import triton
+    import triton.language as tl
+
+    HAVE_TRITON = True
+except ImportError:  # pragma: no cover - environment dependent
+    triton = None
+    tl = None
+    HAVE_TRITON = False
+
 
 def _all_gather_one(t: torch.Tensor, group) -> list[torch.Tensor]:
     """``all_gather`` of one ``[HO, ...]`` entry per rank.
@@ -55,6 +65,22 @@ def _all_gather_one(t: torch.Tensor, group) -> list[torch.Tensor]:
     )
     dist.all_gather_into_tensor(out, t, group=group)
     return list(out.unbind(0))
+
+
+def _all_gather_stacked(t: torch.Tensor, group) -> torch.Tensor:
+    """``all_gather`` of one ``[HO, ...]`` entry per rank as a stacked ``[R, HO, ...]`` tensor.
+
+    Same collective as :func:`_all_gather_one` but without the final ``unbind``: the fused fold
+    kernel indexes the rank axis directly, so it keeps the gathered buffer whole (one fewer Python
+    list and no per-rank view).  Used by :class:`CudnnFusedFoldProducer`; the exchange itself is
+    still ``all_gather`` (symmetric memory is a later stage).
+    """
+    t = t.contiguous()
+    out = torch.empty(
+        (dist.get_world_size(group),) + tuple(t.shape), dtype=t.dtype, device=t.device
+    )
+    dist.all_gather_into_tensor(out, t, group=group)
+    return out
 
 
 def _host_cu_seqlens(cp_context) -> list[int]:
@@ -208,6 +234,126 @@ def _pad_state_nseq(state: Optional[torch.Tensor], target_n: int) -> Optional[to
     return out
 
 
+if HAVE_TRITON:
+
+    @triton.jit
+    def _affine_fold_kernel(
+        h_ptr,  # [R, HO, V, K] fp32 (gathered H / Htilde)
+        m_ptr,  # [R, HO, K, K] fp32 (gathered M / transition)
+        out_ptr,  # [HO, V, K] fp32 (the live boundary-state slot)
+        start,  # first rank index to fold
+        count,  # number of ranks to fold
+        step,  # +1 ascending (forward), -1 descending (backward)
+        h_r_s,
+        h_ho_s,
+        h_v_s,
+        m_r_s,
+        m_ho_s,
+        m_k_s,
+        o_ho_s,
+        o_v_s,
+        V,
+        HEAD_DIM: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        """One head's (and V-tile's) affine fold ``S = S @ M_r + H_r`` over the rank chain.
+
+        Replaces ``CudnnSummaryProducer``'s ``zeros_like`` seed + Python ``matmul`` loop + ``zeros`` +
+        slot copy with a single launch: ``S`` starts at zero and the ``count`` ranks ``start, start +
+        step, ...`` are folded in fp32 (``tl.dot`` with ``allow_tf32=False`` to match the fp32 torch
+        fold and the fp64 oracle).  Forward folds predecessors ascending; the backward passes ``step =
+        -1`` to fold successors descending -- the same affine composition, mirrored.
+        """
+        pid_ho = tl.program_id(0)
+        pid_v = tl.program_id(1)
+        v_off = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
+        k_off = tl.arange(0, HEAD_DIM)
+        v_mask = v_off < V
+        state = tl.zeros([BLOCK_V, HEAD_DIM], dtype=tl.float32)
+        for i in range(count):
+            r = start + i * step
+            h_base = h_ptr + r * h_r_s + pid_ho * h_ho_s
+            h_r = tl.load(
+                h_base + v_off[:, None] * h_v_s + k_off[None, :], mask=v_mask[:, None], other=0.0
+            )
+            m_base = m_ptr + r * m_r_s + pid_ho * m_ho_s
+            m_r = tl.load(m_base + k_off[:, None] * m_k_s + k_off[None, :])
+            state = tl.dot(state, m_r, allow_tf32=False) + h_r
+        tl.store(
+            out_ptr + pid_ho * o_ho_s + v_off[:, None] * o_v_s + k_off[None, :],
+            state,
+            mask=v_mask[:, None],
+        )
+
+
+def _launch_affine_fold(
+    h_stacked: torch.Tensor,
+    m_stacked: torch.Tensor,
+    out_slot: torch.Tensor,
+    start: int,
+    count: int,
+    step: int,
+) -> None:
+    """Fold ``count`` ranks' summaries into ``out_slot`` ``[HO, V, K]`` with the Triton kernel."""
+    if not HAVE_TRITON:
+        raise ImportError(
+            "kda_cudnn_cp_state_producer='cudnn_fused' needs Triton for the fused boundary fold."
+        )
+    _, ho, v, k = h_stacked.shape
+    assert k == m_stacked.shape[-1] == m_stacked.shape[-2], "fold expects square [K, K] transitions"
+    block_v = 64 if v % 64 == 0 else v
+    grid = (ho, triton.cdiv(v, block_v))
+    _affine_fold_kernel[grid](
+        h_stacked,
+        m_stacked,
+        out_slot,
+        int(start),
+        int(count),
+        int(step),
+        h_stacked.stride(0),
+        h_stacked.stride(1),
+        h_stacked.stride(2),
+        m_stacked.stride(0),
+        m_stacked.stride(1),
+        m_stacked.stride(2),
+        out_slot.stride(0),
+        out_slot.stride(1),
+        v,
+        HEAD_DIM=k,
+        BLOCK_V=block_v,
+    )
+
+
+def _fused_affine_fold(
+    h_stacked: torch.Tensor,
+    m_stacked: torch.Tensor,
+    *,
+    n_local: int,
+    live_slot: int,
+    start: int,
+    count: int,
+    step: int,
+) -> torch.Tensor:
+    """Assemble the ``[N_local, HO, V, K]`` boundary state with the fused fold written in place.
+
+    ``h_stacked`` / ``m_stacked`` are the gathered ``[R, HO, V, K]`` / ``[R, HO, K, K]`` fp32
+    summaries.  The live slot (0 forward, ``N_local - 1`` backward) receives the fold of ranks
+    ``start, start + step, ...`` directly; the others are zeroed exactly as ``CudnnSummaryProducer``
+    leaves them.  No ``zeros_like`` seed and no device-to-device slot copy.
+    """
+    _, ho, v, k = h_stacked.shape
+    device = h_stacked.device
+    out = torch.empty((n_local, ho, v, k), dtype=torch.float32, device=device)
+    if n_local > 1:
+        # Only the live slot carries state; match the base producer's zero fill for the rest.
+        if live_slot == 0:
+            out[1:].zero_()
+        else:
+            out[:-1].zero_()
+    _launch_affine_fold(h_stacked, m_stacked, out[live_slot], start, count, step)
+    return out
+
+
 class BoundaryStateProducer(Protocol):
     """Produces the two cross-rank boundary tensors of a chunkwise-CP step on this rank.
 
@@ -232,18 +378,20 @@ class BoundaryStateProducer(Protocol):
 class CudnnSummaryProducer:
     """Default producer: cuDNN's per-span summaries + ``all_gather`` + transition folds."""
 
-    def initial_state(self, k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags):
-        """Summarise the crossing-out sequence, exchange, fold the predecessors' blocks."""
+    def _summarize_fwd(self, k, v, g, beta, cu_list, cp_context, gate_kwargs, flags):
+        """This rank's forward crossing-span summary ``(H, M)`` plus ``(HO, V, K)``.
+
+        The LAST local sequence is the only one that can continue onto a later rank: summarise it
+        alone, padded to a shape bucket with neutral tokens (see ``_bucket_len``); a rank whose last
+        sequence ends locally (``is_last_rank``) contributes zeros.  Shared by both producers so the
+        summary stays single-sourced -- they differ only in how the gathered summaries are folded.
+        """
         ops = _ops.ops()
         # Fold every boundary-summary shape bucket's compile into the first forward (self-guards to
         # once, see _prewarm_summary_fwd) so the steady steps are flat -- always on, no numerical effect.
         _prewarm_summary_fwd(ops, k, v, g, beta, cu_list[-1], gate_kwargs, flags)
-        group = cp_context.group
-        rank = dist.get_rank(group)
         HO, V, K = v.shape[1], v.shape[2], k.shape[2]
         if not cp_context.is_last_rank:
-            # The last local sequence continues on the next rank: summarise it alone, padded to a
-            # shape bucket with neutral tokens (see _bucket_len).
             start = cu_list[-2]
             length = _bucket_len(cu_list[-1] - start)
             cu_tail = torch.tensor([0, length], dtype=torch.int32, device=k.device)
@@ -263,35 +411,20 @@ class CudnnSummaryProducer:
         else:
             h = torch.zeros((HO, V, K), dtype=torch.float32, device=k.device)
             m = torch.zeros((HO, K, K), dtype=torch.float32, device=k.device)
-        hs, ms = _all_gather_one(h, group), _all_gather_one(m, group)
-        if cp_context.is_first_rank:
-            # No predecessor to fold: this rank's own first document starts from a zero state.  Return it
-            # materialised (not None) so the main kernel's plan-key state dtype stays constant fp32 and does
-            # not re-plan step to step under varlen packing (see _zeros_boundary_state).
-            return _zeros_boundary_state(len(cu_list) - 1, HO, V, K, k.device)
-        state = torch.zeros_like(h)
-        for r in range(rank - cp_context.pre_num_ranks, rank):  # ascending, document start first
-            state = torch.matmul(state, ms[r]) + hs[r]
-        initial_state = torch.zeros(
-            (len(cu_list) - 1, HO, V, K), dtype=torch.float32, device=k.device
-        )
-        initial_state[0] = state
-        return initial_state
+        return h, m, HO, V, K
 
-    def final_state_grad(
-        self, q, k, g, beta, do, cu, cu_list, cp_context, scale, gate_kwargs, flags
-    ):
-        """Reverse-summarise the crossing-in sequence, exchange, fold the successors' blocks."""
+    def _summarize_bwd(self, q, k, g, beta, do, cu_list, cp_context, scale, gate_kwargs, flags):
+        """This rank's backward crossing-span summary ``(G, Tr)`` plus ``(HO, V, K)``.
+
+        Mirror of :meth:`_summarize_fwd`: the FIRST local sequence is the only continuation from an
+        earlier rank; ``is_first_rank`` contributes zeros.
+        """
         ops = _ops.ops()
         # Fold every backward boundary-summary bucket's compile into the first backward (self-guards to
         # once, see _prewarm_summary_bwd) so the steady steps are flat -- always on, no numerical effect.
         _prewarm_summary_bwd(ops, q, k, g, beta, do, cu_list[-1], scale, gate_kwargs, flags)
-        group = cp_context.group
-        rank = dist.get_rank(group)
         HO, V, K = do.shape[1], do.shape[2], k.shape[2]
         if not cp_context.is_first_rank:
-            # The first local sequence continues from the previous rank: summarise it alone,
-            # padded to a shape bucket with neutral tokens (see _bucket_len).
             end = cu_list[1]
             length = _bucket_len(end)
             cu_head = torch.tensor([0, length], dtype=torch.int32, device=k.device)
@@ -314,6 +447,37 @@ class CudnnSummaryProducer:
         else:
             gsum = torch.zeros((HO, V, K), dtype=torch.float32, device=k.device)
             tr = torch.zeros((HO, K, K), dtype=torch.float32, device=k.device)
+        return gsum, tr, HO, V, K
+
+    def initial_state(self, k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags):
+        """Summarise the crossing-out sequence, exchange, fold the predecessors' blocks."""
+        h, m, HO, V, K = self._summarize_fwd(k, v, g, beta, cu_list, cp_context, gate_kwargs, flags)
+        group = cp_context.group
+        rank = dist.get_rank(group)
+        hs, ms = _all_gather_one(h, group), _all_gather_one(m, group)
+        if cp_context.is_first_rank:
+            # No predecessor to fold: this rank's own first document starts from a zero state.  Return it
+            # materialised (not None) so the main kernel's plan-key state dtype stays constant fp32 and does
+            # not re-plan step to step under varlen packing (see _zeros_boundary_state).
+            return _zeros_boundary_state(len(cu_list) - 1, HO, V, K, k.device)
+        state = torch.zeros_like(h)
+        for r in range(rank - cp_context.pre_num_ranks, rank):  # ascending, document start first
+            state = torch.matmul(state, ms[r]) + hs[r]
+        initial_state = torch.zeros(
+            (len(cu_list) - 1, HO, V, K), dtype=torch.float32, device=k.device
+        )
+        initial_state[0] = state
+        return initial_state
+
+    def final_state_grad(
+        self, q, k, g, beta, do, cu, cu_list, cp_context, scale, gate_kwargs, flags
+    ):
+        """Reverse-summarise the crossing-in sequence, exchange, fold the successors' blocks."""
+        gsum, tr, HO, V, K = self._summarize_bwd(
+            q, k, g, beta, do, cu_list, cp_context, scale, gate_kwargs, flags
+        )
+        group = cp_context.group
+        rank = dist.get_rank(group)
         gs, ts = _all_gather_one(gsum, group), _all_gather_one(tr, group)
         if cp_context.is_last_rank:
             # No successor gradient: this rank's own last document has a zero final-state gradient.  Return
@@ -332,7 +496,63 @@ class CudnnSummaryProducer:
         return d_final_state
 
 
-_PRODUCERS: dict[str, Any] = {"cudnn": CudnnSummaryProducer}
+class CudnnFusedFoldProducer(CudnnSummaryProducer):
+    """cuDNN frost summaries + ``all_gather``, but ONE fused Triton kernel for the fold.
+
+    Keeps the default producer's fast per-span frost summary and its ``all_gather`` exchange (the
+    symmetric-memory exchange is a later stage), and replaces only the assembly tail -- the
+    ``zeros_like`` seed, the Python ``matmul`` fold loop and the ``zeros`` + slot copy -- with
+    :func:`_fused_affine_fold`, which does the fp32 affine fold and the slot write in one launch.
+    Numerically identical to :class:`CudnnSummaryProducer` (same frost ``(H, M)``, same fp32
+    composition; see ``boundary_fold_ref`` for the fp64 reference).
+    """
+
+    def initial_state(self, k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags):
+        """Summarise + exchange (all_gather) + fused fp32 fold of the predecessors' blocks."""
+        h, m, HO, V, K = self._summarize_fwd(k, v, g, beta, cu_list, cp_context, gate_kwargs, flags)
+        group = cp_context.group
+        rank = dist.get_rank(group)
+        n_local = len(cu_list) - 1
+        hs = _all_gather_stacked(h, group)  # [R, HO, V, K]
+        ms = _all_gather_stacked(m, group)  # [R, HO, K, K]
+        if cp_context.is_first_rank:
+            return _zeros_boundary_state(n_local, HO, V, K, k.device)
+        return _fused_affine_fold(
+            hs,
+            ms,
+            n_local=n_local,
+            live_slot=0,
+            start=rank - cp_context.pre_num_ranks,  # ascending, document start first
+            count=cp_context.pre_num_ranks,
+            step=1,
+        )
+
+    def final_state_grad(
+        self, q, k, g, beta, do, cu, cu_list, cp_context, scale, gate_kwargs, flags
+    ):
+        """Reverse-summarise + exchange (all_gather) + fused fp32 fold of the successors' blocks."""
+        gsum, tr, HO, V, K = self._summarize_bwd(
+            q, k, g, beta, do, cu_list, cp_context, scale, gate_kwargs, flags
+        )
+        group = cp_context.group
+        rank = dist.get_rank(group)
+        n_local = len(cu_list) - 1
+        gs = _all_gather_stacked(gsum, group)  # [R, HO, V, K]
+        ts = _all_gather_stacked(tr, group)  # [R, HO, K, K]
+        if cp_context.is_last_rank:
+            return _zeros_boundary_state(n_local, HO, V, K, k.device)
+        return _fused_affine_fold(
+            gs,
+            ts,
+            n_local=n_local,
+            live_slot=n_local - 1,
+            start=rank + cp_context.post_num_ranks,  # descending, document end first
+            count=cp_context.post_num_ranks,
+            step=-1,
+        )
+
+
+_PRODUCERS: dict[str, Any] = {"cudnn": CudnnSummaryProducer, "cudnn_fused": CudnnFusedFoldProducer}
 
 
 def register_boundary_state_producer(name: str, factory) -> None:

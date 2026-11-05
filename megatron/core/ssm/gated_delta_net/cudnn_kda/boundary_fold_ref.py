@@ -62,11 +62,7 @@ CHUNK_SIZE = 64
 
 
 def naive_span_state_kv(
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    state_in: torch.Tensor,
+    k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, state_in: torch.Tensor
 ) -> torch.Tensor:
     """Naive token-by-token gated-delta-rule span scan in the ``[K, V]`` domain.
 
@@ -323,8 +319,12 @@ def _selftest() -> None:
     world_size, part = 4, 96
     kg_, vg_, gg_, bg_ = _random_operands(world_size * part, hv, kdim, seed=4)
     shards = [
-        (kg_[r * part : (r + 1) * part], vg_[r * part : (r + 1) * part],
-         gg_[r * part : (r + 1) * part], bg_[r * part : (r + 1) * part])
+        (
+            kg_[r * part : (r + 1) * part],
+            vg_[r * part : (r + 1) * part],
+            gg_[r * part : (r + 1) * part],
+            bg_[r * part : (r + 1) * part],
+        )
         for r in range(world_size)
     ]
     summaries = [span_summary_cudnn(*s) for s in shards]
