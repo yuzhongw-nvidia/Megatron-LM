@@ -233,31 +233,35 @@ class FrontHalfFwdTC:
             bar.arrive_and_wait()
 
             # ---- solve: sInv = (I-A)^{-1} (full inverse) via 6 squarings [tensor-core] ----
-            # sInv = I + A ; sP = A    (thread d owns column d)
-            for c in cutlass.range(BT, unroll=1):
-                sP[c, d] = sAb[c, d]
-                sInv[c, d] = sAb[c, d]
+            # sInv = I + A ; sP = A.  The [BT,BT] matrices have only BT (64) columns, so
+            # their column-d SIMT ops must be guarded to threads d < BT (threads BT..2BT-1
+            # still join every barrier + every gemm, which needs all 128 for the 4 warps).
             if d < BT:
+                for c in cutlass.range(BT, unroll=1):
+                    sP[c, d] = sAb[c, d]
+                    sInv[c, d] = sAb[c, d]
                 sInv[d, d] = (sInv[d, d].to(f32) + f32(1.0)).to(bf16)  # +I on the diagonal
             bar.arrive_and_wait()
             for _it in cutlass.range_constexpr(5):
                 # sPn = sP @ sP : materialise sP^T (contiguous) then gemm_ss(sP, sP^T)
-                for c in cutlass.range(BT, unroll=1):
-                    sTt[d, c] = sP[c, d]  # sTt = sP^T
+                if d < BT:
+                    for c in cutlass.range(BT, unroll=1):
+                        sTt[d, c] = sP[c, d]  # sTt = sP^T
                 bar.arrive_and_wait()
                 acc, thr_mma = self._gemm_ss(tiled_mma, tc_a, tc_b, sP, sTt, BT, BT)
                 tC = thr_mma.partition_C(sPn)
                 for i in cutlass.range_constexpr(cute.size(acc)):
                     tC[i] = acc[i].to(bf16)
                 bar.arrive_and_wait()
-                # sIp = I + sPn
-                for c in cutlass.range(BT, unroll=1):
-                    sIp[c, d] = sPn[c, d]
+                # sIp = I + sPn ; sTt = sIp^T
                 if d < BT:
+                    for c in cutlass.range(BT, unroll=1):
+                        sIp[c, d] = sPn[c, d]
                     sIp[d, d] = (sIp[d, d].to(f32) + f32(1.0)).to(bf16)
-                # sTt = sIp^T
-                for c in cutlass.range(BT, unroll=1):
-                    sTt[d, c] = sIp[c, d]
+                bar.arrive_and_wait()
+                if d < BT:
+                    for c in cutlass.range(BT, unroll=1):
+                        sTt[d, c] = sIp[c, d]
                 bar.arrive_and_wait()
                 # sInv = sInv @ (I + sPn)
                 acc, thr_mma = self._gemm_ss(tiled_mma, tc_a, tc_b, sInv, sTt, BT, BT)
@@ -266,12 +270,13 @@ class FrontHalfFwdTC:
                     tC[i] = acc[i].to(bf16)
                 bar.arrive_and_wait()
                 # sP <- sPn
-                for c in cutlass.range(BT, unroll=1):
-                    sP[c, d] = sPn[c, d]
+                if d < BT:
+                    for c in cutlass.range(BT, unroll=1):
+                        sP[c, d] = sPn[c, d]
                 bar.arrive_and_wait()
-            # sInv is now (I - A)^{-1} - I
+            # sInv is now the full inverse (I - A)^{-1}
 
-            # ---- w = sInv @ Xb + Xb ; u = sInv @ Vb + Vb  [tensor-core], kg [SIMT] ----
+            # ---- w = sInv @ Xb ; u = sInv @ Vb  [tensor-core], kg [SIMT] ----
             gk_last = sgk[nvalid - 1, d]
             # Xb[i,d] = beta_i * k[i,d] * 2^gk[i,d]
             for c in cutlass.range(BT, unroll=1):
