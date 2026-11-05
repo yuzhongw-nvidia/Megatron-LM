@@ -345,8 +345,12 @@ class CuTeRawPreprocessProducer(CuTePreprocessProducer):
       ``w`` / ``u`` / ``kg``).  First-draft, GPU-validation pending; the oracle
       above is its numerical target.
 
-    Either way the backward is inherited unchanged from ``CuTePreprocessProducer``
-    (FLA glue) -- forward first.
+    The backward is fused the same way (``final_state_grad`` below): the WY
+    front-half plus ``qg = q*2^gk`` and the intra term ``dv = Aqk^T @ do`` run from
+    raw operands (``eat_raw_ref.front_half_bwd`` torch oracle, or the fused CuTe
+    kernel under ``MCORE_KDA_CUTE_RAW_FUSED_BWD=1``), then the proven fused CP
+    backward scan.  So the whole ``cute_raw`` producer carries no FLA glue in
+    either direction.
     """
 
     name = "cute_raw"
@@ -363,6 +367,19 @@ class CuTeRawPreprocessProducer(CuTePreprocessProducer):
         from .eat_raw_ref import front_half_fwd
 
         return front_half_fwd
+
+    @staticmethod
+    def _front_half_bwd():
+        """The backward front-half implementation: fused CuTe kernel or torch oracle."""
+        import os
+
+        if os.environ.get("MCORE_KDA_CUTE_RAW_FUSED_BWD") == "1":
+            from .front_bwd import front_half_bwd_cute
+
+            return front_half_bwd_cute
+        from .eat_raw_ref import front_half_bwd
+
+        return front_half_bwd
 
     def initial_state(
         self, k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags
@@ -407,3 +424,51 @@ class CuTeRawPreprocessProducer(CuTePreprocessProducer):
         if cp_context.is_first_rank:
             return None
         return _ops.fla_state_to_cudnn(state, state_v_first=False)
+
+    def final_state_grad(
+        self, q, k, g, beta, do, cu, cu_list, cp_context, scale, gate_kwargs, flags
+    ) -> Optional[torch.Tensor]:
+        """Backward boundary gradient with the WY front-half + ``dv`` run from raw operands.
+
+        Collective over ``cp_context.group``; returns the fp32 ``[N_local, HO, V, K]``
+        cuDNN-layout gradient (slot ``N_local - 1`` live) or ``None`` on
+        ``is_last_rank``; refuses CUDA-graph capture.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                "the CuTe raw CP preprocess producer cannot run under CUDA-graph capture"
+            )
+        front_half_bwd = self._front_half_bwd()
+
+        _check_envelope(q, do, flags)
+        ensure_cp_context_metadata(cp_context)
+
+        # The FIRST local sequence is the only one that can continue from an earlier
+        # rank (FLA's backward producer runs on `cu_seqlens[:2]`).
+        bos, eos = int(cu_list[0]), int(cu_list[1])
+        do_w = do[bos:eos].contiguous()
+        if do_w.dtype != q.dtype:
+            do_w = do_w.to(q.dtype)
+        qg, kg, w, dv, gk = front_half_bwd(
+            q[bos:eos], k[bos:eos], g[bos:eos], beta[bos:eos], do_w, float(scale), gate_kwargs
+        )
+        dht = _backend.chunk_gated_delta_rule_bwd_dhu_pre_process_cutedsl(
+            q=qg,
+            k=kg,
+            w=w,
+            do=do_w.unsqueeze(0),
+            dv=dv,
+            g=None,
+            gk=gk,
+            bg=None,
+            scale=float(scale),
+            state_v_first=False,
+            cu_seqlens=cu,
+            dht=None,
+            chunk_size=CHUNK_SIZE,
+            context=cp_context,
+            windowed=True,
+        )
+        if cp_context.is_last_rank:
+            return None
+        return _ops.fla_state_to_cudnn(dht, state_v_first=False)

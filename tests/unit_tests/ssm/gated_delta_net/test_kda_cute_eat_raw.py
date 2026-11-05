@@ -221,3 +221,129 @@ def test_front_half_fwd_matches_naive(t, safe):
         _pad_naive(k), _pad_naive(v), _pad_naive(log_decay), _pad_naive(beta)
     )
     assert _rel_l2(predicted, expected) < _FRONT_TOL
+
+
+# --------------------------------------------------------------------------- #
+# front_half_bwd: the backward front-half (raw window -> qg/kg/w/dv/gk), verified
+# by feeding its output through the kernel's reverse-scan MATH and matching the
+# boundary gradient to autodiff of a differentiable naive forward.
+# --------------------------------------------------------------------------- #
+def _solve_inv(a):
+    inv = torch.zeros_like(a)
+    for i in range(1, _BT):
+        inv = inv.clone()
+        inv[i, :i] = a[i, :i] + (a[i, :, None] * inv[:, :i]).sum(0)
+    return inv
+
+
+def _naive_fwd_diff(q, k, v, log_decay, beta, scale, s0):
+    """Differentiable single-head naive_chunk_kda forward: returns (o [T,V], S_final)."""
+    t, kdim = q.shape
+    vdim = v.shape[-1]
+    nt = (t + _BT - 1) // _BT
+    tp = nt * _BT
+
+    def pad(x):
+        o = x.new_zeros((tp,) + tuple(x.shape[1:]), dtype=_F64)
+        o[:t] = x
+        return o
+
+    qc = pad(q).reshape(nt, _BT, kdim)
+    kc = pad(k).reshape(nt, _BT, kdim)
+    vc = pad(v).reshape(nt, _BT, vdim)
+    gc = pad(log_decay).reshape(nt, _BT, kdim).cumsum(1)
+    bc = pad(beta).reshape(nt, _BT)
+    s = s0.clone()
+    outs = []
+    up = torch.triu(torch.ones(_BT, _BT, dtype=torch.bool), 0)
+    for n in range(nt):
+        qq, kk, vv, gm, b = qc[n] * scale, kc[n], vc[n], gc[n], bc[n]
+        a = (kk * gm.exp()) @ (kk * (-gm).exp()).T * b[:, None]
+        a = -a.masked_fill(up, 0)
+        akk = (_solve_inv(a) + torch.eye(_BT, dtype=_F64)) * b[None, :]
+        w, u = akk @ (gm.exp() * kk), akk @ vv
+        aqk = (qq * gm.exp()) @ (kk * (-gm).exp()).T
+        aqk = aqk.masked_fill(torch.triu(torch.ones(_BT, _BT, dtype=torch.bool), 1), 0)
+        v_new = u - w @ s
+        outs.append((qq * gm.exp()) @ s + aqk @ v_new)
+        s = s * gm[-1].exp()[:, None] + ((gm[-1:] - gm).exp() * kk).T @ v_new
+    return torch.cat(outs, 0)[:t], s
+
+
+def _bwd_scan(qg, kg, w, dv, gk, do, scale, t):
+    """Reverse-scan MATH from front_half_bwd outputs: (H_tilde, P); dS_in = P @ dS_out + H_tilde."""
+    nt = (t + _BT - 1) // _BT
+
+    def c3(x):
+        d = x.shape[-1]
+        xp = torch.zeros(nt * _BT, d, dtype=_F64)
+        xp[:t] = x[0, :, 0].to(_F64)
+        return xp.reshape(nt, _BT, d)
+
+    qgc, kgc, wc, dvc, gkc = c3(qg), c3(kg), c3(w), c3(dv), c3(gk)
+    doc = torch.zeros(nt * _BT, do.shape[-1], dtype=_F64)
+    doc[:t] = do.to(_F64)
+    doc = doc.reshape(nt, _BT, -1)
+    kdim, vdim = qg.shape[-1], dv.shape[-1]
+    big_h = torch.zeros(kdim, vdim, dtype=_F64)
+    big_p = torch.eye(kdim, dtype=_F64)
+    for n in reversed(range(nt)):
+        nv = min(_BT, t - n * _BT)
+        gamma = torch.exp2(gkc[n, nv - 1])[:, None]
+        lam = torch.zeros(_BT, dtype=_F64)
+        lam[:nv] = 1.0
+        x = torch.cat([big_h, big_p], 1)
+        y = lam[:, None] * (kgc[n] @ x)
+        y = y.clone()
+        y[:, :vdim] = y[:, :vdim] + dvc[n]
+        x = gamma * x + wc[n].T @ (-y)
+        x = x.clone()
+        x[:, :vdim] = x[:, :vdim] + qgc[n].T @ (scale * doc[n])
+        big_h, big_p = x[:, :vdim], x[:, vdim:]
+    return big_h, big_p
+
+
+@pytest.mark.parametrize("t,safe", [(128, False), (100, False), (128, True)])
+def test_front_half_bwd_matches_autograd(t, safe):
+    """front_half_bwd's (qg,kg,w,dv,gk), reverse-scanned, reproduce autodiff of naive."""
+    gen = torch.Generator().manual_seed(13)
+    kdim = vdim = 8
+    scale = kdim**-0.5
+    q = torch.randn(t, kdim, dtype=_F64, generator=gen)
+    k = torch.randn(t, kdim, dtype=_F64, generator=gen)
+    k = k / k.norm(dim=-1, keepdim=True)
+    v_fwd = torch.randn(t, vdim, dtype=_F64, generator=gen)
+    do = torch.randn(t, vdim, dtype=_F64, generator=gen)
+    beta = torch.rand(t, dtype=_F64, generator=gen)
+    if safe:
+        g = torch.randn(t, kdim, dtype=_F64, generator=gen) * 2.0
+        a_log = torch.randn(1, dtype=_F64, generator=gen)
+        dt_bias = torch.randn(1, kdim, dtype=_F64, generator=gen)
+        gate_kwargs = {
+            "safe_gate": True,
+            "a_log": a_log,
+            "dt_bias": dt_bias,
+            "gate_lower_bound": -5.0,
+        }
+        log_decay = -5.0 * torch.sigmoid(a_log.reshape(1, 1).exp() * (g + dt_bias))
+    else:
+        g = -torch.rand(t, kdim, dtype=_F64, generator=gen) * 0.5
+        gate_kwargs = {}
+        log_decay = g
+    qg, kg, w, dv, gk = eat_raw_ref.front_half_bwd(
+        q[:, None, :],
+        k[:, None, :],
+        g[:, None, :],
+        beta[:, None],
+        do[:, None, :],
+        scale,
+        gate_kwargs,
+        io_dtype=_F64,
+    )
+    big_h, big_p = _bwd_scan(qg, kg, w, dv, gk, do, scale, t)
+    s0 = torch.randn(kdim, vdim, dtype=_F64, generator=gen, requires_grad=True)
+    d_s_final = torch.randn(kdim, vdim, dtype=_F64, generator=gen)
+    o, s_final = _naive_fwd_diff(q, k, v_fwd, log_decay, beta, scale, s0)
+    ((o * do).sum() + (s_final * d_s_final).sum()).backward()
+    predicted = big_p @ d_s_final + big_h
+    assert _rel_l2(predicted, s0.grad) < _FRONT_TOL

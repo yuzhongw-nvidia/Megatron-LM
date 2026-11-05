@@ -275,10 +275,96 @@ def front_half_fwd(
     return w, u, kg, gk
 
 
-# The backward boundary-gradient summary (G, Tr) is the reverse-scan mirror of
-# the forward: it reuses the same WY front-half (w / kg / qg = q * 2^g) and adds
-# the intra-chunk term dv = Aqk @ do (Aqk the lower-triangular decayed q-k
-# attention, NOT a triangular inverse -- a plain masked gemm).  Its exact (G, Tr)
-# convention and V-major layout are derived in worklogs/.../lebron_cute_eat_raw.md
-# and must be validated against FLA's backward producer on a Blackwell GPU before
-# it is wired in, so it is deliberately NOT shipped here as a verified oracle.
+def _intra_Aqk(
+    qc: torch.Tensor, kc: torch.Tensor, gc: torch.Tensor, scale: float, bc_block: int = 16
+) -> torch.Tensor:
+    """Intra-chunk query-key attention ``Aqk[..., c, j] = scale * <q_c 2^(g_c-g_j), k_j>``.
+
+    Lower-triangular incl. the diagonal (``j <= c``, strictly-upper masked to 0);
+    NOT a triangular inverse -- a plain masked decayed gemm.  Sub-chunk referenced
+    the same way as :func:`_intra_A` so the ``2^(-g)`` factor stays overflow-safe in
+    fp32 under the bounded gate.
+    """
+    bt = qc.shape[-2]
+    nb = bt // bc_block
+    a = qc.new_zeros(tuple(qc.shape[:-1]) + (bt,))
+    for r in range(nb):
+        rs = slice(r * bc_block, (r + 1) * bc_block)
+        ref = gc[..., r * bc_block, :].unsqueeze(-2)
+        qd_r = (qc[..., rs, :] * scale) * (gc[..., rs, :] - ref).exp()
+        for c in range(r + 1):  # j-block <= c-block
+            cs = slice(c * bc_block, (c + 1) * bc_block)
+            ke_c = kc[..., cs, :] * (ref - gc[..., cs, :]).exp()
+            a[..., rs, cs] = qd_r @ ke_c.transpose(-1, -2)
+    mask_strict_upper = torch.triu(
+        torch.ones(bt, bt, dtype=torch.bool, device=a.device), diagonal=1
+    )
+    return a.masked_fill(mask_strict_upper, 0)
+
+
+def front_half_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    do: torch.Tensor,
+    scale: float,
+    gate_kwargs: dict,
+    io_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused backward front-half: raw window operands -> ``(qg, kg, w, dv, gk)``.
+
+    Torch reference of the work the eat-raw backward kernel does, replacing FLA's
+    backward glue (``kda_gate_chunk_cumsum`` + ``chunk_kda_fwd_intra`` +
+    ``chunk_kda_bwd_dAv``).  Inputs are the backward boundary window (the FIRST
+    local sequence; THD, ``B == 1`` dropped): ``q`` / ``k`` ``[T, HV, K]``, ``g``
+    the raw gate operand, ``beta`` ``[T, HV]``, ``do`` ``[T, HV, V]``, ``scale``;
+    ``HV == H``.  Returns the operands the fused CP backward scan kernel consumes,
+    ``[1, T, HV, .]``: ``qg`` = ``q * 2^gk``, ``kg`` and ``w`` (the same WY
+    front-half as the forward), ``dv`` = ``Aqk^T @ do`` (``Aqk`` the lower-incl.
+    diagonal decayed q-k attention), all io-dtype, and ``gk`` fp32.
+
+    ``dv = Aqk^T @ do`` (not ``Aqk @ do``): the ``^T`` is the transpose FLA's
+    ``chunk_kda_bwd_dAv`` folds into its A load; this convention makes the backward
+    boundary gradient agree with autodiff of ``naive_chunk_kda`` to machine
+    precision (``test_kda_cute_eat_raw``).  A ragged last chunk is neutrally padded
+    like the forward.
+    """
+    t, hv, kdim = q.shape
+    vdim = do.shape[-1]
+    nt = (t + CHUNK_SIZE - 1) // CHUNK_SIZE
+    tpad = nt * CHUNK_SIZE
+
+    def _pad(x):
+        if x.shape[0] == tpad:
+            return x.float()
+        out = x.new_zeros((tpad,) + tuple(x.shape[1:]), dtype=torch.float32)
+        out[:t] = x.float()
+        return out
+
+    ld = _apply_gate(g, gate_kwargs)
+    gc = _chunk_cumsum(_pad(ld))  # [Tpad, HV, K] natural-log cumsum
+    q_p, k_p, do_p, b_p = _pad(q), _pad(k), _pad(do), _pad(beta)
+
+    qc = q_p.permute(1, 0, 2).reshape(hv * nt, CHUNK_SIZE, kdim)
+    kc = k_p.permute(1, 0, 2).reshape(hv * nt, CHUNK_SIZE, kdim)
+    doc = do_p.permute(1, 0, 2).reshape(hv * nt, CHUNK_SIZE, vdim)
+    gcc = gc.permute(1, 0, 2).reshape(hv * nt, CHUNK_SIZE, kdim)
+    bcc = b_p.permute(1, 0).reshape(hv * nt, CHUNK_SIZE)
+
+    # w / kg from the forward WY (u, computed from `do` as a stand-in v, is unused).
+    w_c, _u_c, kg_c = wy_representation(kc, doc, gcc, bcc)
+    qg_c = qc * gcc.exp()  # q * 2^gk
+    aqk = _intra_Aqk(qc, kc, gcc, scale)
+    dv_c = aqk.transpose(-1, -2) @ doc  # dv = Aqk^T @ do
+
+    def _unchunk(x, last):
+        x = x.reshape(hv, nt, CHUNK_SIZE, last).permute(1, 2, 0, 3).reshape(tpad, hv, last)
+        return x[:t]
+
+    qg = _unchunk(qg_c, kdim).to(io_dtype).unsqueeze(0).contiguous()
+    kg = _unchunk(kg_c, kdim).to(io_dtype).unsqueeze(0).contiguous()
+    w = _unchunk(w_c, kdim).to(io_dtype).unsqueeze(0).contiguous()
+    dv = _unchunk(dv_c, vdim).to(io_dtype).unsqueeze(0).contiguous()
+    gk = (gc[:t] * _RCP_LN2).unsqueeze(0).contiguous()
+    return qg, kg, w, dv, gk
