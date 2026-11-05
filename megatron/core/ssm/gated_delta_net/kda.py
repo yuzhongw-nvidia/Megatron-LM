@@ -342,7 +342,75 @@ class KimiDeltaAttention(_GDNBase):
         self.dt_bias_dim = self.qk_dim_local_tp
         self.a_log_dim = self.num_k_heads_local_tp
         self.gate_params_dtype = torch.float32
-        self.gated_delta_rule = chunk_kda
+        self.gated_delta_rule = self._select_kda_kernel()
+
+    @staticmethod
+    def _kda_gate_out_dtype(config):
+        """Dtype the pre-KDA fusion should emit the decay gate (``raw_g``) in, per the KDA backend.
+
+        The cuDNN KDA frost kernel takes a fp32 gate operand, so emitting the gate in fp32 from the
+        pre-KDA fusion folds the otherwise-separate bf16->fp32 cast (``cudnn_kda.ops.prepare_gate``'s
+        ``g.float()``) into the fusion's output write, removing a standalone elementwise kernel and a
+        gate-sized memory round-trip at the start of the gated-delta-rule forward.  FLA and the
+        internal backend take the raw bf16 gate and cast it per element inside their own kernels, so
+        ``None`` keeps the gate in its natural dtype for them.  The fusion itself stays backend-
+        agnostic -- it only sees the dtype decided here.
+        """
+        return torch.float32 if getattr(config, "kda_kernel_backend", "fla") == "cudnn" else None
+
+    def _select_kda_kernel(self):
+        """The ``chunk_kda``-compatible kernel entry point for ``config.kda_kernel_backend``."""
+        backend = getattr(self.config, "kda_kernel_backend", "fla")
+        if backend == "fla":
+            return chunk_kda
+        if backend == "cudnn":
+            # Hybrid stacks can reach this module with experimental_attention_variant unset, which
+            # skips TransformerConfig's KDA validation block; keep the guard here too.
+            if getattr(self.config, "deterministic_mode", False):
+                raise ValueError(
+                    "kda_kernel_backend='cudnn' is not deterministic; use 'fla' with "
+                    "deterministic_mode=True."
+                )
+            from megatron.core.ssm.gated_delta_net.cudnn_kda import (
+                chunk_kda_cudnn,
+                cudnn_kda_unavailable_reason,
+            )
+            from megatron.core.ssm.gated_delta_net.cudnn_kda.ops import device_unavailable_reason
+
+            reason = cudnn_kda_unavailable_reason()
+            if reason is not None:
+                raise ImportError(
+                    f"kda_kernel_backend='cudnn' needs cudnn-frontend >= 1.32.0 with the native "
+                    f"KDA operators: {reason}"
+                )
+            # cuDNN's other KDA engines serve a forward-only subset; fail at construction rather
+            # than in the first backward when this GPU / CuTe DSL cannot run the training engines.
+            reason = device_unavailable_reason()
+            if reason is not None:
+                raise RuntimeError(f"kda_kernel_backend='cudnn' cannot run here: {reason}")
+            producer = getattr(self.config, "kda_cudnn_cp_state_producer", "cudnn")
+            if producer not in ("cudnn", "cudnn_fused", "cudnn_symm"):
+                raise ValueError(
+                    f"Unsupported kda_cudnn_cp_state_producer {producer!r}; "
+                    "expected 'cudnn', 'cudnn_fused', or 'cudnn_symm'."
+                )
+            # thd_max_packed_sequences caps the packed-document count; under chunkwise CP it also bounds
+            # the per-rank sequence count, so the cuDNN CP path uses it to pin the main-kernel plan key's
+            # sequence-count axis (static shapes -> no per-step recompile).  None leaves the count dynamic.
+            pad_nseq = getattr(self.config, "thd_max_packed_sequences", None)
+            if producer == "cudnn":
+                return partial(chunk_kda_cudnn, cp_pad_nseq=pad_nseq)
+            if producer == "cudnn_fused":
+                # Same frost summary + all_gather as 'cudnn', but the cross-rank fold runs in one fused
+                # Triton kernel instead of a Python matmul loop + staging (cp.CudnnFusedFoldProducer).
+                return partial(
+                    chunk_kda_cudnn, cp_state_producer="cudnn_fused", cp_pad_nseq=pad_nseq
+                )
+            # producer == "cudnn_symm": same summary + fused fold as 'cudnn_fused', but the
+            # all_gather x2 is replaced by a symmetric-memory push + put_signal/wait_signal exchange
+            # (cp.CudnnSymmFoldProducer).
+            return partial(chunk_kda_cudnn, cp_state_producer="cudnn_symm", cp_pad_nseq=pad_nseq)
+        raise ValueError(f"Unsupported kda_kernel_backend {backend!r}; expected 'fla' or 'cudnn'.")
 
     def _get_in_proj_qkv_layout(self) -> QKVLayout:
         """Describe KDA's rank-major packed input projection for Muon splitting."""
@@ -1078,6 +1146,13 @@ class KimiDeltaAttention(_GDNBase):
 
         gate = kernel_inputs.pop("gate")
 
+        # Match the fused path: hand the KDA kernel its gate in the dtype the backend wants. The
+        # unfused path has no kernel to fold the cast into, so this is a plain cast (a no-op for the
+        # FLA/internal backends, which keep the bf16 gate), kept for behavioural consistency.
+        gate_out_dtype = self._kda_gate_out_dtype(self.config)
+        if gate_out_dtype is not None and kernel_inputs["g"].dtype != gate_out_dtype:
+            kernel_inputs["g"] = kernel_inputs["g"].to(gate_out_dtype)
+
         return (
             kernel_inputs["q"],
             kernel_inputs["k"],
@@ -1152,6 +1227,7 @@ class KimiDeltaAttention(_GDNBase):
             seq_idx=seq_idx,
             cp_group=cp_group,
             strict_runtime_validation=strict_runtime_validation,
+            gate_out_dtype=self._kda_gate_out_dtype(self.config),
         )
         return (*outputs, A_log, dt_bias)
 
