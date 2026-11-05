@@ -1043,3 +1043,105 @@ def test_fused_pre_kda_gate_out_dtype_is_neutral():
     assert raw_g_bf16.dtype == torch.bfloat16
     assert raw_g_fp32.dtype == torch.float32
     torch.testing.assert_close(raw_g_fp32.to(torch.bfloat16), raw_g_bf16, rtol=0, atol=0)
+
+
+# --------------------------------------------------------------------------------------------
+# GPU, two ranks: GDR-region fwd+bwd timing (benchmark, not a parity assert).
+# --------------------------------------------------------------------------------------------
+
+
+class TestKdaCudnnGdrTiming:
+    """Time one KDA layer's GDR region (fwd+bwd) at CP2 for FLA and every cuDNN boundary-state
+    producer available on this branch, on a realistic per-rank token budget.
+
+    This is a benchmark, not a parity check: it prints ``[KDA_GDR_TIMING]`` lines and always
+    passes.  It is a one-node proxy for comparing the GDR cost of the optimization routes
+    (``cudnn_symm`` / ``cute_raw``) against FLA without the 64-GPU model -- the relative ordering
+    is meaningful; the absolute number is CP2, not the CP8 recipe.  Unknown/unavailable producers
+    are skipped, so the same test runs on every branch.  Env knobs: ``KDA_GDR_TIMING_LOCAL_T``
+    (tokens per rank, default 8192), ``KDA_GDR_TIMING_SAMPLES`` (median window, default 20),
+    ``KDA_GDR_TIMING_WARMUP`` (default 8, absorbs the cuDNN plan build and the CuTe JIT).
+    """
+
+    pytestmark = _CP2_MARKS
+
+    @pytest.fixture(scope="function", autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=2
+        )
+        model_parallel_cuda_manual_seed(123)
+        yield
+        torch.cuda.synchronize()
+        Utils.destroy_model_parallel()
+
+    def test_gdr_region_timing(self):
+        import time
+
+        local_t = int(os.environ.get("KDA_GDR_TIMING_LOCAL_T", "8192"))
+        samples = int(os.environ.get("KDA_GDR_TIMING_SAMPLES", "20"))
+        warmup = int(os.environ.get("KDA_GDR_TIMING_WARMUP", "8"))
+        cp_group = parallel_state.get_context_parallel_group()
+        cp_size = cp_group.size()
+        total = local_t * cp_size
+        total -= total % (2 * cp_size)  # the zigzag shard needs divisibility by 2 * cp_size
+        cu_seqlens = [0, total]  # one global document spanning every rank
+
+        config_kwargs = dict(
+            cp_size=cp_size, linear_cp_mode="chunkwise", f_lora_rank=8, gate_lora_rank=12
+        )
+        torch.manual_seed(2026)
+        reference = _build_kda(_make_backend_config("fla", **config_kwargs))
+        global_hidden_states = torch.randn(
+            (total, 1, reference.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        hidden_states = _zigzag_shard_thd(global_hidden_states, cu_seqlens, cp_group)
+
+        def time_module(module):
+            def one_step():
+                module.zero_grad(set_to_none=True)
+                module_input = hidden_states.detach().clone().requires_grad_(True)
+                # The CP layout conversion mutates the packed-seq metadata, so build it fresh.
+                packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+                output, bias = module(module_input, None, packed_seq_params=packed_seq_params)
+                assert bias is None
+                output.float().sum().backward()
+
+            for _ in range(warmup):  # absorb the one-time cuDNN plan build / CuTe JIT
+                one_step()
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            samples_ms = []
+            for _ in range(samples):
+                torch.distributed.barrier()
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                one_step()
+                torch.cuda.synchronize()
+                samples_ms.append((time.perf_counter() - start) * 1e3)
+            samples_ms.sort()
+            return samples_ms[len(samples_ms) // 2]
+
+        results = [("fla", time_module(reference))]
+        for producer in ("cudnn", "cudnn_symm", "cute", "cute_raw"):
+            try:
+                candidate = _build_kda(
+                    _make_backend_config(
+                        "cudnn", kda_cudnn_cp_state_producer=producer, **config_kwargs
+                    )
+                )
+                candidate.load_state_dict(reference.state_dict())
+                results.append((producer, time_module(candidate)))
+            except Exception as exc:  # producer not on this branch, or engines absent on this GPU
+                results.append((producer, f"skip:{type(exc).__name__}:{str(exc)[:60]}"))
+
+        if torch.distributed.get_rank() == 0:
+            for name, value in results:
+                shown = f"{value:.2f}ms" if isinstance(value, float) else value
+                print(
+                    f"[KDA_GDR_TIMING] T={total} cp={cp_size} local_t={local_t} "
+                    f"producer={name} fwd+bwd_median={shown}",
+                    flush=True,
+                )
