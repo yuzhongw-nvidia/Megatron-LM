@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Standalone entry point for multimodal_dev model training (FSDP + EP).
 
@@ -23,14 +23,24 @@ Usage::
         ... (other megatron args)
 """
 
+import dataclasses
+import functools
 import importlib
 import os
 import sys
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from examples.multimodal_dev.arguments import add_multimodal_args
-from examples.multimodal_dev.forward_step import forward_step, seqlen_alignment_factor
+from examples.multimodal_dev.arguments import (
+    add_multimodal_args,
+    encoder_recompute_overrides_from_args,
+    validate_encoder_recompute_args,
+)
+from examples.multimodal_dev.forward_step import (
+    forward_step,
+    quantized_row_alignment,
+    seqlen_alignment_factor,
+)
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import (
@@ -39,7 +49,6 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import initialize_runtime_services, set_run_config
-from megatron.training.training import validate_vision_flops_metadata
 from megatron.training.utils import start_memory_history_recording
 
 
@@ -52,16 +61,10 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
     registry factory functions.
     """
     args = get_args()
-    model_arch = getattr(args, "model_arch", "qwen35_vl")
 
-    from examples.multimodal_dev.models import MODEL_REGISTRY
+    from examples.multimodal_dev.models import registry_for
 
-    if model_arch not in MODEL_REGISTRY:
-        raise ValueError(
-            f"Unknown model arch '{model_arch}'. " f"Available: {list(MODEL_REGISTRY.keys())}"
-        )
-
-    registry = MODEL_REGISTRY[model_arch]
+    registry = registry_for(args)
 
     # --- language config (generic + model-specific post-processing) ---
     language_config = core_transformer_config_from_args(args)
@@ -85,6 +88,11 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
     if post_language_config_fn is not None:
         post_language_config_fn(language_config, args)
 
+    # Variable-length THD packs change the P2P tensor shape between
+    # microbatches; the pipeline schedule must negotiate shapes per send.
+    if getattr(args, "use_packed_sequence", False) and args.pipeline_model_parallel_size > 1:
+        language_config.variable_seq_lengths = True
+
     # --- vision config ---
     vision_config = registry["vision_config_fn"](
         num_layers_override=getattr(args, "vision_num_layers", None),
@@ -93,33 +101,63 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
+    # Transformer Engine's attention backend is process-wide (set_attention_backend asserts
+    # every model in the process agrees), so the encoder follows the decoder's choice.
+    vision_config.attention_backend = language_config.attention_backend
+    vision_config.flash_attention_version = language_config.flash_attention_version
 
-    if getattr(args, "recompute_vision", False):
-        vision_config.recompute_granularity = "full"
-        vision_config.recompute_method = "uniform"
-        vision_config.recompute_num_layers = 1
+    encoder_recompute_overrides = encoder_recompute_overrides_from_args(args)
+    if encoder_recompute_overrides:
+        vision_config = dataclasses.replace(
+            vision_config, **encoder_recompute_overrides
+        )
 
     # --- vision FLOPs metadata ---
     vision_flops_fn = registry.get("vision_flops_fn")
     if vision_flops_fn is not None:
         vision_flops_fn(args, language_config, vision_config)
-        # Validate centrally here (not left to each vision_flops_fn to
-        # remember) so a future architecture that sets
-        # count_vision_model_flops=True without calling this itself still
-        # gets an eager, actionable error instead of a confusing
-        # AttributeError the first time FLOPs are computed. Idempotent, so
-        # this is harmless if an implementation also calls it directly.
-        validate_vision_flops_metadata(args)
+
+    # --- language decoder hook (registry, default: HybridModelBuilder) ---
+    # Bound here, invoked by the arch factory at the point in construction it
+    # chooses (e.g. after its vision encoder, preserving the init RNG order).
+    from examples.multimodal_dev.models.base import build_language_model
+
+    language_model_builder = functools.partial(
+        registry.get("language_model_builder_fn") or build_language_model,
+        args,
+        language_config,
+        pre_process=pre_process,
+        post_process=post_process,
+        vp_stage=kwargs.get("vp_stage"),
+        pg_collection=kwargs.get("pg_collection"),
+    )
 
     # --- build model (fully delegated to the arch factory) ---
+    # Under MDP the model omits its vision encoder: the replicated encoder domain
+    # owns it. Build it here anyway, exactly as the model builds it natively
+    # (the arch's own encoder factory, the model's own process groups, right
+    # before the decoder), so the decoder initializes from the same RNG history
+    # as a native run and MDP can start its encoder from these weights
+    # (megatron.core.mdp.encoder.build_encoder_with_native_init).
+    native_init_encoder = None
+    if getattr(args, "mdp_enable", False) and pre_process:
+        from examples.multimodal_dev.mdp_adapter import build_mdp_adapter
+
+        native_init_encoder = build_mdp_adapter(
+            args, language_config, vision_config
+        ).build_encoder(vision_config, pg_collection=None)
+
     model = registry["model_factory_fn"](
         args=args,
         language_config=language_config,
         vision_config=vision_config,
         pre_process=pre_process,
         post_process=post_process,
+        language_model_builder=language_model_builder,
         **kwargs,
     )
+    if native_init_encoder is not None:
+        model.stash_mdp_init_vision_encoder(native_init_encoder)
 
     return model
 
@@ -142,33 +180,89 @@ def datasets_provider(train_val_test_num_samples, vp_stage=None):
     """
     del vp_stage
     args = get_args()
-    model_arch = getattr(args, "model_arch", "qwen35_vl")
     provider = getattr(args, "dataset_provider", "mock")
 
-    from examples.multimodal_dev.models import MODEL_REGISTRY
+    from examples.multimodal_dev.models import registry_for
 
-    if model_arch not in MODEL_REGISTRY:
-        raise ValueError(
-            f"Unknown model arch '{model_arch}'. " f"Available: {list(MODEL_REGISTRY.keys())}"
-        )
-
-    registry = MODEL_REGISTRY[model_arch]
+    registry = registry_for(args)
     available = registry.get("dataset_providers", {})
 
     if provider not in available:
         raise ValueError(
             f"Unknown dataset provider '{provider}' for arch "
-            f"'{model_arch}'. Available: {list(available.keys())}"
+            f"'{getattr(args, 'model_arch', None)}'. Available: {list(available.keys())}"
         )
 
     provider_fn = _resolve_provider_fn(available[provider])
     return provider_fn(train_val_test_num_samples)
 
 
+def _mdp_adapter_builder(args):
+    """Build the registered MDP adapter plus its vision TransformerConfig.
+
+    Mirrors model_provider's vision-config assembly so the MDP encoder is
+    built from exactly the same configuration as the native path.
+    """
+    from examples.multimodal_dev.mdp_adapter import build_mdp_adapter
+    from examples.multimodal_dev.models import registry_for
+
+    registry = registry_for(args)
+    language_config = core_transformer_config_from_args(args)
+    post_language_config_fn = registry.get("post_language_config_fn")
+    if post_language_config_fn is not None:
+        post_language_config_fn(language_config, args)
+    vision_config = registry["vision_config_fn"](
+        num_layers_override=getattr(args, "vision_num_layers", None),
+        variant=getattr(args, "model_variant", None),
+    )
+    vision_config.bf16 = language_config.bf16
+    vision_config.fp16 = language_config.fp16
+    vision_config.apply_rope_fusion = language_config.apply_rope_fusion
+    # Transformer Engine's attention backend is process-wide (set_attention_backend asserts
+    # every model in the process agrees), so the encoder follows the decoder's choice.
+    vision_config.attention_backend = language_config.attention_backend
+    vision_config.flash_attention_version = language_config.flash_attention_version
+    vision_config.params_dtype = language_config.params_dtype
+    # The encoder DDP derives its gradient prescale from this flag; MDP
+    # requires prescale 1 (WORLD sum, normalized once by 1/T_global).
+    vision_config.calculate_per_token_loss = language_config.calculate_per_token_loss
+    return build_mdp_adapter(args, language_config, vision_config), vision_config
+
+
+def _setup_mdp(args):
+    """Validate the MDP configuration and register the adapter builder."""
+    from megatron.core.mdp import integration as mdp_integration
+
+    if not getattr(args, "use_packed_sequence", False):
+        raise RuntimeError(
+            "--mdp-enable requires --use-packed-sequence: the dual-THD contract "
+            "packs decoder samples into [1, T]"
+        )
+    if not getattr(args, "use_vanilla_collate_fn", False):
+        raise RuntimeError(
+            "--mdp-enable requires --use-vanilla-collate-fn: pack_or_pad_batch "
+            "consumes the per-sample dict list only the identity collate produces"
+        )
+    mdp_integration.validate_from_args(args)
+    from megatron.core.mdp.checkpoint import assert_supported_checkpoint_config
+
+    assert_supported_checkpoint_config(args)
+    mdp_integration.set_adapter_builder(_mdp_adapter_builder)
+
+
 if __name__ == "__main__":
     datasets_provider.is_distributed = True
 
-    args = parse_and_validate_args(extra_args_provider=add_multimodal_args, args_defaults={})
+    args = parse_and_validate_args(
+        extra_args_provider=add_multimodal_args,
+        args_defaults={},
+    )
+    validate_encoder_recompute_args(args)
+    # Fail fast on a quantization recipe the collate path cannot align, before
+    # the model and datasets are built (the result is cached on the argument values).
+    quantized_row_alignment(args)
+    if getattr(args, "mdp_enable", False):
+        _setup_mdp(args)
     if args.pipeline_model_parallel_size > 1 and not args.use_packed_sequence:
         # The BSHD collate pads to --seq-length and rounds *up* to the CP/SP
         # alignment factor, while the pipeline scheduler sizes its static P2P
