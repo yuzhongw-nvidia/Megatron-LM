@@ -891,6 +891,39 @@ def test_padded_copy_matches_reference(fill, dtype):
         assert torch.equal(got, ref), f"t_rows={t_rows} length={length} rest={rest}"
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the state-pad masked write is a CUDA Triton kernel."
+)
+def test_pad_state_nseq_matches_reference():
+    """The masked-write ``_pad_state_nseq`` reproduces its new_zeros + copy, incl. the two guards.
+
+    This is the main-kernel plan-key state padding (``[N_local, HO, V, K]`` -> ``[target_n, ...]`` with
+    zero rows), the last per-step staging pair on the cuDNN CP path; shared by every cuDNN producer.
+    """
+    from megatron.core.ssm.gated_delta_net.cudnn_kda.cp import HAVE_TRITON, _pad_state_nseq
+
+    if not HAVE_TRITON:
+        pytest.skip("Triton is required for the state-pad masked write.")
+    device = torch.cuda.current_device()
+    gen = torch.Generator().manual_seed(23)
+    ho, v, k = 3, _HEAD_DIM, _HEAD_DIM
+
+    # Guards: None passes through, and an already-full state is returned unchanged.
+    assert _pad_state_nseq(None, 4) is None
+    full = torch.randn(4, ho, v, k, generator=gen).to(device=device, dtype=torch.float32)
+    assert _pad_state_nseq(full, 4) is full
+    assert _pad_state_nseq(full, 2) is full
+
+    # Padding: trailing sequences are zero, the live ones are copied exactly.
+    for n_local, target_n in [(1, 4), (2, 5), (3, 8)]:
+        state = torch.randn(n_local, ho, v, k, generator=gen).to(device=device, dtype=torch.float32)
+        got = _pad_state_nseq(state, target_n)
+        ref = state.new_zeros((target_n, ho, v, k))
+        ref[:n_local] = state
+        assert tuple(got.shape) == (target_n, ho, v, k)
+        assert torch.equal(got, ref), f"n_local={n_local} target_n={target_n}"
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the symm-mem exchange needs CUDA.")
 @pytest.mark.skipif(

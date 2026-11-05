@@ -271,9 +271,18 @@ def _prewarm_summary_bwd(ops, q, k, g, beta, do, total, scale, gate_kwargs, flag
 
 
 def _pad_state_nseq(state: Optional[torch.Tensor], target_n: int) -> Optional[torch.Tensor]:
-    """Pad a per-sequence state ``[N_local, ...]`` to ``[target_n, ...]`` with zero rows."""
+    """Pad a per-sequence state ``[N_local, ...]`` to ``[target_n, ...]`` with zero rows.
+
+    The main-kernel plan-key state padding (shared by every cuDNN producer): one masked-write kernel
+    on CUDA when Triton is available (``_padded_copy`` with a zero fill), instead of a ``new_zeros``
+    fill of the whole buffer plus a copy of the live rows -- the same 2->1 reduction as the
+    frost-summary ``_pad_window``, and the last per-step staging pair on the cuDNN CP path.  Falls
+    back to ``new_zeros`` + copy on CPU or without Triton (numerically identical).
+    """
     if state is None or state.shape[0] >= target_n:
         return state
+    if HAVE_TRITON and state.is_cuda:
+        return _padded_copy(state, target_n, 0.0)
     out = state.new_zeros((target_n,) + tuple(state.shape[1:]))
     out[: state.shape[0]] = state
     return out
