@@ -212,6 +212,23 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "chunkwise CP remain in the existing parity suite.",
     ),
     KernelEntry(
+        name="kda_cudnn_backend",
+        sources=(
+            "megatron/core/ssm/gated_delta_net/cudnn_kda/chunk.py",
+            "megatron/core/ssm/gated_delta_net/cudnn_kda/cp.py",
+            "megatron/core/ssm/gated_delta_net/cudnn_kda/ops.py",
+        ),
+        kind="dispatch",
+        notes="cudnn-frontend's native KDA kernels (kda_kernel_backend='cudnn') and the chunkwise-CP "
+        "composition from cuDNN's per-span summaries (the symm_mem / all_gather "
+        "boundary-exchange producers). Parity against FLA: "
+        "tests/unit_tests/ssm/gated_delta_net/test_kda_cudnn.py.",
+        exempt_reason="cuDNN's KDA engines are not bit-exact and need a Blackwell GPU plus "
+        "cudnn-frontend >= 1.32.0; TransformerConfig and KimiDeltaAttention reject "
+        "kda_kernel_backend='cudnn' under deterministic_mode, so the deterministic path stays on "
+        "the FLA/torch kernels covered by kda_recurrence.",
+    ),
+    KernelEntry(
         name="balanced_cp_route_metadata",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/cp_balanced_indexer.py",
