@@ -692,6 +692,30 @@ class TransformerConfig(ModelParallelConfig):
     kda_lower_bound: Optional[float] = None
     """Optional lower bound for KDA's bounded gate values."""
 
+    kda_kernel_backend: Literal["fla", "cudnn"] = "fla"
+    """Kernel implementation of the KDA chunked recurrence.
+
+    ``fla`` (default) runs flash-linear-attention's Triton ``chunk_kda``; ``cudnn`` runs
+    cudnn-frontend's native KDA kernels (>= 1.32.0, Blackwell SM100+) behind the same call,
+    including chunkwise context parallelism through cuDNN's per-span summary primitives.  FLA
+    stays required for the causal convolution, L2 norm and the CP context.
+    """
+
+    kda_cudnn_cp_boundary_exchange: Literal["symm_mem", "all_gather"] = "symm_mem"
+    """How the cuDNN KDA backend exchanges the chunkwise-CP boundary states.
+
+    ``symm_mem`` (default): boundary exchange of the fp32 (H, M) payload via CUDA symmetric memory
+    (NVLink) -- each rank pushes to its consumers' buffers and waits on ``put_signal``/``wait_signal``
+    releases.  Numerically identical to ``all_gather``.  The symm-mem path is not CUDA-graphable and
+    needs P2P across the CP group; there is no fallback, so an incompatible setup is an explicit
+    error -- combining ``symm_mem`` with CUDA graphs is rejected here, and a missing symmetric-memory
+    module or a rendezvous that cannot establish P2P raises at runtime.  Use ``all_gather`` instead.
+    ``all_gather``: the portable, CUDA-graph-safe path -- cuDNN's per-span summaries, an NCCL
+    all-gather, and one fused Triton kernel for the fp32 affine fold.  Both share the same frost
+    summary and fused fold.  Only used with ``kda_kernel_backend="cudnn"`` and
+    ``linear_cp_mode="chunkwise"``.
+    """
+
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use streamed Triton pre-GDR preprocessing for GDN-family attention."""
 
@@ -2973,6 +2997,39 @@ class TransformerConfig(ModelParallelConfig):
                             "KDA requires kda_lower_bound to be in [-5, 0) "
                             "when kda_safe_gate=True."
                         )
+                if self.kda_kernel_backend not in ("fla", "cudnn"):
+                    raise ValueError(
+                        "kda_kernel_backend must be 'fla' or 'cudnn', "
+                        f"got {self.kda_kernel_backend!r}."
+                    )
+                if self.kda_kernel_backend == "cudnn" and self.deterministic_mode:
+                    raise ValueError(
+                        "kda_kernel_backend='cudnn' is not deterministic; use 'fla' with "
+                        "deterministic_mode=True."
+                    )
+                if self.kda_cudnn_cp_boundary_exchange not in ("symm_mem", "all_gather"):
+                    raise ValueError(
+                        "kda_cudnn_cp_boundary_exchange must be 'symm_mem' or 'all_gather', "
+                        f"got {self.kda_cudnn_cp_boundary_exchange!r}."
+                    )
+                # 'symm_mem' exchanges the boundary states through symmetric memory, whose signals
+                # spin and are not CUDA-graph capturable.  There is no fallback, so reject the
+                # combination up front and point the user at the CUDA-graph-safe 'all_gather' path.
+                cuda_graphs_on = (
+                    self.cuda_graph_impl != "none"
+                    or self.enable_cuda_graph
+                    or self.external_cuda_graph
+                )
+                if (
+                    self.kda_kernel_backend == "cudnn"
+                    and self.kda_cudnn_cp_boundary_exchange == "symm_mem"
+                    and cuda_graphs_on
+                ):
+                    raise ValueError(
+                        "kda_cudnn_cp_boundary_exchange='symm_mem' is not CUDA-graphable (the "
+                        "symmetric-memory exchange cannot be captured); set "
+                        "kda_cudnn_cp_boundary_exchange='all_gather' or disable CUDA graphs."
+                    )
 
             if (
                 self.experimental_attention_variant == "gdn2"
