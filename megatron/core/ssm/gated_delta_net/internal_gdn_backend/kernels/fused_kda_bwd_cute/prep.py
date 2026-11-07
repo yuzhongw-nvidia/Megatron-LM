@@ -4,8 +4,7 @@ For every 64-token chunk of every sequence and head, with G the chunk-local
 log2 gate cumsum and G_last its last valid row:
 
 * qg = q 2^G and kg = k 2^(G_last - G) (zero past the sequence end);
-* w = Akk (k beta 2^G);
-* Aqk with its strict upper triangle zeroed (rows s >= t of column t kept).
+* w = Akk (k beta 2^G).
 
 These are the parts of FLA's ``recompute_w_u_fwd`` and ``chunk_kda_bwd_dAv``
 that the dS recurrence kernel (``dhu``) needs, without ``u`` or ``dA``; the
@@ -28,14 +27,12 @@ def _prep_kernel(
     k,
     gc,
     beta,
-    aqk,
     akk,
     cu_seqlens,
     chunk_offsets,
     qg,
     kg,
     w,
-    aqk_masked,
     num_sequences,
     H: tl.constexpr,
     K: tl.constexpr,
@@ -44,7 +41,6 @@ def _prep_kernel(
 ):
     chunk = tl.program_id(0)
     head = tl.program_id(1)
-    i_k = tl.program_id(2)
     if chunk >= tl.load(chunk_offsets + num_sequences):
         return
     # The sequence holding this chunk: the last s with chunk_offsets[s] <= chunk.
@@ -62,55 +58,47 @@ def _prep_kernel(
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < length
     rows = (bos + o_t).to(tl.int64)
-    o_k = i_k * BK + tl.arange(0, BK)
     o_c = tl.arange(0, BT)
-    p_tok = rows[:, None] * (H * K) + head * K + o_k[None, :]
     p_sq = rows[:, None] * (H * BT) + head * BT + o_c[None, :]
     m_tok = m_t[:, None]
-
-    b_g = tl.load(gc + p_tok, mask=m_tok, other=0.0)
-    last = (bos + tl.minimum(i_t * BT + BT, length) - 1).to(tl.int64)
-    b_gn = tl.load(gc + last * (H * K) + head * K + o_k)
-    b_q = tl.load(q + p_tok, mask=m_tok, other=0.0).to(tl.float32)
-    b_k = tl.load(k + p_tok, mask=m_tok, other=0.0).to(tl.float32)
-    b_b = tl.load(beta + rows * H + head, mask=m_t, other=0.0)
-    gamma = tl.exp2(b_g)
-    tl.store(qg + p_tok, (b_q * gamma).to(qg.dtype.element_ty), mask=m_tok)
-    b_kg = b_k * tl.where(m_tok, tl.exp2(b_gn[None, :] - b_g), 0.0)
-    tl.store(kg + p_tok, b_kg.to(kg.dtype.element_ty), mask=m_tok)
-    b_kb = (b_k * b_b[:, None] * gamma).to(k.dtype.element_ty)
+    # One program covers all key channels, so Akk is read once per chunk.
     b_akk = tl.load(akk + p_sq, mask=m_tok, other=0.0)
-    b_w = tl.dot(b_akk, b_kb)
-    tl.store(w + p_tok, b_w.to(w.dtype.element_ty), mask=m_tok)
-    if i_k == 0:
-        b_aqk = tl.load(aqk + p_sq, mask=m_tok, other=0.0)
-        b_aqk = tl.where(o_c[:, None] >= o_c[None, :], b_aqk, 0.0)
-        tl.store(aqk_masked + p_sq, b_aqk.to(aqk_masked.dtype.element_ty), mask=m_tok)
+    b_b = tl.load(beta + rows * H + head, mask=m_t, other=0.0)
+    last = (bos + tl.minimum(i_t * BT + BT, length) - 1).to(tl.int64)
+    for i_k in tl.static_range(K // BK):
+        o_k = i_k * BK + tl.arange(0, BK)
+        p_tok = rows[:, None] * (H * K) + head * K + o_k[None, :]
+        b_g = tl.load(gc + p_tok, mask=m_tok, other=0.0)
+        b_gn = tl.load(gc + last * (H * K) + head * K + o_k)
+        b_q = tl.load(q + p_tok, mask=m_tok, other=0.0).to(tl.float32)
+        b_k = tl.load(k + p_tok, mask=m_tok, other=0.0).to(tl.float32)
+        gamma = tl.exp2(b_g)
+        tl.store(qg + p_tok, (b_q * gamma).to(qg.dtype.element_ty), mask=m_tok)
+        b_kg = b_k * tl.where(m_tok, tl.exp2(b_gn[None, :] - b_g), 0.0)
+        tl.store(kg + p_tok, b_kg.to(kg.dtype.element_ty), mask=m_tok)
+        b_kb = (b_k * b_b[:, None] * gamma).to(k.dtype.element_ty)
+        b_w = tl.dot(b_akk, b_kb)
+        tl.store(w + p_tok, b_w.to(w.dtype.element_ty), mask=m_tok)
 
 
-def kda_dhu_prep(
-    q, k, gc, beta, aqk, akk, cu_seqlens, chunk_offsets, max_chunks, num_warps=4, block_k=64
-):
-    """Returns ``(qg, kg, w, aqk_masked)`` (BF16, shaped like ``q`` and ``aqk``).
+def kda_dhu_prep(q, k, gc, beta, akk, cu_seqlens, chunk_offsets, max_chunks, num_warps=4, block_k=64):
+    """Returns ``(qg, kg, w)`` (BF16, shaped like ``q``).
 
     ``max_chunks`` is an upper bound on ``chunk_offsets[-1]``.
     """
     _, _, heads, dim = q.shape
     qg, kg, w = torch.empty_like(q), torch.empty_like(q), torch.empty_like(q)
-    aqk_masked = torch.empty_like(aqk)
-    _prep_kernel[(max_chunks, heads, dim // block_k)](
+    _prep_kernel[(max_chunks, heads)](
         q,
         k,
         gc,
         beta,
-        aqk,
         akk,
         cu_seqlens,
         chunk_offsets,
         qg,
         kg,
         w,
-        aqk_masked,
         cu_seqlens.numel() - 1,
         H=heads,
         K=dim,
@@ -118,4 +106,4 @@ def kda_dhu_prep(
         BT=_BT,
         num_warps=num_warps,
     )
-    return qg, kg, w, aqk_masked
+    return qg, kg, w

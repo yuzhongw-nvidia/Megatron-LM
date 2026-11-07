@@ -42,27 +42,27 @@ def default_split(num_sequences: int, heads: int, device: torch.device) -> int:
 def prefer_tape(num_sequences: int, heads: int, device: torch.device) -> bool:
     """Whether to run the dS recurrence separately (``kda_dhu``) and the gradients from its tape.
 
-    The fused kernel walks each (sequence, head) with one or two CTAs, so it only
-    fills the device when the pair count approaches the SM count; below about
-    three quarters of it, the separate recurrence plus chunk-parallel gradients
-    is faster on GB200, above it the extra recurrence pass does not pay off.
+    The fused kernel walks each (sequence, head) with one or two CTAs, so its
+    parallelism is the pair count; the tape path spreads every chunk over the
+    device and overlaps the recurrence with the gradients, at the cost of the
+    extra prep and recurrence passes and of a transient tape as large as the
+    forward's ``h``.  On GB200 the tape path is about 3% faster at eight pairs
+    per SM and within 1% of the fused kernel beyond, so it is used up to
+    eight pairs per SM.
     """
     sms = torch.cuda.get_device_properties(device).multi_processor_count
-    return 4 * num_sequences * heads <= 3 * sms
+    return num_sequences * heads <= 8 * sms
 
 
-def tape_split(num_sequences: int, heads: int) -> int:
-    """CTAs per (sequence, head) for the tape-fed gradient kernel.
+# Chunks per work item of the persistent tape-fed kernel.
+TAPE_RUN = 2
 
-    The power of two that gives at least 1024 CTAs in total (one resident per
-    SM, so several short waves that even out ragged sequences), at most 32 per
-    pair; a power of two divides the usual chunk counts evenly, and a CTA past
-    its sequence's last chunk exits at once.
-    """
-    ways = 1
-    while ways < 32 and ways * num_sequences * heads < 1024:
-        ways *= 2
-    return ways
+
+def tape_flags(num_chunks: int, heads: int, device: torch.device) -> torch.Tensor:
+    """Zeroed int32 chunk ready flags (``[C * H]``) plus the work counter of the
+    tape-fed gradient kernel, for ``kda_dhu(..., flags=...)`` and
+    ``fused_kda_bwd(..., flags=...)``."""
+    return torch.zeros(num_chunks * heads + 1, dtype=torch.int32, device=device)
 
 
 def _require(name, tensor, dtype, shape, device):
@@ -126,6 +126,7 @@ def fused_kda_bwd(
     chunk_offsets=None,
     split=None,
     tape=None,
+    flags=None,
     debug=False,
     trace=False,
 ):
@@ -140,9 +141,12 @@ def fused_kda_bwd(
     final-state gradient ``[S, H, 128, 128]``; ``cu_seqlens`` is int32
     ``[S + 1]``.  ``chunk_offsets`` is the per-sequence chunk prefix of ``cu_seqlens``
     (computed on device when omitted). ``tape`` is ``(dh, dv_new)`` from
-    ``kda_dhu``: the kernel then skips the recurrence and ``split`` (default
-    ``tape_split``) CTAs per (sequence, head) take its chunks in turn; without a
+    ``kda_dhu``: the kernel then skips the recurrence and persistent CTAs take
+    runs of ``split`` (default ``TAPE_RUN``) chunks from a global counter; without a
     tape ``split`` is 1 or 2 (default ``default_split``) and dh0 is computed here.
+    ``flags`` are the chunk ready flags ``kda_dhu`` raised for this tape: the
+    kernel then launches as its programmatic dependent and starts on the chunks
+    already written, so nothing may be enqueued between the two calls.
     Returns ``(dq, dk, dv, dg, dbeta, dh0)``
     and, with ``debug=True``, a sixth FP32 tensor of per-chunk intermediates
     ``[C, H, 10, 64, 128]``. With ``trace=True`` the last element is an int64
@@ -166,7 +170,7 @@ def fused_kda_bwd(
         _require("dh", dh_tape, torch.bfloat16, tuple(h.shape), q.device)
         _require("dv_new", dv_new, torch.bfloat16, tuple(v.shape), q.device)
         if split is None:
-            split = tape_split(cu_seqlens.numel() - 1, heads)
+            split = TAPE_RUN
     else:
         dh_tape, dv_new = h, v
         if split is None:
@@ -178,9 +182,28 @@ def fused_kda_bwd(
     # Two-CTA split: per (sequence, head) and CTA, the FP32 dS handed to the other CTA.
     xfer_rows = (cu_seqlens.numel() - 1) * heads * 2 if split == 2 and tape is None else 1
     xfer = torch.empty((xfer_rows, _D, _D), device=q.device, dtype=torch.float32)
+    signal = flags is not None
+    if signal and tape is None:
+        raise ValueError("flags need a tape")
+    ctas = 0
+    if tape is not None:
+        # Persistent CTAs take runs of ``split`` chunks from a global counter
+        # (the last element of the flags, zeroed with them).
+        items = (cu_seqlens.numel() - 1) * heads * -(-h.shape[1] // split)
+        ctas = max(1, min(torch.cuda.get_device_properties(q.device).multi_processor_count, items))
+    if signal:
+        _require("flags", flags, torch.int32, (h.shape[1] * heads + 1,), q.device)
+        work = flags[-1:]
+    else:
+        flags = torch.empty((1,), device=q.device, dtype=torch.int32)
+        work = torch.zeros((1,), device=q.device, dtype=torch.int32)
+    # Unused buffers stay uninitialized: with flags, no kernel may run between
+    # the recurrence and this launch.
+    alloc = torch.zeros if debug else torch.empty
     debug_shape = (h.shape[1], heads, len(DEBUG_SLOTS), _BT, _D) if debug else (1, 1, 1, 1, 1)
-    debug_out = torch.zeros(debug_shape, device=q.device, dtype=torch.float32)
-    trace_out = torch.zeros((4, 8, 16) if trace else (1, 1, 1), device=q.device, dtype=torch.int64)
+    debug_out = alloc(debug_shape, device=q.device, dtype=torch.float32)
+    alloc = torch.zeros if trace else torch.empty
+    trace_out = alloc((4, 8, 16) if trace else (1, 1, 1), device=q.device, dtype=torch.int64)
 
     token_inputs = (q, k, v, gc, beta, aqk, akk)
     token_outputs = (dq, dk, dv, dg, dbeta)
@@ -198,20 +221,27 @@ def fused_kda_bwd(
         *(_dynamic(t, 1) for t in token_outputs),
         _dynamic(dh0, 0),
         _dynamic(xfer, 0),
+        _dynamic(flags, 0, align=4),
+        _dynamic(work, 0, align=4),
         from_dlpack(debug_out, assumed_align=16),
         from_dlpack(trace_out, assumed_align=16),
     )
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     device_index = q.device.index if q.device.index is not None else torch.cuda.current_device()
-    # With a tape the CTA count per (sequence, head) is a runtime argument.
+    # With a tape the run length and the persistent CTA count are runtime arguments.
     compiled_split = 1 if tape is not None else split
-    key = (heads, compiled_split, tape is not None, debug, trace, device_index)
-    runtime = (cutlass.Float32(scale), cutlass.Int32(split), stream)
+    key = (heads, compiled_split, tape is not None, signal, debug, trace, device_index)
+    runtime = (cutlass.Float32(scale), cutlass.Int32(split), cutlass.Int32(ctas), stream)
     with _LOCK:
         compiled = _CACHE.get(key)
         if compiled is None:
             kernel = FusedKdaBwdKernel(
-                heads=heads, split=compiled_split, tape=tape is not None, debug=debug, trace=trace
+                heads=heads,
+                split=compiled_split,
+                tape=tape is not None,
+                signal=signal,
+                debug=debug,
+                trace=trace,
             )
             compiled = cute.compile(kernel, *args, *runtime)
             _CACHE[key] = compiled
@@ -238,6 +268,8 @@ def kda_dhu(
     *,
     chunk_offsets=None,
     num_chunks=None,
+    flags=None,
+    keepalive=None,
     trace=False,
 ):
     """KDA's backward state recurrence from the forward residuals.
@@ -249,8 +281,13 @@ def kda_dhu(
     chunk-local log2 gate cumsum, ``beta`` FP32 ``[1, T, H]``, ``aqk`` and
     ``akk`` BF16 ``[1, T, H, 64]`` and ``dht`` the FP32 ``[S, H, 128, 128]``
     final-state gradient; ``num_chunks`` (default: an upper bound) sizes the
-    tape like the forward's ``h``.  Returns ``(dh, dh0, dv2)``: the BF16 per-chunk dS
-    ``[1, C, H, 128, 128]``, the FP32 initial-state gradient and BF16 dv_new.
+    tape like the forward's ``h``.  ``flags`` (from ``tape_flags``) makes
+    the recurrence raise a ready flag per chunk for ``fused_kda_bwd(...,
+    flags=flags)`` launched right after it; that kernel overlaps this one, so
+    the intermediate buffers this one reads are appended to ``keepalive``, which
+    the caller must hold until it has launched ``fused_kda_bwd``.  Returns ``(dh, dh0, dv2)``: the
+    BF16 per-chunk dS ``[1, C, H, 128, 128]``, the FP32 initial-state gradient
+    and BF16 dv_new.
     """
     import cutlass
     import cutlass.cute as cute
@@ -274,31 +311,42 @@ def kda_dhu(
     _require("dht", dht, torch.float32, (num_sequences, heads, _D, _D), device)
     if num_chunks is None:
         num_chunks = (tokens + _BT - 1) // _BT + num_sequences
-    qg, kg, w, aqk_masked = kda_dhu_prep(
-        q, k, gc, beta, aqk, akk, cu_seqlens, chunk_offsets, num_chunks
-    )
+    qg, kg, w = kda_dhu_prep(q, k, gc, beta, akk, cu_seqlens, chunk_offsets, num_chunks)
+    if flags is not None:
+        if keepalive is None:
+            raise ValueError("flags need a keepalive list")
+        keepalive.extend((qg, kg, w))
     dh = torch.empty((1, num_chunks, heads, _D, _D), device=device, dtype=torch.bfloat16)
     dv2 = torch.empty_like(do)
     dh0 = torch.empty_like(dht)
     trace_out = torch.zeros((8, 16) if trace else (1, 1), device=device, dtype=torch.int64)
+    signal = flags is not None
+    if signal:
+        _require("flags", flags, torch.int32, (num_chunks * heads + 1,), device)
+    else:
+        flags = torch.empty((1,), device=device, dtype=torch.int32)
     args = (
-        *(_dynamic(t, 1) for t in (kg, w, qg, do, aqk_masked, gc)),
+        *(_dynamic(t, 1) for t in (kg, w, qg, do, aqk, gc)),
         _dynamic(dht, 0),
         _dynamic(cu_seqlens, 0, align=4),
         _dynamic(chunk_offsets, 0, align=4),
         _dynamic(dh, 1),
         _dynamic(dv2, 1),
         _dynamic(dh0, 0),
+        _dynamic(flags, 0, align=4),
         from_dlpack(trace_out, assumed_align=16),
     )
     stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
     device_index = device.index if device.index is not None else torch.cuda.current_device()
-    key = ("dhu", heads, trace, device_index)
+    key = ("dhu", heads, signal, trace, device_index)
     with _LOCK:
         compiled = _CACHE.get(key)
         if compiled is None:
             compiled = cute.compile(
-                KdaDhuKernel(heads=heads, trace=trace), *args, cutlass.Float32(scale), stream
+                KdaDhuKernel(heads=heads, signal=signal, trace=trace),
+                *args,
+                cutlass.Float32(scale),
+                stream,
             )
             _CACHE[key] = compiled
     compiled(*args, cutlass.Float32(scale), stream)
