@@ -9,19 +9,24 @@ vision-language models built on Megatron-Core (FSDP + EP).
 multimodal_dev/
 ├── pretrain_multimodal.py   # Training entry point (model-agnostic)
 ├── forward_step.py          # Forward step, TP broadcast, loss computation
+├── mdp_adapter.py           # Registry dispatch: MDP adapter + VisionCollateSpec
 ├── arguments.py             # Multimodal CLI arguments
 ├── data/
 │   └── mock.py              # Mock dataset for end-to-end testing
 ├── models/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
-│   ├── base.py              # MultimodalModel base class (vision encoder + HybridModel)
+│   ├── base.py              # MultimodalModel (vision encoder + built decoder), default decoder hook
+│   ├── vision_base.py       # VisionCollateSpec, BaseGridVisionAdapter (shared MDP plumbing)
+│   ├── kimi_k3_vl/          # Kimi-K3 VL: MoonViT 3D + Kimi-K3 hybrid decoder (see below)
 │   └── qwen35_vl/           # Qwen3.5-VL architecture
 │       ├── factory.py       # Factory functions for pretrain entry point
+│       ├── mdp_adapter.py   # Qwen3.5-VL MDP adapter + collate spec
 │       ├── model.py         # Qwen35VLModel (MRoPE, vision encoder wiring)
 │       ├── configuration.py # TransformerConfig builders and constants
 │       ├── specs.py         # Vision layer spec builders
 │       ├── mrope.py         # 3D MRoPE position ID computation
 │       └── vision_encoder.py# ViT encoder (patch embed, merger, RoPE)
+├── recipes/                 # Recorded multi-node recipes (Kimi-K3 VL 9L proxy)
 └── scripts/                 # Launch scripts (torchrun, Slurm)
 ```
 
@@ -154,6 +159,78 @@ correctly but the script exits non-zero after save with
 `AttributeError: 'TokenizerConfig' object has no attribute 'make_vocab_size_divisible_by'`
 against this branch's `megatron.core.tokenizers.utils.build_tokenizer`.
 
+## Kimi-K3 VL (`--model-arch kimi_k3_vl`)
+
+MoonViT 3D vision tower and `patchmergerv2` projector in MCore modules, combined
+with the Kimi-K3 hybrid decoder (KDA, NoPE MLA, latent MoE, attention residuals,
+SiTU-GLU, MTP) built by `HybridModelBuilder` from the recipe. Reference: HF
+`moonshotai/Kimi-K3` remote code at revision `f831ab6`.
+
+| Piece | Where | Notes |
+|---|---|---|
+| Vision config | `kimi_k3_vl/configuration.py` | 27 layers (`--model-variant full`) or 4 (`proxy`); 1024 hidden, 12 x 128 QKV, 4096 tanh-GELU MLP, no biases |
+| Tower | `kimi_k3_vl/vision_encoder.py` | patch embed as a GEMM on 588-wide rows; 64 x 64 bilinear position table + sin-cos time rows (t <= 4); interleaved 2-D RoPE; one attention sequence per item (all frames); final RMSNorm; mean over frames then 2 x 2 merge |
+| Layer spec | `kimi_k3_vl/specs.py` | TE ViT layer + fp32-RoPE vision attention; `get_kimi_k3_vl_vision_reference_spec()` is a TF32-free numerics reference |
+| Data | `kimi_k3_vl/data.py`, `preprocessing.py` | `mock`, `mdp_mock` (video items t in {1, 2, 4}), `cord_v2` (Kimi tokenizer + native port of the HF processor) |
+| HF mapping | `kimi_k3_vl/hf_mapping.py` | full HF <-> MCore state-dict mapping (also mirrored by the agentic-mcore-dev `ckpt_tools` converter) |
+
+Model-specific facts worth knowing:
+
+* `<|media_pad|>` (163605) is expanded in the data: an item of grid `(t, h, w)`
+  fills `(h/2)*(w/2)` decoder slots regardless of `t`.
+* The decoder has no positional embedding, so the factory requires
+  `--position-embedding-type none` and no position ids are built.
+* MoonViT norms use `torch.finfo(dtype).eps` (no explicit eps in HF); the
+  factory sets `layernorm_epsilon` from the vision dtype (7.8e-3 for bf16).
+* Transformer Engine runs pure-fp32 GEMMs as TF32, so fp32 HF parity of the TE
+  spec is ~4e-4 relative; the reference spec reaches ~1e-6
+  (`tests/test_kimi_k3_vl_vision_parity.py`).
+* On H100 the Blackwell-only Kimi-K3 features (MoK, MXFP8, FA4, MLA latent CP)
+  must stay off. MDP runs with decoder TP and CP (e.g. TP2+SP CP2 EP4 on 8
+  H100s); `--mdp-overlap-window-capture` still needs `TP=CP=1`.
+* Decoder CP uses Kimi-K3's release layout, `--cp-partition-mode contiguous`
+  (KDA chunkwise CP; MLA converts internally). Contiguous CP needs fixed-shape
+  THD batches: add `--thd-static-packing --pad-packed-seq-alignment max
+  --max-seqlen-per-dp-cp-rank <rows> --thd-max-packed-sequences <n>`. The model
+  splits its inputs per CP rank before the embedding, and each rank scatters
+  only the vision rows its slice owns.
+* `--optimizer muon` trains the decoder with the layer-wise distributed
+  optimizer under MDP; the MoonViT encoder trains with Adam ZeRO-1 (decoder lr,
+  schedule, weight decay and betas).
+
+```bash
+torchrun --nproc_per_node 8 examples/multimodal_dev/pretrain_multimodal.py \
+    --model-arch kimi_k3_vl --model-variant proxy \
+    --dataset-provider mdp_mock --use-packed-sequence --use-vanilla-collate-fn \
+    --mdp-enable ...   # decoder args: see scripts/run_kimi_k3_vl.sh
+```
+
+Tests: `tests/test_kimi_k3_vl_vision_parity.py`, `test_kimi_k3_vl_crosscheck.py`
+(full model through the mapping, plus a bitwise HF -> MCore -> HF round trip),
+`test_kimi_k3_vl_preprocessing.py`, `test_kimi_k3_vl_data.py`. The HF-reference
+tests need transformers 4.56 - 5.0 (see `tests/_kimi_hf.py`).
+
+### Kimi-K3 VL 9L proxy, packed THD 64K on 64 GB300
+
+[`recipes/kimi_k3_vl_proxy_9layer/gb300/mxfp8_THD64K_64GPU_TP4PP1EP64CP2_muon_mdp.yaml`](recipes/kimi_k3_vl_proxy_9layer/gb300/mxfp8_THD64K_64GPU_TP4PP1EP64CP2_muon_mdp.yaml)
+is the multimodal counterpart of the Kimi-K3 9L proxy 64K recipe
+(`examples/moe_recipes/kimi_k3_proxy_9layer/`), trained through MDP.
+
+| | |
+|---|---|
+| Model | 9 decoder blocks (7 KDA + 2 MLA; 1 dense + 8 LatentMoE, 896 experts top-16) + 1 MTP depth, full Kimi-K3 widths; 3-layer MoonViT (9/93 of 27, rounded up) |
+| Input | one 65536-token sample per microbatch, GBS 256 (16.8M tokens per step); per-sample vision share 10-20 %, items of 256-4096 slots, a quarter of them video; no text-only samples (`mdp_mock`) |
+| Parallelism | TP4+SP / PP1 / EP64 / ETP1 / CP2 (contiguous) / DP8 / MBS 1 |
+| Features | FA4 4.0.0b11 MLA latent CP (a2a), KDA chunkwise CP, MXFP8 with FP8 parameter gather, HybridEP, MoK, fused AttnRes / GDN / cross entropy, grad-reduce and param-gather overlap, Muon (release flags) |
+
+Recorded run (50 iterations, 2026-11-04): 816 TFLOP/s/GPU mean over iterations
+3-50 (820.9 at iteration 50), peak 143.7 GB allocated and 166.2 GB device memory
+used per GPU, no NaN or skipped iterations, lm loss 13.44 -> 12.01. Compared
+with the text recipe, MDP rejects the dp_balanced packing scheduler and
+fine-grained activation offload, and chunked optimizer-state offload is left
+off. The 16 nodes must share one NVLink domain (EP64 spans every GPU and
+HybridEP sizes its domain from the ranks it can reach).
+
 ## Architecture
 
 `pretrain_multimodal.py` is **model-agnostic**. All model-specific logic
@@ -163,6 +240,8 @@ is delegated to factory functions registered in `MODEL_REGISTRY`
 - Building `language_config` from Megatron CLI args
 - Constructing `vision_config` via the registry
 - Applying vision recompute and dtype propagation
+- Binding the registry's decoder hook (`language_model_builder_fn`) to the
+  stage placement and passing it to the model factory
 - Routing to model and dataset factories
 
 The `forward_step` is also model-agnostic — it uses the model's
@@ -201,30 +280,54 @@ def post_language_config(language_config, args):
 def set_vision_flops_metadata(args, language_config, vision_config):
     """(Optional) Set vision FLOPs metadata on args.
 
-    Omit this function entirely unless megatron.training.training implements
-    a FLOPs calculator for THIS architecture -- "qwen35_vl" is the only
-    variant today, and naming it from a different architecture would report
-    Qwen3.5-VL's formula for your model. An unrecognised variant is rejected
-    at model-construction time.
+    ``num_floating_point_operations`` adds a vision-encoder term when
+    ``count_vision_model_flops`` is set, so an arch that skips this hook
+    reports language-model FLOPs only. All of the fields below are
+    required once the flag is on:
+
+        args.vision_num_layers, vision_hidden_size, vision_ffn_hidden_size,
+        vision_num_attention_heads, vision_kv_channels, vision_in_channels,
+        vision_patch_size, vision_temporal_patch_size, vision_out_hidden_size,
+        vision_merge_dim
+
+    plus the shape knobs ``vision_gated_mlp`` (default False) and
+    ``vision_merger_hidden_size`` (default ``vision_merge_dim``). The
+    per-batch row counts (patch rows, packed-attention ``L^2``, merged rows)
+    are not derived from these fields: the collator measures them through
+    the model's ``VisionCollateSpec.workload_of``. See
+    ``megatron/training/training.py::vision_encoder_flops``.
     """
     args.count_vision_model_flops = True
-    args.vision_flops_variant = "<variant implemented in megatron/training/training.py>"
-    # ... set the vision_* dimension fields that variant requires;
-    # see models/qwen35_vl/factory.py:set_vision_flops_metadata
+    # ... set dimension fields for FLOPs calculation
 
-def build_model(args, language_config, vision_config, **kwargs):
-    """(Required) Build and return the complete model instance."""
+def build_model(args, language_config, vision_config, language_model_builder, **kwargs):
+    """(Required) Build and return the complete model instance.
+
+    ``language_model_builder(**config_overrides)`` builds this stage's decoder
+    (registry ``language_model_builder_fn``; default ``HybridModelBuilder``,
+    so ``--spec`` and builder-side features apply). Never construct
+    ``HybridModel(...)`` here -- it would silently drop whatever the builder
+    adds. Pass only architectural constants as overrides.
+    """
     from .model import LlavaNextModel
-    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 
     return LlavaNextModel(
         language_config=language_config,
-        hybrid_stack_spec=hybrid_stack_spec,
-        hybrid_layer_pattern=args.hybrid_layer_pattern,
+        # Build the vision encoder first, then call the builder: the order
+        # fixes the parameter-initialization RNG stream.
+        language_model_builder=lambda: language_model_builder(rotary_base=1_000_000),
         vision_config=vision_config,
+        pre_process=kwargs.get("pre_process", True),
+        vp_stage=kwargs.get("vp_stage"),
         # ... model-specific args
     )
 ```
+
+`MultimodalModel(language_config, language_model, vision_encoder,
+image_token_id, pre_process, vp_stage)` wraps an already-built decoder; any
+decoder that accepts `decoder_input` / `input_ids` / `position_ids` /
+`packed_seq_params` / `labels` and exposes `embedding` works (`HybridModel`,
+`GPTModel`).
 
 ### Step 3 — Register in `MODEL_REGISTRY`
 
@@ -245,11 +348,38 @@ MODEL_REGISTRY["llava_next"] = {
     "vision_config_fn": get_llava_next_vision_config,      # required
     "post_language_config_fn": _llava_next_post_language_config,  # optional
     "vision_flops_fn": _llava_next_vision_flops,           # optional
+    "vision_collate_spec_fn": _llava_next_collate_spec,    # packed multimodal
+    "mdp_adapter_fn": _llava_next_mdp_adapter,             # --mdp-enable
     "dataset_providers": {                                  # optional
         "mock": "multimodal_dev.data.llava_mock.train_valid_test_datasets_provider",
     },
 }
 ```
+
+### Step 3b — Vision collate spec and MDP adapter
+
+The THD collator and MDP never read vision geometry from loose `args`
+attributes; they ask the model. Provide, usually in
+`models/<arch>/mdp_adapter.py`:
+
+- `build_collate_spec(args) -> VisionCollateSpec`
+  (`models/vision_base.py`): image-token id, `shape_key_width`,
+  `payload_rows_of`, `output_rows_of`, `workload_of`, `grid_key`,
+  `require_contiguous_slots`. It must be callable on every rank without a
+  model instance.
+- `build_mdp_adapter(args, language_config, vision_config)`: normally a
+  `BaseGridVisionAdapter` subclass that only implements `build_encoder` and
+  `encode`; `output_hidden_size` is the width of one encoder output row
+  (the projector output), which MDP uses for its bridge buffers.
+
+MDP core sees an item only as `payload_rows`, `output_rows`, an LPT cost and
+an opaque `shape_key`; see `megatron/core/mdp/README.md`.
+
+Shared code carries no architecture defaults: `--model-arch` is required and
+`--image-token-id` defaults to `None`, meaning "the architecture's own id".
+Resolve it once in the package (Qwen3.5-VL: `configuration.resolve_image_token_id`)
+and use that everywhere the package needs the id (factory, collate spec,
+datasets).
 
 ### Step 4 — (Optional) Add a dataset provider
 
@@ -279,46 +409,11 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
 
 | Field | Required | Signature |
 |-------|----------|-----------|
-| `model_factory_fn` | Yes | `(args, language_config, vision_config, **kwargs) -> MegatronModule` |
+| `model_factory_fn` | Yes | `(args, language_config, vision_config, pre_process, post_process, language_model_builder, **kwargs) -> MegatronModule` |
+| `language_model_builder_fn` | No | `(args, language_config, *, pre_process, post_process, vp_stage, pg_collection, **config_overrides) -> decoder`; default `models.base.build_language_model` |
 | `vision_config_fn` | Yes | `(num_layers_override=None) -> TransformerConfig` |
 | `post_language_config_fn` | No | `(language_config, args) -> None` |
 | `vision_flops_fn` | No | `(args, language_config, vision_config) -> None` |
+| `vision_collate_spec_fn` | For packed (THD) training | `(args) -> VisionCollateSpec` |
+| `mdp_adapter_fn` | For `--mdp-enable` | `(args, language_config, vision_config) -> MdpModelAdapter` |
 | `dataset_providers` | No | `Dict[str, str \| callable]` |
-
-## Vision FLOPs Accounting
-
-Training throughput uses `megatron.training.training.num_floating_point_operations`.
-Architectures opt in through `vision_flops_fn`, which sets a supported
-`vision_flops_variant` plus the vision model dimensions on the global args
-(see `qwen35_vl/factory.py:set_vision_flops_metadata`). `model_provider`
-validates the result centrally right after calling `vision_flops_fn`, via
-`megatron.training.training.validate_vision_flops_metadata(args)` --
-individual `vision_flops_fn` implementations do not need to call it
-themselves. Enabling an unknown variant or omitting required metadata is an
-error rather than silently reporting decoder-only FLOPs, raised at
-model-construction time rather than at the first training iteration.
-
-For Qwen3.5-VL, the estimate includes the dominant training matrix operations
-from:
-
-- the Conv3d patch projection;
-- every vision Transformer layer's dense QKV/output projections, bidirectional
-  attention, and two-linear GELU MLP; and
-- both patch-merger projections.
-
-`forward_step` records the actual `(T, H, W)` values from every
-`image_grid_thw` microbatch. The training loop globally reduces three
-sufficient statistics: total input patches, the per-temporal-frame
-`sum(sequence_length^2)` used by packed vision attention, and the number of
-post-merger tokens. This makes variable-resolution, multi-image, text-only and
-packed-sequence batches use their real vision work.
-
-The runtime statistics are the only input to the vision terms. An entry point
-that enables `count_vision_model_flops` without calling
-`update_vision_model_flops_stats` from its forward step gets decoder-only
-FLOPs plus a one-time warning, not an estimate synthesised from nominal
-architecture metadata — a fabricated-but-plausible figure would silently
-corrupt MFU comparisons and perf regression tracking.
-
-As in the language-model estimate, small elementwise work such as LayerNorm,
-GELU, RoPE, interpolation, and residual additions is intentionally omitted.

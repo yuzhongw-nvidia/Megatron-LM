@@ -1,11 +1,16 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Base multimodal model for FSDP + EP and PP training.
 
-Composes a vision encoder and a ``HybridModel`` language decoder.  The
-vision encoder is built only on the first PP stage; the language
-decoder spans all PP stages following standard Megatron PP layout
-flags.
+Composes a vision encoder and a pre-built language decoder.  The vision
+encoder is built only on the first PP stage; the language decoder spans
+all PP stages following standard Megatron PP layout flags.
+
+The decoder is not constructed here. A model package receives a
+``language_model_builder`` from the entry point (the registry's
+``language_model_builder_fn``, default :func:`build_language_model`), so
+any decoder MCore can build -- with its own spec, builder-side features
+and full keyword set -- becomes multimodal without editing this file.
 
 Subclasses override ``compute_position_ids()`` for model-specific
 position encoding (e.g. MRoPE for Qwen3.5-VL).
@@ -17,10 +22,10 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -79,51 +84,113 @@ def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
     return idx.long()
 
 
+def cp_partition_index(packed_seq_params, total_tokens, cp_size, cp_rank, device=None):
+    """Global packed positions this CP rank owns, in its local order (THD).
+
+    Follows ``packed_seq_params.cp_partition_mode`` -- the decoder input layout:
+    ``zigzag`` is TE's per-sequence ``thd_get_partitioned_indices``;
+    ``contiguous`` is rows ``[r * T / cp, (r + 1) * T / cp)`` of the whole packed
+    buffer, as ``get_cp_slice_for_thd`` slices decoder-only batches. MDP cuts
+    vision rows into CP shards with the same rule
+    (``megatron.core.mdp.cp_partition``).
+    """
+    mode = getattr(packed_seq_params, "cp_partition_mode", "zigzag")
+    if mode == "contiguous":
+        if total_tokens % cp_size != 0:
+            raise RuntimeError(
+                f"contiguous CP needs packed rows {total_tokens} divisible by cp_size={cp_size}"
+            )
+        local = total_tokens // cp_size
+        if device is None:
+            device = packed_seq_params.cu_seqlens_q_padded.device
+        return torch.arange(cp_rank * local, (cp_rank + 1) * local, device=device)
+    if mode != "zigzag":
+        raise ValueError(f"unsupported cp_partition_mode {mode!r}")
+    return _thd_cp_partition_index(
+        packed_seq_params.cu_seqlens_q_padded, total_tokens, cp_size, cp_rank
+    )
+
+
+def build_language_model(
+    args,
+    language_config: TransformerConfig,
+    *,
+    pre_process: bool,
+    post_process: bool,
+    vp_stage: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    **config_overrides,
+) -> MegatronModule:
+    """Default ``language_model_builder_fn``: the decoder exactly as ``pretrain_hybrid`` builds it.
+
+    Goes through ``hybrid_config_from_args`` + ``HybridModelBuilder`` rather than
+    calling ``HybridModel(...)`` directly, so the multimodal decoder gets
+    everything the text-only decoder gets: ``--spec`` (static spec or a
+    ``config -> spec`` factory), builder-side spec selection and stack features,
+    and the full keyword set (``fp16_lm_cross_entropy``,
+    ``seq_len_interpolation_factor``, ``pg_collection``, ...). A hand-written
+    constructor call silently drops whatever the builder later learns.
+
+    Args:
+        args: Megatron parsed arguments.
+        language_config: The decoder ``TransformerConfig``, already
+            post-processed by the model's ``post_language_config_fn``. Used
+            as-is; not rebuilt from ``args``.
+        pre_process / post_process / vp_stage: Pipeline placement.
+        pg_collection: Model process groups; defaults to the global mpu groups.
+        **config_overrides: ``HybridModelConfig`` fields the model package pins
+            regardless of the CLI (e.g. architectural RoPE constants).
+    """
+    from megatron.training.argument_utils import hybrid_config_from_args
+    from megatron.training.models.hybrid import HybridModelBuilder
+
+    model_config = hybrid_config_from_args(args, config=language_config)
+    for name, value in config_overrides.items():
+        if not hasattr(model_config, name):
+            raise AttributeError(f"HybridModelConfig has no field '{name}' to override")
+        setattr(model_config, name, value)
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    return HybridModelBuilder(model_config).build_model(
+        pg_collection, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
+    )
+
+
 class MultimodalModel(MegatronModule):
     """Base class for multimodal vision-language models.
 
-    Composes a pre-constructed vision encoder and a ``HybridModel`` language
-    decoder.  Supports pipeline parallelism: the vision encoder is built
-    only on the first PP stage, while the language decoder spans all PP
-    stages following standard Megatron PP layout flags.
+    Composes a pre-constructed vision encoder and a pre-constructed language
+    decoder.  Supports pipeline parallelism: the vision encoder lives only on
+    the first PP stage, while the language decoder spans all PP stages
+    following standard Megatron PP layout flags.
+
+    The decoder must accept ``decoder_input`` / ``input_ids`` /
+    ``position_ids`` / ``packed_seq_params`` / ``labels`` keyword arguments and
+    expose ``embedding`` on the first stage (``HybridModel`` and ``GPTModel``
+    both do). It is called on every PP stage with ``input_ids`` alongside
+    ``decoder_input``, so token-indexed decoder features (e.g. hashed n-gram
+    memories) see the raw ids on every stage.
 
     Args:
         language_config: ``TransformerConfig`` for the language decoder.
-        hybrid_stack_spec: ``ModuleSpec`` defining HybridModel layer families.
-        hybrid_layer_pattern: Ordered HybridModel decoder and MTP layer pattern.
+        language_model: The built decoder for this PP/VPP stage, normally from
+            :func:`build_language_model`. Its own ``pre_process`` /
+            ``post_process`` must match this wrapper's placement.
         vision_encoder: Pre-constructed vision encoder module (or ``None``
-            on non-first PP stages).
-        vocab_size: Language model vocabulary size.
-        max_sequence_length: Maximum sequence length.
+            on non-first PP stages / under MDP).
         image_token_id: Token ID for image placeholder tokens.
-        position_embedding_type: Position embedding type for the decoder.
-        rotary_percent: Fraction of hidden dim for RoPE.
-        rotary_base: Base frequency for RoPE.
-        parallel_output: Keep outputs split across TP ranks.
-        share_embeddings_and_output_weights: Tie input/output embeddings.
-        pre_process: First PP stage flag — when True, build embedding +
-            run vision encoder + scatter image embeddings.
-        post_process: Last PP stage flag — when True, build output layer +
-            compute loss inside ``HybridModel``.
-        vp_stage: Virtual pipeline stage (forwarded to ``HybridModel``).
+        pre_process: First PP stage flag — when True, run vision encoder +
+            scatter image embeddings into the text embeddings.
+        vp_stage: Virtual pipeline stage (must match the decoder's).
     """
 
     def __init__(
         self,
         language_config: TransformerConfig,
-        hybrid_stack_spec: ModuleSpec,
-        hybrid_layer_pattern: str,
+        language_model: MegatronModule,
         vision_encoder: Optional[MegatronModule],
-        vocab_size: int,
-        max_sequence_length: int,
         image_token_id: int,
-        position_embedding_type: str = "rope",
-        rotary_percent: float = 1.0,
-        rotary_base: int = 10000,
-        parallel_output: bool = True,
-        share_embeddings_and_output_weights: bool = False,
         pre_process: bool = True,
-        post_process: bool = True,
         vp_stage: Optional[int] = None,
     ):
         super().__init__(config=language_config)
@@ -134,29 +201,35 @@ class MultimodalModel(MegatronModule):
         # ``post_process`` is deliberately not stored: nothing reads it off this
         # wrapper, and ``get_attr_wrapped_model(model, 'post_process', ...)``
         # (schedules.clear_embedding_activation_buffer) must keep resolving to
-        # the HybridModel that owns ``embedding_activation_buffer``.
+        # the decoder that owns ``embedding_activation_buffer``.
         # Surfaced for ``finalize_model_grads._allreduce_word_embedding_grads``
-        # which inspects the outer module (not the wrapped HybridModel) when
+        # which inspects the outer module (not the wrapped decoder) when
         # PP > 1 and either tied embeddings or MTP layers are in use.
-        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.share_embeddings_and_output_weights = bool(
+            getattr(language_model, "share_embeddings_and_output_weights", False)
+        )
 
         # Vision encoder lives only on the first PP stage.
         self.vision_model = vision_encoder if pre_process else None
-        self.language_model = HybridModel(
-            config=language_config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=vocab_size,
-            max_sequence_length=max_sequence_length,
-            hybrid_layer_pattern=hybrid_layer_pattern,
-            pre_process=pre_process,
-            post_process=post_process,
-            vp_stage=vp_stage,
-            parallel_output=parallel_output,
-            share_embeddings_and_output_weights=(share_embeddings_and_output_weights),
-            position_embedding_type=position_embedding_type,
-            rotary_percent=rotary_percent,
-            rotary_base=rotary_base,
-        )
+        self.language_model = language_model
+
+    def stash_mdp_init_vision_encoder(self, encoder: Optional[MegatronModule]) -> None:
+        """Keep a natively built vision encoder for MDP without making it a submodule.
+
+        Under MDP ``pretrain_multimodal.model_provider`` still builds the vision
+        encoder where the native model does -- before the decoder, so the
+        decoder initializes from the same RNG history -- but MDP's replicated
+        encoder domain owns the vision weights. The built encoder is held outside
+        the module tree (no parameters, no checkpoint keys, no DDP buffer) until
+        MDP copies its initial weights (:meth:`take_mdp_init_vision_encoder`).
+        """
+        object.__setattr__(self, "_mdp_init_vision_encoder", encoder)
+
+    def take_mdp_init_vision_encoder(self) -> Optional[MegatronModule]:
+        """Hand the stashed native encoder to MDP once, and drop the reference."""
+        encoder = getattr(self, "_mdp_init_vision_encoder", None)
+        object.__setattr__(self, "_mdp_init_vision_encoder", None)
+        return encoder
 
     def shared_embedding_or_output_weight(self):
         """Surface the wrapped language model's shared embedding / output
@@ -173,6 +246,134 @@ class MultimodalModel(MegatronModule):
             input_tensor = [input_tensor]
         assert len(input_tensor) == 1
         self.language_model.set_input_tensor(input_tensor[0])
+
+    def _prepare_decoder_inputs(
+        self,
+        *,
+        input_ids: Tensor,
+        position_ids: Tensor = None,
+        attention_mask: Tensor = None,
+        labels: Tensor = None,
+        loss_mask: Tensor = None,
+        padding_mask: Tensor = None,
+        pixel_values: Tensor = None,
+        image_grid_thw: Tensor = None,
+        decoder_input: Tensor = None,
+        packed_seq_params=None,
+        vision_embeddings: Tensor = None,
+    ):
+        """Prepare the rank-local inputs shared by eager and scheduled decoder execution.
+
+        The native path runs the vision encoder here, while MDP supplies its
+        detached endpoint leaf through ``vision_embeddings`` after P2/P3.
+        Vision work and embedding scatter intentionally stay outside the
+        decoder's fine-grained schedule.
+        """
+        if position_ids is None:
+            with nvtx_phase("compute_position_ids"):
+                position_ids = self.compute_position_ids(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    packed_seq_params=packed_seq_params,
+                )
+
+        # Context parallelism splits the sequence BEFORE the embedding: each CP
+        # rank embeds only its own tokens and scatters only the vision rows whose
+        # image-token slots it owns. MDP delivers exactly those rows (its leaf is
+        # this rank's CP shard); the native path selects them from the full
+        # encoder output, so both paths run the same rank-local scatter.
+        full_input_ids = input_ids
+        if decoder_input is not None:
+            # A caller-supplied full-length decoder input is split like the rest.
+            decoder_input = self._cp_split_sequence(decoder_input, 0, packed_seq_params)
+        (
+            input_ids, labels, loss_mask, attention_mask, padding_mask,
+        ) = self._cp_split_for_forward(
+            input_ids=input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
+
+        if self.pre_process:
+            # An MDP endpoint supplies the pre-encoded leaf. The native path
+            # encodes pixels here; both feed the same scatter below.
+            if vision_embeddings is None:
+                if self.vision_model is not None and pixel_values is not None:
+                    with nvtx_phase("native_vision_encoder_forward"):
+                        vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+                    vision_embeddings = self._cp_local_vision_rows(
+                        full_input_ids, vision_embeddings, packed_seq_params
+                    )
+
+            if decoder_input is None:
+                with nvtx_phase("text_embedding"):
+                    text_embeddings = self.language_model.embedding(
+                        input_ids=input_ids, position_ids=None
+                    )
+
+                if vision_embeddings is not None:
+                    with nvtx_phase("scatter_vision_embeddings"):
+                        decoder_input = self._scatter_vision_embeddings(
+                            input_ids, text_embeddings, vision_embeddings
+                        )
+                else:
+                    if bool((input_ids == self.image_token_id).any()):
+                        raise RuntimeError(
+                            "input_ids contain image-token slots but no vision "
+                            "source was provided (neither pixel_values nor "
+                            "vision_embeddings); the text path would silently "
+                            "train on placeholder embeddings"
+                        )
+                    decoder_input = text_embeddings
+        else:
+            # Intermediate PP/VPP chunks receive their activation through
+            # GPTModel.set_input_tensor during scheduled or eager execution.
+            decoder_input = None
+
+        return dict(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=decoder_input,
+            labels=labels,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+            packed_seq_params=packed_seq_params,
+        )
+
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor = None,
+        attention_mask: Tensor = None,
+        labels: Tensor = None,
+        loss_mask: Tensor = None,
+        padding_mask: Tensor = None,
+        pixel_values: Tensor = None,
+        image_grid_thw: Tensor = None,
+        decoder_input: Tensor = None,
+        packed_seq_params=None,
+        vision_embeddings: Tensor = None,
+        **kwargs,
+    ):
+        """Build the native fine-grained schedule for the decoder only."""
+        decoder_inputs = self._prepare_decoder_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            decoder_input=decoder_input,
+            packed_seq_params=packed_seq_params,
+            vision_embeddings=vision_embeddings,
+        )
+        return self.language_model.build_schedule_plan(**decoder_inputs)
 
     def _scatter_vision_embeddings(
         self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings: Tensor
@@ -201,8 +402,17 @@ class MultimodalModel(MegatronModule):
 
         combined = text_embeddings.transpose(0, 1).contiguous()
         image_mask = input_ids == self.image_token_id
+        num_slots = int(image_mask.sum())
+        if num_slots != vision_embeddings.shape[0]:
+            raise RuntimeError(
+                f"image-token slot count {num_slots} != vision embedding rows "
+                f"{vision_embeddings.shape[0]}; masked_scatter would silently "
+                "mis-fill the sequence"
+            )
         mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
-        combined = combined.masked_scatter(mask_expanded, vision_embeddings)
+        combined = combined.masked_scatter(
+            mask_expanded, vision_embeddings.to(combined.dtype)
+        )
         combined = combined.transpose(0, 1).contiguous()
 
         if sp:
@@ -221,73 +431,88 @@ class MultimodalModel(MegatronModule):
         B, S = input_ids.shape
         return torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, -1)
 
+    def _cp_split_sequence(self, tensor, seq_dim, packed_seq_params, cp_size=None, cp_rank=None):
+        """This CP rank's slice of ``tensor`` along ``seq_dim`` (None passes through).
+
+        THD follows the decoder input layout (:func:`cp_partition_index`); BSHD
+        is zigzag only, like ``get_batch_on_this_cp_rank``.
+        """
+        if tensor is None:
+            return None
+        if cp_size is None:
+            cp_size = parallel_state.get_context_parallel_world_size()
+            if cp_size <= 1:
+                return tensor
+            cp_rank = parallel_state.get_context_parallel_rank()
+        if cp_size <= 1:
+            return tensor
+        if packed_seq_params is None:
+            return _cp_split_tensor(tensor, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank)
+        self._check_cp_partition_mode(packed_seq_params)
+        idx = cp_partition_index(
+            packed_seq_params, tensor.shape[seq_dim], cp_size, cp_rank, device=tensor.device
+        )
+        return tensor.index_select(seq_dim, idx)
+
+    def _check_cp_partition_mode(self, packed_seq_params):
+        """The collator's THD layout must be the one the decoder was built for."""
+        expected = getattr(self.config, "cp_partition_mode", "zigzag")
+        actual = getattr(packed_seq_params, "cp_partition_mode", "zigzag")
+        if actual != expected:
+            raise RuntimeError(
+                f"packed_seq_params.cp_partition_mode={actual!r} but the decoder is built "
+                f"for cp_partition_mode={expected!r}; tokens would land on the wrong CP rank"
+            )
+
     def _cp_split_for_forward(
         self,
         *,
-        decoder_input,
         input_ids,
         labels,
         loss_mask,
         attention_mask,
-        position_ids,
         packed_seq_params,
         padding_mask=None,
     ):
-        """Apply CP split to model-forward inputs.
+        """Apply the CP split to the token-indexed model-forward inputs.
 
-        BSHD path zigzag-splits each tensor along its seq dim.  THD path
-        partitions per-sample via ``tex.thd_get_partitioned_indices`` so
-        chunks line up with ``cu_seqlens_q_padded`` boundaries.
-        ``position_ids`` and ``attention_mask`` are NOT split in THD —
-        MRoPE returns full freqs and TE attention's
-        ``_apply_rotary_pos_emb_thd`` does the per-sample CP zigzag
-        itself via ``_get_thd_freqs_on_this_cp_rank``.
+        BSHD zigzag-splits each tensor along its seq dim. THD follows the
+        decoder's ``cp_partition_mode`` (zigzag per sample, or contiguous over
+        the whole pack) so chunks line up with ``cu_seqlens_q_padded``.
+        ``position_ids`` are NOT split: MRoPE returns full freqs and TE
+        attention's ``_apply_rotary_pos_emb_thd`` does the per-sample CP split
+        itself via ``_get_thd_freqs_on_this_cp_rank``. ``attention_mask`` is
+        split for BSHD only (THD carries none).
+        """
+        split = self._cp_split_sequence
+        return (
+            split(input_ids, 1, packed_seq_params),
+            split(labels, 1, packed_seq_params),
+            split(loss_mask, 1, packed_seq_params),
+            attention_mask if packed_seq_params is not None
+            else split(attention_mask, 1, packed_seq_params),
+            split(padding_mask, 1, packed_seq_params),
+        )
+
+    def _cp_local_vision_rows(self, full_input_ids, vision_embeddings, packed_seq_params):
+        """Rows of the full encoder output whose image-token slots this CP rank owns.
+
+        ``vision_embeddings`` is ordered like ``masked_scatter`` fills the full
+        sequence (row-major over ``full_input_ids``). Splitting a position index
+        with the same rule as the tokens gives the owned slots in local order,
+        which is exactly the order the rank-local scatter consumes them in.
         """
         cp_size = parallel_state.get_context_parallel_world_size()
-        if cp_size <= 1:
-            return (
-                decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids, padding_mask,
-            )
-        cp_rank = parallel_state.get_context_parallel_rank()
-
-        if packed_seq_params is not None:
-            total_tokens = (
-                decoder_input.shape[0] if decoder_input is not None else input_ids.shape[1]
-            )
-            idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded, total_tokens, cp_size, cp_rank
-            )
-            if decoder_input is not None:
-                decoder_input = decoder_input.index_select(0, idx)
-            if input_ids is not None:
-                input_ids = input_ids.index_select(1, idx)
-            if labels is not None:
-                labels = labels.index_select(1, idx)
-            if loss_mask is not None:
-                loss_mask = loss_mask.index_select(1, idx)
-            if padding_mask is not None:
-                padding_mask = padding_mask.index_select(1, idx)
-        else:
-
-            def _split(t, seq_dim):
-                return (
-                    None
-                    if t is None
-                    else _cp_split_tensor(t, seq_dim=seq_dim, cp_size=cp_size, cp_rank=cp_rank)
-                )
-
-            decoder_input = _split(decoder_input, 0)
-            input_ids = _split(input_ids, 1)
-            labels = _split(labels, 1)
-            loss_mask = _split(loss_mask, 1)
-            attention_mask = _split(attention_mask, 1)
-            padding_mask = _split(padding_mask, 1)
-
-        return (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
-        )
+        if cp_size <= 1 or vision_embeddings is None:
+            return vision_embeddings
+        image_mask = (full_input_ids == self.image_token_id).reshape(-1)
+        row_of_slot = torch.cumsum(image_mask.to(torch.long), dim=0) - 1
+        positions = torch.arange(
+            image_mask.numel(), device=full_input_ids.device
+        ).view_as(full_input_ids)
+        local = self._cp_split_sequence(positions, 1, packed_seq_params).reshape(-1)
+        local = local[image_mask[local]]
+        return vision_embeddings.index_select(0, row_of_slot[local])
 
     @staticmethod
     def cp_split_loss_mask(loss_mask, packed_seq_params):
@@ -303,8 +528,8 @@ class MultimodalModel(MegatronModule):
             return loss_mask
         cp_rank = parallel_state.get_context_parallel_rank()
         if packed_seq_params is not None:
-            idx = _thd_cp_partition_index(
-                packed_seq_params.cu_seqlens_q_padded, loss_mask.shape[1], cp_size, cp_rank
+            idx = cp_partition_index(
+                packed_seq_params, loss_mask.shape[1], cp_size, cp_rank, device=loss_mask.device
             )
             return loss_mask.index_select(1, idx)
         return _cp_split_tensor(loss_mask, seq_dim=1, cp_size=cp_size, cp_rank=cp_rank)
@@ -345,6 +570,7 @@ class MultimodalModel(MegatronModule):
         image_grid_thw: Tensor = None,
         decoder_input: Tensor = None,
         packed_seq_params=None,
+        vision_embeddings: Tensor = None,
         **kwargs,
     ):
         """Forward pass.
@@ -371,43 +597,7 @@ class MultimodalModel(MegatronModule):
         Returns:
             Loss tensor (post_process=True) or hidden states.
         """
-        # MRoPE freqs are computed per PP stage from position_ids inside
-        # HybridModel, so position_ids must be available on every stage.
-        if position_ids is None:
-            position_ids = self.compute_position_ids(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                packed_seq_params=packed_seq_params,
-            )
-
-        if self.pre_process:
-            vision_embeddings = None
-            if self.vision_model is not None and pixel_values is not None:
-                vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
-
-            if decoder_input is None and self.language_model is not None:
-                text_embeddings = self.language_model.embedding(
-                    input_ids=input_ids, position_ids=None
-                )
-
-                if vision_embeddings is not None:
-                    decoder_input = self._scatter_vision_embeddings(
-                        input_ids, text_embeddings, vision_embeddings
-                    )
-                else:
-                    decoder_input = text_embeddings
-        else:
-            # Non-first PP stage: no vision encoder, no embedding; the
-            # activation arrives via HybridModel.set_input_tensor.
-            assert decoder_input is None, (
-                "decoder_input is only honored on the first pipeline stage; "
-                "later stages take their activation from set_input_tensor."
-            )
-
-        (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
-        ) = self._cp_split_for_forward(
+        decoder_inputs = self._prepare_decoder_inputs(
             decoder_input=decoder_input,
             input_ids=input_ids,
             labels=labels,
@@ -416,16 +606,12 @@ class MultimodalModel(MegatronModule):
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            vision_embeddings=vision_embeddings,
         )
 
-        with self._thd_mrope_no_cp_override(packed_seq_params):
-            return self.language_model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                decoder_input=decoder_input,
-                labels=labels,
-                loss_mask=loss_mask,
-                padding_mask=padding_mask,
-                packed_seq_params=packed_seq_params,
-            )
+        with self._thd_mrope_no_cp_override(packed_seq_params), nvtx_phase(
+            "decoder_forward"
+        ):
+            return self.language_model(**decoder_inputs)
