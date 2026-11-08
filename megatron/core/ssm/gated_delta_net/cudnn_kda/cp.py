@@ -291,8 +291,9 @@ if HAVE_TRITON:
         m_ptr,  # [R, HO, K, K] fp32 (gathered M / transition)
         out_ptr,  # [HO, V, K] fp32 (the live boundary-state slot)
         start,  # first rank index to fold
-        count,  # number of ranks to fold
+        count,  # number of ranks to fold (this rank's actual chain length; runtime)
         step,  # +1 ascending (forward), -1 descending (backward)
+        num_ranks,  # R = CP group size, to clamp the padded loads in bounds
         h_r_s,
         h_ho_s,
         h_v_s,
@@ -304,6 +305,7 @@ if HAVE_TRITON:
         V,
         HEAD_DIM: tl.constexpr,
         BLOCK_V: tl.constexpr,
+        MAX_COUNT: tl.constexpr,  # uniform loop bound (R-1) -- SAME on every rank
     ):
         """One head's (and V-tile's) affine fold ``S = S @ M_r + H_r`` over the rank chain.
 
@@ -312,21 +314,34 @@ if HAVE_TRITON:
         ``allow_tf32=False`` to match the fp64 oracle).  Forward folds predecessors ascending; the
         backward passes ``step = -1`` to fold successors descending -- the same affine composition,
         mirrored.  See ``boundary_fold_ref`` for the device-independent reference.
+
+        RANK-SYMMETRIC: the loop runs a fixed ``MAX_COUNT`` (= R-1, the group-wide max chain length)
+        on EVERY rank, not this rank's ``count``.  Iterations ``i >= count`` fold the identity affine
+        (H=0, M=I), a numerical no-op, so the result is bit-identical to folding exactly ``count``
+        ranks -- but every CP rank now does the same work and finishes the fold at the same time.
+        Without this, ``count = pre/post_num_ranks`` grows with CP-rank index, so high-index ranks
+        lagged and desynced the whole CP group, inflating the *downstream* collective (e.g. the MoE
+        expert all-gather) which waits on the slowest rank.  Padded loads are clamped to [0, R-1].
         """
         pid_ho = tl.program_id(0)
         pid_v = tl.program_id(1)
         v_off = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
         k_off = tl.arange(0, HEAD_DIM)
         v_mask = v_off < V
+        ident = (k_off[:, None] == k_off[None, :]).to(tl.float32)  # [K, K] identity (no-op fold)
         state = tl.zeros([BLOCK_V, HEAD_DIM], dtype=tl.float32)
-        for i in range(count):
+        for i in range(MAX_COUNT):
+            do_fold = i < count
             r = start + i * step
-            h_base = h_ptr + r * h_r_s + pid_ho * h_ho_s
+            r_safe = tl.minimum(tl.maximum(r, 0), num_ranks - 1)  # keep padded loads in bounds
+            h_base = h_ptr + r_safe * h_r_s + pid_ho * h_ho_s
             h_r = tl.load(
                 h_base + v_off[:, None] * h_v_s + k_off[None, :], mask=v_mask[:, None], other=0.0
             )
-            m_base = m_ptr + r * m_r_s + pid_ho * m_ho_s
+            h_r = tl.where(do_fold, h_r, 0.0)  # padding iteration contributes zero H
+            m_base = m_ptr + r_safe * m_r_s + pid_ho * m_ho_s
             m_r = tl.load(m_base + k_off[:, None] * m_k_s + k_off[None, :])
+            m_r = tl.where(do_fold, m_r, ident)  # padding iteration multiplies by identity
             state = tl.dot(state, m_r, allow_tf32=False) + h_r
         tl.store(
             out_ptr + pid_ho * o_ho_s + v_off[:, None] * o_v_s + k_off[None, :],
@@ -348,10 +363,15 @@ def _launch_affine_fold(
         raise ImportError(
             "cuDNN KDA boundary exchange needs Triton for the fused boundary fold."
         )
-    _, ho, v, k = h_stacked.shape
+    num_ranks, ho, v, k = h_stacked.shape
     assert k == m_stacked.shape[-1] == m_stacked.shape[-2], "fold expects square [K, K] transitions"
     block_v = 64 if v % 64 == 0 else v
     grid = (ho, triton.cdiv(v, block_v))
+    # Uniform loop bound across every CP rank (= R-1, the max chain length): rank-symmetric fold so
+    # all ranks finish together and don't desync the group / inflate the downstream collective. The
+    # extra iterations beyond this rank's ``count`` fold the identity (no-op), so the result is
+    # unchanged. MAX_COUNT is a constexpr that is constant for a given CP group -> compiles once.
+    max_count = max(num_ranks - 1, 1)
     _affine_fold_kernel[grid](
         h_stacked,
         m_stacked,
@@ -359,6 +379,7 @@ def _launch_affine_fold(
         int(start),
         int(count),
         int(step),
+        int(num_ranks),
         h_stacked.stride(0),
         h_stacked.stride(1),
         h_stacked.stride(2),
@@ -370,6 +391,7 @@ def _launch_affine_fold(
         v,
         HEAD_DIM=k,
         BLOCK_V=block_v,
+        MAX_COUNT=int(max_count),
     )
 
 
