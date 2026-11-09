@@ -7,10 +7,13 @@ contiguous token shares, one per CP rank, and lets FLA's ``cp_context`` (``FLACP
 the rank-local ``cu_seqlens`` plus the bookkeeping of the two sequences that may cross a rank
 boundary: ``is_first_rank`` / ``is_last_rank`` (does the first / last local sequence start / end
 on this rank) and ``pre_num_ranks`` / ``post_num_ranks`` (how many preceding / following ranks
-hold earlier / later parts of those two documents).  FLA's own exchange then works per rank with
-one block of (state, transition) for the crossing sequence: summarise, ``all_gather``, fold the
-predecessors' blocks into this rank's initial state (forward) and the successors' blocks into the
-gradient of this rank's final state (backward).
+hold earlier / later parts of those two documents).  FLA's own exchange works per rank with one
+block of (state, transition) for the crossing sequence: summarise, then accumulate the predecessors'
+blocks into this rank's initial state (forward) and the successors' blocks into the gradient of this
+rank's final state (backward).  This module does that accumulation as an O(1) sequential chain -- each
+rank receives its upstream neighbour's accumulated boundary, folds its single span once, and forwards
+the result -- instead of re-folding the whole prefix on every rank (an asymmetric O(rank) fold that
+desynchronised the CP group and inflated the first downstream collective's barrier wait).
 
 cudnn-frontend 1.32.0 exposes exactly those two primitives for its KDA kernels:
 
@@ -25,9 +28,9 @@ folded states to the native ``kda_fwd`` / ``kda_bwd`` (``initial_state`` / ``d_f
 Only the boundary-crossing sequence is summarised (the token tensors are sliced to it and padded
 to a power-of-two token bucket with neutral tokens, so cuDNN's shape-specialised engines compile
 a handful of times instead of once per packed micro-batch) and one entry per rank is exchanged,
-like FLA's preprocess (``cu_seqlens[-2:]`` forward, ``[:2]`` backward).  The boundary-state production is behind :class:`BoundaryStateProducer` so an
-alternative producer can replace the summary +
-all_gather + fold stage without touching the kernel calls.
+like FLA's preprocess (``cu_seqlens[-2:]`` forward, ``[:2]`` backward).  The boundary-state production
+is behind :class:`BoundaryStateProducer` so an alternative producer can replace the summary +
+accumulation-chain stage without touching the kernel calls.
 
 Gradient conventions match FLA's CP path: the gate parameters receive this rank's contribution
 only (the model's gradient reduction over the CP group sums them), ``initial_state`` is not
@@ -61,21 +64,6 @@ try:
 except Exception:  # pragma: no cover - environment dependent
     _symm_mem = None
     _SYMM_MEM_AVAILABLE = False
-
-
-def _all_gather_stacked(t: torch.Tensor, group) -> torch.Tensor:
-    """``all_gather`` of one ``[HO, ...]`` entry per rank as a stacked ``[R, HO, ...]`` tensor.
-
-    The fused fold kernel indexes the rank axis directly, so the gathered buffer is kept whole (one
-    Python list and no per-rank view fewer).  Used by :class:`AllGatherBoundaryProducer`; the
-    exchange is the NCCL ``all_gather``.
-    """
-    t = t.contiguous()
-    out = torch.empty(
-        (dist.get_world_size(group),) + tuple(t.shape), dtype=t.dtype, device=t.device
-    )
-    dist.all_gather_into_tensor(out, t, group=group)
-    return out
 
 
 def _host_cu_seqlens(cp_context) -> list[int]:
@@ -290,6 +278,7 @@ if HAVE_TRITON:
         h_ptr,  # [R, HO, V, K] fp32 (gathered H / Htilde)
         m_ptr,  # [R, HO, K, K] fp32 (gathered M / transition)
         out_ptr,  # [HO, V, K] fp32 (the live boundary-state slot)
+        init_ptr,  # [HO, V, K] fp32 initial state when HAS_INIT (else unused dummy)
         start,  # first rank index to fold
         count,  # number of ranks to fold
         step,  # +1 ascending (forward), -1 descending (backward)
@@ -301,24 +290,37 @@ if HAVE_TRITON:
         m_k_s,
         o_ho_s,
         o_v_s,
+        i_ho_s,
+        i_v_s,
         V,
+        HAS_INIT: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_V: tl.constexpr,
     ):
         """One head's (and V-tile's) affine fold ``S = S @ M_r + H_r`` over the rank chain.
 
-        Collapses the per-rank affine composition into a single launch: ``S`` starts at zero and the
-        ``count`` ranks ``start, start + step, ...`` are folded in fp32 (``tl.dot`` with
-        ``allow_tf32=False`` to match the fp64 oracle).  Forward folds predecessors ascending; the
-        backward passes ``step = -1`` to fold successors descending -- the same affine composition,
-        mirrored.  See ``boundary_fold_ref`` for the device-independent reference.
+        Collapses the per-rank affine composition into a single launch: ``S`` starts at ``init_ptr``
+        (when ``HAS_INIT``; else zero) and the ``count`` ranks ``start, start + step, ...`` are folded
+        in fp32 (``tl.dot`` with ``allow_tf32=False`` to match the fp64 oracle).  Forward folds
+        predecessors ascending; the backward passes ``step = -1`` to fold successors descending -- the
+        same affine composition, mirrored.  The ``HAS_INIT`` + ``count = 1`` form is the O(1)
+        sequential-accumulation step (``_affine_step``): one exact fold of this rank's span onto the
+        accumulated boundary received from its upstream neighbour, bit-identical to one iteration of
+        the ``count = R - 1`` fused fold.  See ``boundary_fold_ref`` for the device-independent reference.
         """
         pid_ho = tl.program_id(0)
         pid_v = tl.program_id(1)
         v_off = pid_v * BLOCK_V + tl.arange(0, BLOCK_V)
         k_off = tl.arange(0, HEAD_DIM)
         v_mask = v_off < V
-        state = tl.zeros([BLOCK_V, HEAD_DIM], dtype=tl.float32)
+        if HAS_INIT:
+            state = tl.load(
+                init_ptr + pid_ho * i_ho_s + v_off[:, None] * i_v_s + k_off[None, :],
+                mask=v_mask[:, None],
+                other=0.0,
+            )
+        else:
+            state = tl.zeros([BLOCK_V, HEAD_DIM], dtype=tl.float32)
         for i in range(count):
             r = start + i * step
             h_base = h_ptr + r * h_r_s + pid_ho * h_ho_s
@@ -342,8 +344,14 @@ def _launch_affine_fold(
     start: int,
     count: int,
     step: int,
+    init: Optional[torch.Tensor] = None,
 ) -> None:
-    """Fold ``count`` ranks' summaries into ``out_slot`` ``[HO, V, K]`` with the Triton kernel."""
+    """Fold ``count`` ranks' summaries into ``out_slot`` ``[HO, V, K]`` with the Triton kernel.
+
+    ``init`` (``[HO, V, K]`` fp32) seeds the fold with an initial state instead of zero -- the O(1)
+    sequential-accumulation step folds this rank's single span (``count = 1``) onto the accumulated
+    boundary received from its upstream neighbour.
+    """
     if not HAVE_TRITON:
         raise ImportError(
             "cuDNN KDA boundary exchange needs Triton for the fused boundary fold."
@@ -352,10 +360,13 @@ def _launch_affine_fold(
     assert k == m_stacked.shape[-1] == m_stacked.shape[-2], "fold expects square [K, K] transitions"
     block_v = 64 if v % 64 == 0 else v
     grid = (ho, triton.cdiv(v, block_v))
+    has_init = init is not None
+    init_t = init if has_init else out_slot  # valid dummy pointer; untouched when HAS_INIT is False
     _affine_fold_kernel[grid](
         h_stacked,
         m_stacked,
         out_slot,
+        init_t,
         int(start),
         int(count),
         int(step),
@@ -367,7 +378,10 @@ def _launch_affine_fold(
         m_stacked.stride(2),
         out_slot.stride(0),
         out_slot.stride(1),
+        init_t.stride(0),
+        init_t.stride(1),
         v,
+        HAS_INIT=has_init,
         HEAD_DIM=k,
         BLOCK_V=block_v,
     )
@@ -403,6 +417,78 @@ def _fused_affine_fold(
     return out
 
 
+def _affine_step(
+    pred_state: Optional[torch.Tensor], m: torch.Tensor, h: torch.Tensor, HO: int, V: int, K: int, device
+) -> torch.Tensor:
+    """One fp32 affine step ``C = pred_state @ M + H`` (``pred_state=None`` -> zero init).
+
+    The O(1) per-rank fold of the sequential-accumulation chain: this rank's single span ``(H, M)``
+    folded onto the accumulated boundary ``pred_state`` received from its upstream neighbour.  Runs
+    the SAME :func:`_affine_fold_kernel` with ``count = 1`` and the predecessor state as the kernel's
+    initial state, so it is bit-identical to one iteration of the ``count = R - 1`` fused fold -- the
+    chain distributes the exact same ``tl.dot(allow_tf32=False)`` steps across ranks instead of
+    recomputing the whole prefix on every rank (see ``boundary_fold_ref``).
+    """
+    out = torch.empty((HO, V, K), dtype=torch.float32, device=device)
+    init = pred_state.contiguous() if pred_state is not None else None
+    _launch_affine_fold(
+        h.unsqueeze(0), m.unsqueeze(0), out, start=0, count=1, step=1, init=init
+    )
+    return out
+
+
+def _accumulate_chain(
+    h: torch.Tensor,
+    m: torch.Tensor,
+    HO: int,
+    V: int,
+    K: int,
+    *,
+    n_local: int,
+    in_cnt: int,
+    out_cnt: int,
+    is_start: bool,
+    live_slot: int,
+    recv_into,
+    send_state,
+) -> torch.Tensor:
+    """O(1) sequential-accumulation boundary state for one direction (transport-agnostic).
+
+    The chunkwise-CP boundary entering a rank is the affine fold of its predecessors' spans (forward)
+    / successors' spans (backward).  Re-folding the whole prefix on every rank is ``O(rank)`` per rank
+    and ``O(R^2)`` total -- the asymmetric work desynchronises the CP group, and the first collective
+    downstream (an MoE expert all-gather) absorbs the skew as barrier wait.  Instead, each rank
+    RECEIVES the accumulated boundary from its one upstream neighbour, uses it directly as its own
+    boundary, folds its single span once (:func:`_affine_step`), and SENDS the result to its one
+    downstream neighbour: ``O(1)`` fold + one ``recv`` + one ``send`` per rank, exact for any CP size.
+
+    ``recv_into(slot)`` fills ``slot`` ``[HO, V, K]`` with the upstream accumulated state (called iff
+    ``in_cnt >= 1``, i.e. the crossing document continues from upstream); ``send_state(state)``
+    forwards ``state`` ``[HO, V, K]`` downstream (iff ``out_cnt >= 1``).  ``is_start`` (the rank that
+    opens the crossing document in this direction, ``in_cnt == 0``) returns a zero boundary.  ``h`` /
+    ``m`` are this rank's span summary ``(H, M)`` forward / ``(G, Tr)`` backward; the single span of a
+    rank that ALSO continues from upstream (``n_local == 1``) chains the received state, otherwise the
+    outgoing document opens on this rank and folds from zero.
+    """
+    device = h.device
+    out = torch.empty((n_local, HO, V, K), dtype=torch.float32, device=device)
+    if n_local > 1:
+        (out[1:] if live_slot == 0 else out[:-1]).zero_()
+    live = out[live_slot]  # the live boundary slot (a contiguous [HO, V, K] view)
+    if in_cnt >= 1:
+        recv_into(live)  # the upstream accumulated boundary IS this rank's boundary state
+    if out_cnt >= 1:
+        # The outgoing document chains the received state only when this rank's single span also
+        # continues from upstream (n_local == 1); with an internal document boundary it opens here.
+        pred = live if (n_local == 1 and in_cnt >= 1) else None
+        # NCCL's process group records the send tensor's stream (symm copies it synchronously), so the
+        # temporary stays valid until the transport completes -- no explicit keep-alive needed.
+        send_state(_affine_step(pred, m, h, HO, V, K, device))
+    if is_start:
+        live.zero_()  # no upstream: the boundary is zero by definition
+    return out
+
+
 class BoundaryStateProducer(Protocol):
     """Produces the two cross-rank boundary tensors of a chunkwise-CP step on this rank.
 
@@ -429,9 +515,9 @@ class _CudnnBoundaryBase:
 
     Not user-selectable (absent from :data:`_PRODUCERS`); the two concrete producers below subclass
     it for the single-sourced frost summary (``_summarize_fwd`` / ``_summarize_bwd``).  They differ
-    only in how the summaries are exchanged and folded; the fp32 affine fold itself is the shared
-    :func:`_fused_affine_fold` / :func:`_symm_fold` on the module-level Triton kernel, with
-    ``boundary_fold_ref`` the device-independent fp32/fp64 reference.
+    only in the transport of the O(1) sequential-accumulation chain (:func:`_accumulate_chain`); the
+    per-rank fp32 affine fold itself is the shared :func:`_affine_step` on the module-level Triton
+    kernel, with ``boundary_fold_ref`` the device-independent fp32/fp64 reference.
     """
 
     def _summarize_fwd(self, k, v, g, beta, cu_list, cp_context, gate_kwargs, flags):
@@ -506,73 +592,91 @@ class _CudnnBoundaryBase:
         return gsum, tr, HO, V, K
 
 
-class AllGatherBoundaryProducer(_CudnnBoundaryBase):
-    """``all_gather`` producer: cuDNN frost summaries + NCCL ``all_gather`` + ONE fused fold.
+def _neighbor_global_ranks(group, rank: int, pre: int, post: int):
+    """Global ranks of this rank's immediate CP neighbours (``None`` when the chain does not cross)."""
+    pred = dist.get_global_rank(group, rank - 1) if pre >= 1 else None
+    succ = dist.get_global_rank(group, rank + 1) if post >= 1 else None
+    return pred, succ
 
-    The portable boundary exchange: runs on any topology and is CUDA-graph-safe.  Keeps the base's
-    fast per-span frost summary, gathers the per-rank summaries with an NCCL ``all_gather``, and
-    assembles the boundary state with :func:`_fused_affine_fold` -- the fp32 affine fold and the
-    slot write in one Triton launch.  See ``boundary_fold_ref`` for the device-independent
-    fp32/fp64 reference of that fold.
+
+class NcclP2PBoundaryProducer(_CudnnBoundaryBase):
+    """``all_gather`` knob: cuDNN frost summaries + an O(1) NCCL point-to-point accumulation chain.
+
+    The portable, CUDA-graph-safe boundary exchange (runs on any topology; on an NVLink node NCCL
+    routes the point-to-point sends over NVLink).  Replaces the former NCCL ``all_gather`` + per-rank
+    ``O(rank)`` fold -- whose asymmetric work desynchronised the CP group -- with the exact
+    sequential accumulation of :func:`_accumulate_chain`: each rank receives its predecessor's
+    accumulated boundary with one ``dist.recv``, folds its single span once, and forwards the result
+    to its successor with one ``dist.send``.  Numerically bit-identical to the fused fold (the same
+    ``tl.dot`` steps, distributed across ranks); the historical knob name ``all_gather`` is kept for
+    config compatibility.  See ``boundary_fold_ref`` for the device-independent reference.
     """
 
     def initial_state(self, k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags):
-        """Summarise + exchange (all_gather) + fused fp32 fold of the predecessors' blocks."""
+        """Summarise + O(1) forward accumulation chain (recv predecessor, fold once, send successor)."""
         h, m, HO, V, K = self._summarize_fwd(k, v, g, beta, cu_list, cp_context, gate_kwargs, flags)
         group = cp_context.group
         rank = dist.get_rank(group)
         n_local = len(cu_list) - 1
-        hs = _all_gather_stacked(h, group)  # [R, HO, V, K]
-        ms = _all_gather_stacked(m, group)  # [R, HO, K, K]
-        if cp_context.is_first_rank:
-            return _zeros_boundary_state(n_local, HO, V, K, k.device)
-        return _fused_affine_fold(
-            hs,
-            ms,
+        pre, post = cp_context.pre_num_ranks, cp_context.post_num_ranks
+        pred, succ = _neighbor_global_ranks(group, rank, pre, post)
+        return _accumulate_chain(
+            h,
+            m,
+            HO,
+            V,
+            K,
             n_local=n_local,
+            in_cnt=pre,  # forward: upstream = predecessor, downstream = successor
+            out_cnt=post,
+            is_start=cp_context.is_first_rank,
             live_slot=0,
-            start=rank - cp_context.pre_num_ranks,  # ascending, document start first
-            count=cp_context.pre_num_ranks,
-            step=1,
+            recv_into=lambda slot: dist.recv(slot, src=pred, group=group),
+            send_state=lambda s: dist.send(s, dst=succ, group=group),
         )
 
     def final_state_grad(
         self, q, k, g, beta, do, cu, cu_list, cp_context, scale, gate_kwargs, flags
     ):
-        """Reverse-summarise + exchange (all_gather) + fused fp32 fold of the successors' blocks."""
+        """Reverse-summarise + O(1) backward accumulation chain (mirror: recv successor, send predecessor)."""
         gsum, tr, HO, V, K = self._summarize_bwd(
             q, k, g, beta, do, cu_list, cp_context, scale, gate_kwargs, flags
         )
         group = cp_context.group
         rank = dist.get_rank(group)
         n_local = len(cu_list) - 1
-        gs = _all_gather_stacked(gsum, group)  # [R, HO, V, K]
-        ts = _all_gather_stacked(tr, group)  # [R, HO, K, K]
-        if cp_context.is_last_rank:
-            return _zeros_boundary_state(n_local, HO, V, K, k.device)
-        return _fused_affine_fold(
-            gs,
-            ts,
+        pre, post = cp_context.pre_num_ranks, cp_context.post_num_ranks
+        pred, succ = _neighbor_global_ranks(group, rank, pre, post)
+        return _accumulate_chain(
+            gsum,
+            tr,
+            HO,
+            V,
+            K,
             n_local=n_local,
+            in_cnt=post,  # backward: upstream = successor, downstream = predecessor
+            out_cnt=pre,
+            is_start=cp_context.is_last_rank,
             live_slot=n_local - 1,
-            start=rank + cp_context.post_num_ranks,  # descending, document end first
-            count=cp_context.post_num_ranks,
-            step=-1,
+            recv_into=lambda slot: dist.recv(slot, src=succ, group=group),
+            send_state=lambda s: dist.send(s, dst=pred, group=group),
         )
 
 
-class _SymmHMExchange:
-    """One rendezvoused fp32 symmetric buffer that exchanges the per-rank (H, M) over NVLink.
+class _SymmStateChain:
+    """One rendezvoused fp32 symmetric buffer that passes the accumulated boundary state neighbour to
+    neighbour over NVLink -- the O(1) sequential-accumulation chain's symmetric-memory transport.
 
-    Instead of an NCCL all-gather, each rank PUSHES its packed ``[HO, V+K, K]`` summary straight
-    into its consumers' buffer slots and signals them; a consumer waits for its producers' signals
-    and then folds its own (now-populated) buffer.  The payload is fp32 -- the symmetric tensor is
-    fp32 natively (cuDNN's summary ``hm_sym`` is fp32).  Correctness of the write-before-read across ranks rides torch's
-    own ``put_signal`` (release) / ``wait_signal`` (acquire), NOT ``dist.barrier`` (a CPU/NCCL
-    collective that does not order a peer-visible NVLink write).  The buffer is parity-buffered on
-    ``step % 2`` so a step's writes do not clobber the previous step's unread slots.  One instance
-    per ``(group, HO, V, K)`` serves every KDA layer (its ``step`` advances in the collective order
-    the autograd function guarantees); constructing it is a collective ``rendezvous``.
+    Each rank receives the accumulated boundary from its one upstream neighbour, folds its span, and
+    writes the result straight into its one downstream neighbour's buffer slot, then signals it.  No
+    all-gather and no all-consumers broadcast: one NVLink write + one signal per rank per direction
+    (forward downstream = successor, backward downstream = predecessor).  The payload is the fp32
+    state ``[HO, V, K]`` (not the ``(H, M)`` summary -- each rank folds its own span locally).
+    Write-before-read across ranks rides torch's ``put_signal`` (release) / ``wait_signal`` (acquire),
+    NOT ``dist.barrier``.  The buffer is parity-buffered on ``step % 2`` so a step's write does not
+    clobber the previous step's unread slot.  One instance per ``(group, HO, V, K)`` serves every KDA
+    layer (its ``step`` advances in the collective order the autograd function guarantees);
+    constructing it is a collective ``rendezvous``.
     """
 
     _FWD, _BWD = 0, 1
@@ -583,8 +687,8 @@ class _SymmHMExchange:
         self.group = group
         self.R = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
-        self.ho, self.v, self.k, self.width = ho, v, k, v + k
-        self._shape = (2, self.R, ho, self.width, k)
+        self.ho, self.v, self.k = ho, v, k
+        self._shape = (2, 2, ho, v, k)  # [direction (FWD/BWD), parity (step % 2), HO, V, K]
         self.buf = symm_mem.empty(self._shape, dtype=torch.float32, device=device)
         self.buf.zero_()
         self.handle = symm_mem.rendezvous(self.buf, group)
@@ -593,110 +697,84 @@ class _SymmHMExchange:
             group=group
         )  # buffer zeroed everywhere before any peer write (construction only)
         # Separate forward/backward step counters so each direction's parity ALTERNATES across its own
-        # consecutive calls (a shared counter would make forward always land on one parity -- the two
-        # directions interleave -- and lose the cross-step protection).  Forward writes a consumer's
-        # predecessor slots and backward its successor slots, which are disjoint, so the two directions
-        # safely share one buffer even when their parities coincide.
+        # consecutive calls (a shared counter would make a direction always land on one parity and lose
+        # the cross-step protection).  The FWD and BWD slabs are disjoint, so the two directions safely
+        # share one buffer even when their parities coincide.
         self.fwd_step = 0
         self.bwd_step = 0
 
-    def _write_peer(self, consumer: int, par: int, h: torch.Tensor, m: torch.Tensor) -> None:
-        """Write this rank's (H, M) into ``consumer``'s buffer slot ``[par, self.rank]`` (NVLink)."""
-        slot = self.handle.get_buffer(consumer, self._shape, torch.float32)[par, self.rank]
-        slot[:, : self.v, :] = h
-        slot[:, self.v :, :] = m
+    def _recv_into(self, direction: int, up_rank: int, par: int, slot: torch.Tensor) -> None:
+        """Wait the upstream neighbour's release, then copy its accumulated state into ``slot``."""
+        self.handle.wait_signal(up_rank, channel=direction)
+        slot.copy_(self.buf[direction, par])
 
-    def exchange_forward(self, h: torch.Tensor, m: torch.Tensor) -> int:
-        """Push (H, M) to every later rank + wait every earlier rank's push; return the parity.
+    def _send(self, direction: int, down_rank: int, par: int, state: torch.Tensor) -> None:
+        """Write ``state`` into the downstream neighbour's buffer slot and release it (NVLink)."""
+        peer = self.handle.get_buffer(down_rank, self._shape, torch.float32)
+        peer[direction, par].copy_(state)
+        self.handle.put_signal(down_rank, channel=direction)
 
-        A producer signals, and a consumer waits on, EVERY earlier/later rank (one matched
-        signal per pair), so no signal is left dangling; the fold then reads only its
-        ``[rank-pre, rank)`` sub-range of the populated buffer.
-        """
+    def forward_handles(self):
+        """``(recv_into, send_state)`` for one forward step: upstream = predecessor, downstream = successor."""
         self.fwd_step += 1
         par = self.fwd_step % 2
-        for consumer in range(self.rank + 1, self.R):
-            self._write_peer(consumer, par, h, m)
-            self.handle.put_signal(consumer, channel=self._FWD)
-        for producer in range(0, self.rank):
-            self.handle.wait_signal(producer, channel=self._FWD)
-        return par
+        up, down = self.rank - 1, self.rank + 1
+        return (
+            lambda slot: self._recv_into(self._FWD, up, par, slot),
+            lambda state: self._send(self._FWD, down, par, state),
+        )
 
-    def exchange_backward(self, g: torch.Tensor, t: torch.Tensor) -> int:
-        """Mirror of :meth:`exchange_forward`: push to every earlier rank, wait every later rank."""
+    def backward_handles(self):
+        """Mirror of :meth:`forward_handles`: upstream = successor, downstream = predecessor."""
         self.bwd_step += 1
         par = self.bwd_step % 2
-        for consumer in range(0, self.rank):
-            self._write_peer(consumer, par, g, t)
-            self.handle.put_signal(consumer, channel=self._BWD)
-        for producer in range(self.rank + 1, self.R):
-            self.handle.wait_signal(producer, channel=self._BWD)
-        return par
+        up, down = self.rank + 1, self.rank - 1
+        return (
+            lambda slot: self._recv_into(self._BWD, up, par, slot),
+            lambda state: self._send(self._BWD, down, par, state),
+        )
 
 
-_SYMM_EXCHANGES: dict[tuple, _SymmHMExchange] = {}
+_SYMM_CHAINS: dict[tuple, _SymmStateChain] = {}
 
 
-def _get_symm_hm_exchange(group, ho: int, v: int, k: int, device) -> _SymmHMExchange:
-    """The cached per-``(group, HO, V, K)`` symmetric exchange (``rendezvous`` runs once).
+def _get_symm_state_chain(group, ho: int, v: int, k: int, device) -> _SymmStateChain:
+    """The cached per-``(group, HO, V, K)`` symmetric state chain (``rendezvous`` runs once).
 
     Raises a clear, actionable RuntimeError when the symmetric-memory rendezvous cannot establish
     P2P across the CP group (there is no fallback -- see :class:`SymmMemBoundaryProducer`).  A failed
     rendezvous is not cached, so it surfaces rather than being silently swallowed.
     """
     key = (id(group), ho, v, k, getattr(device, "index", device))
-    exch = _SYMM_EXCHANGES.get(key)
-    if exch is None:
+    chain = _SYMM_CHAINS.get(key)
+    if chain is None:
         try:
-            exch = _SymmHMExchange(group, ho, v, k, device)
+            chain = _SymmStateChain(group, ho, v, k, device)
         except Exception as exc:  # pragma: no cover - environment dependent
             raise RuntimeError(
                 "kda_cudnn_cp_boundary_exchange='symm_mem' could not establish a symmetric-memory "
                 f"exchange across the CP group (P2P required): {exc}. "
                 "Set kda_cudnn_cp_boundary_exchange='all_gather'."
             ) from exc
-        _SYMM_EXCHANGES[key] = exch
-    return exch
-
-
-def _symm_fold(
-    hm_par: torch.Tensor, v: int, *, n_local: int, live_slot: int, start: int, count: int, step: int
-) -> torch.Tensor:
-    """Fold the live boundary slot straight from the symm buffer's populated parity slab.
-
-    ``hm_par`` is ``[R, HO, V+K, K]`` (this rank's buffer after the exchange).  Its ``H`` / ``M``
-    halves are strided views (rows ``[0,V)`` and ``[V,V+K)``), handed to the SAME verified stage-2
-    ``_affine_fold_kernel`` -- no gather, no staging copy, the fold reads the exchanged state in
-    place.
-    """
-    _, ho, _width, k = hm_par.shape
-    h_view = hm_par[:, :, :v, :]  # [R, HO, V, K] (strided)
-    m_view = hm_par[:, :, v:, :]  # [R, HO, K, K] (strided)
-    out = torch.empty((n_local, ho, v, k), dtype=torch.float32, device=hm_par.device)
-    if n_local > 1:
-        if live_slot == 0:
-            out[1:].zero_()
-        else:
-            out[:-1].zero_()
-    _launch_affine_fold(h_view, m_view, out[live_slot], start, count, step)
-    return out
+        _SYMM_CHAINS[key] = chain
+    return chain
 
 
 class SymmMemBoundaryProducer(_CudnnBoundaryBase):
-    """``symm_mem`` producer (default): cuDNN frost summaries, a symmetric-memory exchange, fused fold.
+    """``symm_mem`` producer (default): cuDNN frost summaries + an O(1) symmetric-memory accumulation chain.
 
     The boundary exchange over CUDA symmetric memory (point-to-point writes across NVLink): each rank
-    pushes its (H, M) into its consumers' buffers over NVLink (:class:`_SymmHMExchange`), waits on its
-    producers' ``put_signal`` releases, and folds the populated buffer in place with
-    :func:`_symm_fold`.  Numerically identical to :class:`AllGatherBoundaryProducer` (same frost
-    summary, same fp32 fold); the exchange's cross-rank memory ordering is pinned by the
-    ``test_symm_mem_exchange_stress`` round-trip.
+    receives its upstream neighbour's accumulated boundary from the symmetric buffer
+    (:class:`_SymmStateChain`), folds its single span once, and writes the result into its downstream
+    neighbour's buffer, signalling it.  Numerically bit-identical to :class:`NcclP2PBoundaryProducer`
+    (same frost summary, same fp32 fold via :func:`_accumulate_chain`); the chain's cross-rank memory
+    ordering is pinned by the ``test_symm_mem_state_chain_stress`` round-trip.
 
     The symm-mem path is not CUDA-graphable (the signals spin) and needs torch symmetric memory plus
     P2P across the CP group.  There is NO fallback -- every incompatibility is an explicit error:
     selecting ``symm_mem`` with CUDA graphs is rejected in ``TransformerConfig`` validation; a
     missing torch symmetric-memory module raises at construction; and a rendezvous that cannot
-    establish P2P raises a clear RuntimeError (see :func:`_get_symm_hm_exchange`).  Use
+    establish P2P raises a clear RuntimeError (see :func:`_get_symm_state_chain`).  Use
     ``kda_cudnn_cp_boundary_exchange='all_gather'`` for the portable, CUDA-graph-safe path.
     """
 
@@ -708,7 +786,7 @@ class SymmMemBoundaryProducer(_CudnnBoundaryBase):
             )
 
     def initial_state(self, k, v, g, beta, cu, cu_list, cp_context, gate_kwargs, flags):
-        """Summarise + symmetric-memory exchange + fused fp32 fold of the predecessors' blocks."""
+        """Summarise + O(1) forward symmetric-memory accumulation chain."""
         # Defensive guard for the hybrid-bypass path that skips TransformerConfig's CUDA-graph
         # rejection: the symm-mem signals are not capturable, so raise cleanly instead of hanging.
         if torch.cuda.is_current_stream_capturing():
@@ -718,25 +796,27 @@ class SymmMemBoundaryProducer(_CudnnBoundaryBase):
             )
         h, m, HO, V, K = self._summarize_fwd(k, v, g, beta, cu_list, cp_context, gate_kwargs, flags)
         n_local = len(cu_list) - 1
-        exch = _get_symm_hm_exchange(cp_context.group, HO, V, K, k.device)
-        par = exch.exchange_forward(h, m)
-        if cp_context.is_first_rank:
-            return _zeros_boundary_state(n_local, HO, V, K, k.device)
-        rank = exch.rank
-        return _symm_fold(
-            exch.buf[par],
+        chain = _get_symm_state_chain(cp_context.group, HO, V, K, k.device)
+        recv_into, send_state = chain.forward_handles()
+        return _accumulate_chain(
+            h,
+            m,
+            HO,
             V,
+            K,
             n_local=n_local,
+            in_cnt=cp_context.pre_num_ranks,  # forward: upstream = predecessor, downstream = successor
+            out_cnt=cp_context.post_num_ranks,
+            is_start=cp_context.is_first_rank,
             live_slot=0,
-            start=rank - cp_context.pre_num_ranks,  # ascending, document start first
-            count=cp_context.pre_num_ranks,
-            step=1,
+            recv_into=recv_into,
+            send_state=send_state,
         )
 
     def final_state_grad(
         self, q, k, g, beta, do, cu, cu_list, cp_context, scale, gate_kwargs, flags
     ):
-        """Reverse-summarise + symmetric-memory exchange + fused fp32 fold of the successors' blocks."""
+        """Reverse-summarise + O(1) backward symmetric-memory accumulation chain (mirror)."""
         # Defensive guard (mirror of initial_state) for the hybrid-bypass path: symm-mem is not
         # CUDA-graph capturable, so raise cleanly instead of hanging under capture.
         if torch.cuda.is_current_stream_capturing():
@@ -748,30 +828,35 @@ class SymmMemBoundaryProducer(_CudnnBoundaryBase):
             q, k, g, beta, do, cu_list, cp_context, scale, gate_kwargs, flags
         )
         n_local = len(cu_list) - 1
-        exch = _get_symm_hm_exchange(cp_context.group, HO, V, K, k.device)
-        par = exch.exchange_backward(gsum, tr)
-        if cp_context.is_last_rank:
-            return _zeros_boundary_state(n_local, HO, V, K, k.device)
-        rank = exch.rank
-        return _symm_fold(
-            exch.buf[par],
+        chain = _get_symm_state_chain(cp_context.group, HO, V, K, k.device)
+        recv_into, send_state = chain.backward_handles()
+        return _accumulate_chain(
+            gsum,
+            tr,
+            HO,
             V,
+            K,
             n_local=n_local,
+            in_cnt=cp_context.post_num_ranks,  # backward: upstream = successor, downstream = predecessor
+            out_cnt=cp_context.pre_num_ranks,
+            is_start=cp_context.is_last_rank,
             live_slot=n_local - 1,
-            start=rank + cp_context.post_num_ranks,  # descending, document end first
-            count=cp_context.post_num_ranks,
-            step=-1,
+            recv_into=recv_into,
+            send_state=send_state,
         )
 
 
 # The two user-facing boundary-exchange modes (mirrors the config Literal in transformer_config.py
-# and the dispatch in kda.py): "symm_mem" (symmetric-memory / NVLink exchange, default) and
-# "all_gather" (NCCL all-gather, portable and CUDA-graph safe).  "symm_mem" has no fallback -- an
-# incompatibility (CUDA graphs, missing symm-mem, or a rendezvous that cannot establish P2P) is an
-# explicit error directing the user to "all_gather".
+# and the dispatch in kda.py): "symm_mem" (symmetric-memory / NVLink accumulation chain, default) and
+# "all_gather" (NCCL point-to-point accumulation chain, portable and CUDA-graph safe).  Both now run
+# the SAME O(1) sequential-accumulation chain (:func:`_accumulate_chain`) and differ only in
+# transport; the "all_gather" name is retained for config compatibility (it was an NCCL all-gather +
+# per-rank fold before the O(1) fix).  "symm_mem" has no fallback -- an incompatibility (CUDA graphs,
+# missing symm-mem, or a rendezvous that cannot establish P2P) is an explicit error directing the
+# user to "all_gather".
 _PRODUCERS: dict[str, Any] = {
     "symm_mem": SymmMemBoundaryProducer,
-    "all_gather": AllGatherBoundaryProducer,
+    "all_gather": NcclP2PBoundaryProducer,
 }
 
 

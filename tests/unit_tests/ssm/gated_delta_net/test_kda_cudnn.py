@@ -7,10 +7,11 @@ of ``chunk_kda_cudnn``.  The GPU tests compare the cuDNN kernels with FLA's ``ch
 kernel, module and chunkwise context-parallel level.  Agreement is measured as relative L2
 (``||cudnn - fla|| / ||fla||``); the bounds widen the values observed on Blackwell (output ~6e-3,
 dq/dk/dv/dbeta ~5-7e-3, dg ~9e-3, dA_log/ddt_bias up to ~1.3e-2) for headroom.  The chunkwise CP
-tests run with the boundary-exchange modes of the cuDNN backend: ``all_gather`` (summaries, NCCL
-all-gather, fused Triton fold) and ``symm_mem`` (symmetric-memory / NVLink exchange).  ``symm_mem``
-has no fallback: an incompatible setup (CUDA graphs, missing symm-mem, or a failed P2P rendezvous)
-is an explicit error.
+tests run with the boundary-exchange modes of the cuDNN backend: ``all_gather`` (per-span summaries,
+NCCL point-to-point accumulation chain) and ``symm_mem`` (symmetric-memory / NVLink accumulation
+chain).  Both run the same O(1) sequential-accumulation fold and differ only in transport.
+``symm_mem`` has no fallback: an incompatible setup (CUDA graphs, missing symm-mem, or a failed P2P
+rendezvous) is an explicit error.
 """
 
 import functools
@@ -899,20 +900,21 @@ def test_pad_state_nseq_matches_reference():
 
 
 @pytest.mark.internal
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="the symm-mem exchange needs CUDA.")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the symm-mem state chain needs CUDA.")
 @pytest.mark.skipif(
-    Utils.world_size < 2, reason="the symm-mem exchange needs >= 2 distributed ranks."
+    Utils.world_size < 2, reason="the symm-mem state chain needs >= 2 distributed ranks."
 )
-def test_symm_mem_exchange_stress():
-    """Hammer the ``symm_mem`` mode's (H, M) symmetric-memory exchange to pin its cross-rank memory order.
+def test_symm_mem_state_chain_stress():
+    """Hammer the ``symm_mem`` mode's neighbour-to-neighbour state chain to pin its cross-rank memory order.
 
-    Isolates ``cp._SymmHMExchange`` (no summary, no fold): each rank writes a known, iteration-varying
-    value into its consumers' buffer slots, signals, waits on its producers, and asserts every
-    predecessor (forward) / successor (backward) slot of its OWN buffer holds that producer's exact
-    value. Run x100 so a missing ``put_signal`` release / ``wait_signal`` acquire would surface as a
-    stale or absent slot on some iteration rather than passing by luck once.
+    Isolates ``cp._SymmStateChain`` (no summary, no fold): each rank sends a known, iteration-varying
+    state to its one downstream neighbour (forward = successor, backward = predecessor), receives its
+    one upstream neighbour's state, and asserts it holds that neighbour's exact value.  Run x100 so a
+    missing ``put_signal`` release / ``wait_signal`` acquire would surface as a stale or absent slot on
+    some iteration rather than passing by luck once.  Each direction walks the chain sequentially (recv
+    upstream, then send downstream), so the forward pass runs rank 0 -> R-1 and the backward R-1 -> 0.
     """
-    from megatron.core.ssm.gated_delta_net.cudnn_kda.cp import _SymmHMExchange
+    from megatron.core.ssm.gated_delta_net.cudnn_kda.cp import _SymmStateChain
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1,
@@ -926,7 +928,7 @@ def test_symm_mem_exchange_stress():
         device = torch.cuda.current_device()
         ho, v, k = 4, _HEAD_DIM, _HEAD_DIM
         try:
-            exchange = _SymmHMExchange(group, ho, v, k, torch.device("cuda", device))
+            chain = _SymmStateChain(group, ho, v, k, torch.device("cuda", device))
         except Exception as reason:  # pragma: no cover - environment dependent
             pytest.skip(f"torch symmetric memory is unavailable here: {reason}")
 
@@ -934,24 +936,33 @@ def test_symm_mem_exchange_stress():
             return 1000.0 * (producer_rank + 1) + iteration
 
         for iteration in range(100):
-            h = torch.full((ho, v, k), value(rank, iteration), device=device, dtype=torch.float32)
-            m = torch.full((ho, k, k), value(rank, iteration), device=device, dtype=torch.float32)
+            state = torch.full(
+                (ho, v, k), value(rank, iteration), device=device, dtype=torch.float32
+            )
 
-            par = exchange.exchange_forward(h, m)
-            forward_buffer = exchange.buf[par]  # [world, ho, v+k, k], predecessor slots live
-            for producer in range(rank):  # every earlier rank pushed into this rank's buffer
-                expected = value(producer, iteration)
-                assert torch.allclose(
-                    forward_buffer[producer], torch.full_like(forward_buffer[producer], expected)
-                ), f"forward iter={iteration} rank={rank}: predecessor {producer} slot stale/missing"
+            # Forward: upstream = predecessor, downstream = successor (recv before send: chain 0 -> R-1).
+            recv_into, send_state = chain.forward_handles()
+            if rank > 0:
+                got = torch.empty((ho, v, k), device=device, dtype=torch.float32)
+                recv_into(got)
+                expected = value(rank - 1, iteration)
+                assert torch.allclose(got, torch.full_like(got, expected)), (
+                    f"forward iter={iteration} rank={rank}: predecessor {rank - 1} state stale/missing"
+                )
+            if rank < world - 1:
+                send_state(state)
 
-            par = exchange.exchange_backward(h, m)
-            backward_buffer = exchange.buf[par]  # successor slots live
-            for producer in range(rank + 1, world):  # every later rank pushed into this buffer
-                expected = value(producer, iteration)
-                assert torch.allclose(
-                    backward_buffer[producer], torch.full_like(backward_buffer[producer], expected)
-                ), f"backward iter={iteration} rank={rank}: successor {producer} slot stale/missing"
+            # Backward: upstream = successor, downstream = predecessor (chain R-1 -> 0).
+            recv_into, send_state = chain.backward_handles()
+            if rank < world - 1:
+                got = torch.empty((ho, v, k), device=device, dtype=torch.float32)
+                recv_into(got)
+                expected = value(rank + 1, iteration)
+                assert torch.allclose(got, torch.full_like(got, expected)), (
+                    f"backward iter={iteration} rank={rank}: successor {rank + 1} state stale/missing"
+                )
+            if rank > 0:
+                send_state(state)
         torch.cuda.synchronize()
     finally:
         Utils.destroy_model_parallel()

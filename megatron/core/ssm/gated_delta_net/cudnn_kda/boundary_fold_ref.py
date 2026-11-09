@@ -5,11 +5,13 @@
 cuDNN's fast per-span frost summary (``kimi_delta_attention_summary`` -> ``(H, M)``)
 gives each rank the affine map of its crossing span; the cross-rank boundary state
 is then the composition of the neighbouring ranks' spans.  The two boundary-exchange
-producers in ``cp.py`` -- ``AllGatherBoundaryProducer`` (NCCL all-gather) and
-``SymmMemBoundaryProducer`` (symmetric-memory exchange over NVLink) -- share ONE fused
-Triton "fold" kernel (``_affine_fold_kernel``) that eats frost's ``(H, M)`` directly,
-does the affine fold in fp32 in-kernel, and writes the boundary state out -- no glue,
-no staging, no per-rank launches.
+producers in ``cp.py`` -- ``NcclP2PBoundaryProducer`` (NCCL point-to-point chain) and
+``SymmMemBoundaryProducer`` (symmetric-memory chain over NVLink) -- run the SAME O(1)
+sequential-accumulation chain over ONE fused Triton "fold" kernel (``_affine_fold_kernel``)
+that eats frost's ``(H, M)`` directly, does the affine fold in fp32 in-kernel, and writes the
+boundary state out.  Each rank folds its single span once onto the accumulated boundary
+received from its upstream neighbour -- bit-identical to the full composition below, the same
+``tl.dot`` steps distributed across ranks instead of recomputed on every rank.
 
 This module is the authoritative, device-independent fp32/fp64 reference for the
 MATH that kernel must reproduce.  It is *not* a fast path and imports only

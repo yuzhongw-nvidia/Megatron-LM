@@ -398,11 +398,11 @@ class KimiDeltaAttention(_GDNBase):
             # the per-rank sequence count, so the cuDNN CP path uses it to pin the main-kernel plan key's
             # sequence-count axis (static shapes -> no per-step recompile).  None leaves the count dynamic.
             pad_nseq = getattr(self.config, "thd_max_packed_sequences", None)
-            # 'symm_mem' (default) exchanges the boundary (H, M) over CUDA symmetric memory (NVLink)
-            # with no fallback -- an incompatible setup (CUDA graphs, missing symm-mem, or a failed
-            # P2P rendezvous) is an explicit error (cp.SymmMemBoundaryProducer); 'all_gather' is the
-            # portable, CUDA-graph-safe NCCL path (cp.AllGatherBoundaryProducer).  Both run the same
-            # frost summary + fused fp32 fold.
+            # 'symm_mem' (default) runs the O(1) boundary accumulation chain over CUDA symmetric memory
+            # (NVLink) with no fallback -- an incompatible setup (CUDA graphs, missing symm-mem, or a
+            # failed P2P rendezvous) is an explicit error (cp.SymmMemBoundaryProducer); 'all_gather' is
+            # the portable, CUDA-graph-safe NCCL point-to-point chain (cp.NcclP2PBoundaryProducer).  Both
+            # run the same frost summary + O(1) sequential-accumulation fold.
             return partial(
                 chunk_kda_cudnn, cp_boundary_exchange=exchange, cp_pad_nseq=pad_nseq
             )
