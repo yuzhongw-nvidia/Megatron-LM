@@ -352,7 +352,11 @@ def _launch_affine_fold(
         )
     _, ho, v, k = h_stacked.shape
     assert k == m_stacked.shape[-1] == m_stacked.shape[-2], "fold expects square [K, K] transitions"
-    block_v = 64 if v % 64 == 0 else v
+    # BLOCK_V is kept at 16 (the tl.dot MMA minimum): the TF32 tensor-core fold's smem footprint
+    # (state/h/acc [BLOCK_V, HEAD_DIM] tiles + the [HEAD_DIM, HEAD_DIM] transition) overflows the
+    # 232 KB hardware limit at BLOCK_V=64 (needs ~262 KB); 16 fits with ample margin and the fold is
+    # tiny, so the extra V-tiles cost nothing.
+    block_v = 16 if v % 16 == 0 else v
     grid = (ho, triton.cdiv(v, block_v))
     _affine_fold_kernel[grid](
         h_stacked,
