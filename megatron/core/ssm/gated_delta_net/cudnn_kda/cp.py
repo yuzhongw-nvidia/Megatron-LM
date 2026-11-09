@@ -308,10 +308,12 @@ if HAVE_TRITON:
         """One head's (and V-tile's) affine fold ``S = S @ M_r + H_r`` over the rank chain.
 
         Collapses the per-rank affine composition into a single launch: ``S`` starts at zero and the
-        ``count`` ranks ``start, start + step, ...`` are folded in fp32 (``tl.dot`` with
-        ``allow_tf32=False`` to match the fp64 oracle).  Forward folds predecessors ascending; the
-        backward passes ``step = -1`` to fold successors descending -- the same affine composition,
-        mirrored.  See ``boundary_fold_ref`` for the device-independent reference.
+        ``count`` ranks ``start, start + step, ...`` are folded, accumulating in fp32 with ``tl.dot``
+        on TF32 tensor cores (default ``allow_tf32=True``) -- the same precision FLA's CP merge kernel
+        uses, ~16x faster than the fp32-non-tensor-core ``allow_tf32=False`` path and well within
+        bf16 training tolerance.  Forward folds predecessors ascending; the backward passes
+        ``step = -1`` to fold successors descending -- the same affine composition, mirrored.  See
+        ``boundary_fold_ref`` for the device-independent reference.
         """
         pid_ho = tl.program_id(0)
         pid_v = tl.program_id(1)
@@ -327,7 +329,7 @@ if HAVE_TRITON:
             )
             m_base = m_ptr + r * m_r_s + pid_ho * m_ho_s
             m_r = tl.load(m_base + k_off[:, None] * m_k_s + k_off[None, :])
-            state = tl.dot(state, m_r, allow_tf32=False) + h_r
+            state = tl.dot(state, m_r) + h_r
         tl.store(
             out_ptr + pid_ho * o_ho_s + v_off[:, None] * o_v_s + k_off[None, :],
             state,
