@@ -7,7 +7,7 @@ This directory contains MoE training recipes. Each YAML file includes:
 - `ENV_VARS`: Environment variables expected by the runtime.
 - `ARGS`: Megatron-LM training arguments.
 
-See the [Kimi-K3 guide](kimi_k3/README.md) for the decoder recipes, measurement revisions and ARM64 build.
+See the [Kimi-K3](kimi_k3/README.md) and [Kimi-K3.1](kimi_k3p1/README.md) guides for the decoder recipes, measurement revisions and ARM64 build.
 
 ## Recipe Index
 
@@ -77,6 +77,33 @@ See the [Kimi-K3 guide](kimi_k3/README.md) for the decoder recipes, measurement 
       <td>1/256/65536</td>
       <td>LongAlign-10k continuation</td>
       <td>—</td>
+    </tr>
+    <tr>
+      <td>Kimi-K3.1</td>
+      <td><a href="kimi_k3p1/gb300/mxfp8_THD64K_256GPU_TP1PP4EP64CP16_muon.yaml">GB300 MXFP8 THD 64K</a></td>
+      <td>256</td>
+      <td>1/4/64/16/1</td>
+      <td>1/256/65536</td>
+      <td>cuDNN KDA and H96 sparse DSA, latent all-gather</td>
+      <td>638.0</td>
+    </tr>
+    <tr>
+      <td>Kimi-K3.1</td>
+      <td><a href="kimi_k3p1/gb300/mxfp8_THD256K_256GPU_TP1PP4EP64CP64_muon.yaml">GB300 MXFP8 THD 256K</a></td>
+      <td>256</td>
+      <td>1/4/64/64/1</td>
+      <td>1/64/262144</td>
+      <td>cuDNN KDA and H96 sparse DSA, latent all-gather</td>
+      <td>— (cancelled before allocation)</td>
+    </tr>
+    <tr>
+      <td>Kimi-K3.1 9L proxy</td>
+      <td><a href="kimi_k3p1_proxy_9layer/gb300/mxfp8_THD64K_64GPU_TP1PP1EP64CP8_muon.yaml">GB300 MXFP8 THD 64K</a></td>
+      <td>64</td>
+      <td>1/1/64/8/1</td>
+      <td>1/256/65536</td>
+      <td>cuDNN KDA and H96 sparse DSA, latent all-gather</td>
+      <td>733.9 (PyTorch profiler run), 734.6 (Nsight run)</td>
     </tr>
     <tr>
       <td>DeepSeek-V4-Pro</td>
