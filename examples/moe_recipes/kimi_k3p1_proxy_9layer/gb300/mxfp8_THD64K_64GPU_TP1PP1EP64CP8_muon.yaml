@@ -1,0 +1,226 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Kimi-K3.1 9-layer proxy: 9 decoder blocks, 64 GB300 GPUs, packed THD sequences of up
+# to 65536 tokens (TP1, EP64, CP8; 8192 tokens per rank), with the Kimi-K3.1 structure:
+# DSA (DeepSeek-style sparse-indexer) full attention at blocks 4 and 8, KDA elsewhere,
+# dense first block.
+#
+# This proxy exists to materialize the Kimi-K3.1 *model structure* at a small depth; it
+# is not a tuned performance recipe and has only been run at this sequence length. The
+# DSA indexer dims and the non-pooled selection mirror the full K3.1 config.
+#
+# TP1 keeps all 96 attention heads on one rank, which the fused DSA backends need. This
+# is the measured configuration: these ARGS and ENV_VARS ran end to end on both
+# backends. Head counts per backend, image and measurements: ../../kimi_k3p1/README.md
+#
+# Entry point: pretrain_hybrid.py. Launch guide: ../../kimi_k3/README.md
+# Image: ../../kimi_k3p1/Dockerfile, built on top of the Kimi-K3 image.
+DEPENDENCIES:
+  pytorch_base_image: nvcr.io/nvidia/pytorch:26.04-py3
+  dockerfile_path: examples/moe_recipes/kimi_k3p1/Dockerfile
+ENV_VARS:
+  TORCH_NCCL_AVOID_RECORD_STREAMS: '0'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  NCCL_NVLS_ENABLE: '0'
+  NCCL_GRAPH_REGISTER: '0'
+  NCCL_DEBUG: VERSION
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
+  NVTE_NORM_FWD_USE_CUDNN: '1'
+  NVTE_NORM_BWD_USE_CUDNN: '1'
+  PYTHONWARNINGS: ignore
+  DYNAMO_CACHE_SIZE_LIMIT: '64'
+  NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API: '128'
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: '128'
+  NUM_OF_TOKENS_PER_CHUNK_PREPROCESSING_API: '128'
+  NVTE_CPU_OFFLOAD_V1: '1'
+  NCCL_LL128_BUFFSIZE: '1048576'
+  NCCL_PROTO: ^LL128
+  NCCL_BUFFSIZE: '1048576'
+ARGS:
+  tokenizer_type: HuggingFaceTokenizer
+  tokenizer_model: moonshotai/Kimi-K3
+  trust_remote_code: true
+  vocab_size: 163840
+  make_vocab_size_divisible_by: 1280
+  spec:
+  - megatron.core.models.hybrid.hybrid_layer_specs
+  - hybrid_stack_spec
+  enable_experimental: true
+  num_layers: 18
+  # K=KDA, D=DSA (sparse-indexer full attention), -=dense MLP, E=LatentMoE; /DE adds one
+  # MTP depth. DSA at blocks 4 and 8 (every 4th block), KDA elsewhere, dense first block --
+  # a 9-block slice of the Kimi-K3.1 cadence.
+  hybrid_layer_pattern: K-KEKEDEKEKEKEDEKE/DE
+  experimental_attention_variant: dsa
+  hidden_size: 7168
+  ffn_hidden_size: 33792
+  num_attention_heads: 96
+  # kv_channels omitted on purpose (MLA head dim is qk_head_dim + qk_pos_emb_head_dim;
+  # 7168 % 96 != 0). Megatron derives it for multi_latent_attention models.
+  max_position_embeddings: 1048576
+  init_method_std: 0.02
+  linear_conv_kernel_dim: 4
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_num_key_heads: 96
+  linear_num_value_heads: 96
+  kda_f_lora_rank: 128
+  kda_safe_gate: true
+  kda_lower_bound: -5.0
+  multi_latent_attention: true
+  q_lora_rank: 1536
+  kv_lora_rank: 512
+  qk_head_dim: 128
+  qk_pos_emb_head_dim: 64
+  v_head_dim: 128
+  qk_layernorm: true
+  attention_latent_norm_epsilon: 1.0e-06
+  attention_output_gate: true
+  gated_attention_proj_granularity: elementwise
+  mla_down_proj_fusion: false
+  no_rope_freq: 1
+  position_embedding_type: none
+  # ============ DeepSeek-style Sparse Attention (DSA) indexer ============
+  dsa_indexer_n_heads: 32
+  dsa_indexer_head_dim: 128
+  dsa_indexer_topk: 2048
+  dsa_indexer_topk_freq: 1
+  dsa_indexer_skip_topk_offset: 1
+  dsa_indexer_k_norm_epsilon: 1.0e-06
+  dsa_indexer_loss_coeff: 0.0
+  # Kimi-K3.1's indexer has no Hadamard rotation. The option defaults to true, which
+  # also needs fast_hadamard_transform; the image does not carry it.
+  dsa_indexer_rotate_activation: false
+  # Fused sparse-attention kernels. Both backends run the 96 heads a rank holds here
+  # (../../kimi_k3p1/README.md); tilelang also needs TileLang added to the image.
+  dsa_kernel_backend: cudnn
+  enable_attention_residuals: true
+  # Counts HybridModel entries (one attention or MLP sublayer per entry).
+  attn_res_block_layers: 2
+  normalization: RMSNorm
+  norm_epsilon: 1.0e-05
+  situ_glu: true
+  situ_glu_beta1: 4.0
+  situ_glu_beta2: 25.0
+  disable_bias_linear: true
+  untie_embeddings_and_output_weights: true
+  num_experts: 896
+  moe_ffn_hidden_size: 3072
+  moe_latent_size: 3584
+  moe_latent_output_norm: false
+  moe_latent_up_projection_rmsnorm: true
+  moe_shared_expert_intermediate_size: 6144
+  moe_router_topk: 16
+  moe_router_score_function: sigmoid
+  moe_router_dtype: fp32
+  moe_router_pre_softmax: false
+  moe_router_topk_scaling_factor: 1.0
+  moe_router_load_balancing_type: quantile_balancing
+  moe_aux_loss_coeff: 0.0
+  moe_router_quantile_balancing_estimation_scope: global_batch
+  moe_router_qb_num_bins: 1000
+  moe_router_enable_expert_bias: false
+  moe_enable_routing_replay: false
+  mtp_num_layers: 1
+  mtp_loss_scaling_factor: 0.1
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  # Mock sequences of 32768 to 65536 tokens (the default mock length distribution).
+  mock_data: true
+  seq_length: 65536
+  moe_router_force_load_balancing: true
+  use_varlen_dataset: true
+  sequence_packing_scheduler: dp_balanced
+  max_seqlen_per_dp_cp_rank: 8192
+  pad_packed_seq_alignment: max
+  calculate_per_token_loss: true
+  moe_hybridep_pad_variable_tokens: false
+  transformer_impl: transformer_engine
+  attention_backend: flash
+  distributed_timeout_minutes: 60
+  tensor_model_parallel_size: 1
+  sequence_parallel: false
+  pipeline_model_parallel_size: 1
+  expert_model_parallel_size: 64
+  expert_tensor_parallel_size: 1
+  # Global contiguous CP partition: native for KDA; DSA converts latents to zigzag internally.
+  context_parallel_size: 8
+  cp_partition_mode: contiguous
+  linear_cp_mode: chunkwise
+  # DSA all-gathers the latent KV across CP ranks.
+  cp_comm_type: all_gather
+  distributed_backend: nccl
+  attn_res_impl: fla
+  attn_res_norm_fusion: true
+  gdn_pre_gated_delta_rule_fusion: true
+  gdn_gated_output_norm_fusion: true
+  strict_runtime_validation_frequency: once_per_microbatch
+  moe_token_dispatcher_type: flex
+  moe_flex_dispatcher_backend: hybridep
+  moe_hybridep_num_sms: 32
+  moe_grouped_gemm: true
+  moe_permute_fusion: true
+  moe_megakernel_backend: mok
+  moe_megakernel_backend_config:
+    shared_expert_mode: native
+  bf16: true
+  fp8_format: e4m3
+  fp8_recipe: mxfp8
+  fp8_param_gather: true
+  reuse_grad_buf_for_mxfp8_param_ag: true
+  moe_router_padding_for_quantization: true
+  micro_batch_size: 1
+  global_batch_size: 256
+  train_iters: 20
+  exit_duration_in_mins: 230
+  seed: 20260901
+  recompute_granularity: selective
+  recompute_modules:
+  - gdn
+  - moe
+  - mlp
+  fine_grained_activation_offloading: true
+  offload_modules: [core_attn, attn_proj]
+  nccl_communicator_config_path: examples/moe_recipes/kimi_k3/nccl/tp_dp_cp_max_ctas16.yaml
+  cross_entropy_loss_fusion: true
+  cross_entropy_fusion_impl: native
+  optimizer: muon
+  use_distributed_optimizer: true
+  use_precision_aware_optimizer: false
+  muon_momentum: 0.95
+  muon_scale_mode: spectral
+  muon_extra_scale_factor: 1.0
+  muon_num_ns_steps: 5
+  muon_coefficient_type: quintic
+  muon_split_qkv_per_head: true
+  muon_tp_mode: duplicated
+  muon_fp32_matmul_prec: medium
+  muon_nesterov: false
+  optimizer_cpu_offload: false
+  optimizer_offload_fraction: 0.0
+  overlap_cpu_optimizer_d2h_h2d: false
+  chunked_optimizer_state_offload: true
+  optimizer_state_offload_chunk_size_mb: 256
+  optimizer_state_offload_fraction: 1.0
+  overlap_grad_reduce: true
+  overlap_param_gather: true
+  no_create_attention_mask_in_dataloader: true
+  lr: 1.0e-05
+  min_lr: 1.0e-06
+  lr_warmup_init: 1.0e-06
+  lr_decay_style: cosine
+  lr_decay_iters: 50
+  lr_warmup_iters: 0
+  weight_decay: 0.1
+  clip_grad: 1.0
+  no_check_for_nan_in_loss_and_grad: true
+  manual_gc: true
+  manual_gc_interval: 10
+  eval_iters: 0
+  eval_interval: 200
+  no_save_optim: true
+  no_load_optim: true
+  no_load_rng: true
+  log_throughput: true
+  log_interval: 1
+  logging_level: 20
+  log_device_memory_used: true
