@@ -198,6 +198,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "init_method_std": 0.014,
     "init_model_with_meta_device": False,
     "is_hybrid_model": True,
+    "kda_backend": "fla",
     "kda_f_lora_rank": None,
     "kda_gate_lora_rank": None,
     "kda_lower_bound": None,
