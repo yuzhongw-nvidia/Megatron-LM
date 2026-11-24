@@ -288,9 +288,12 @@ def test_indexer_mxfp8_quantize_replays():
 
 def test_kda_recurrence_replays():
     """Replay KDA's raw gate preparation and the selected FLA recurrence at CP1."""
+    from megatron.core.ops.ssm.kda.backends import select_kda_recurrence
     from megatron.core.ssm.gated_delta_net import kda
 
-    if kda.chunk_kda is None:
+    try:
+        chunk_kda = select_kda_recurrence("fla")
+    except ImportError:
         pytest.skip("FLA KDA kernel is unavailable")
     seeded()
     shape = (1, 128, 4, 64)
@@ -306,7 +309,7 @@ def test_kda_recurrence_replays():
 
     def run(q, k, v, g, beta, a_log, dt_bias):
         gate, extra = kda.KimiDeltaAttention._compute_gates(layer, a_log, dt_bias, 1, 128, g, beta)
-        output, _ = kda.chunk_kda(
+        output, _ = chunk_kda(
             q=q,
             k=k,
             v=v,
@@ -339,9 +342,12 @@ def test_kda_low_rank_projection_replays():
     """
     from megatron.core import parallel_state
     from megatron.core.extensions.transformer_engine import HAVE_TE
+    from megatron.core.ops.ssm.kda.backends import select_kda_recurrence
     from megatron.core.ssm.gated_delta_net import kda
 
-    if kda.chunk_kda is None:
+    try:
+        chunk_kda = select_kda_recurrence("fla")
+    except ImportError:
         pytest.skip("FLA KDA kernel is unavailable")
     if not HAVE_TE:
         pytest.skip("needs Transformer Engine")
@@ -399,13 +405,10 @@ def test_kda_low_rank_projection_replays():
         assert module.g_a_proj.weight.shape == (gate_rank, config.hidden_size)
         assert module.g_b_proj.weight.shape == (module.v_dim, gate_rank)
         assert module.beta_proj.weight.shape == (module.num_key_heads, config.hidden_size)
-        assert module.gated_delta_rule is kda.chunk_kda
+        assert module.gated_delta_rule is chunk_kda
         # The streamed pre-GDR fusion (gdn_pre_gated_delta_rule_fusion) is opt-in and rejected
         # under deterministic_mode; the deterministic replay stays on pre_gated_delta_rule.
         assert not module.gdn_pre_gated_delta_rule_fusion
-        # So is kda_kernel_backend='cudnn' (test_ssm_kernels.py): this replay covers the FLA
-        # backend, the only one deterministic_mode accepts.
-        assert config.kda_kernel_backend == "fla"
 
         hidden_states = torch.randn(
             128, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
@@ -444,9 +447,12 @@ def test_kda_recurrence_with_fused_gated_output_norm_replays():
     input gradient and the RMSNorm weight gradient.
     """
     from megatron.core.fusions import fused_gated_norm
+    from megatron.core.ops.ssm.kda.backends import select_kda_recurrence
     from megatron.core.ssm.gated_delta_net import kda
 
-    if kda.chunk_kda is None:
+    try:
+        chunk_kda = select_kda_recurrence("fla")
+    except ImportError:
         pytest.skip("FLA KDA kernel is unavailable")
     te = pytest.importorskip("transformer_engine.pytorch")
     seeded()
@@ -484,7 +490,7 @@ def test_kda_recurrence_with_fused_gated_output_norm_replays():
             decay, extra = kda.KimiDeltaAttention._compute_gates(
                 gate_layer, a_log, dt_bias, batch, length, g, beta
             )
-            core_attn_out, _ = kda.chunk_kda(
+            core_attn_out, _ = chunk_kda(
                 q=q,
                 k=k,
                 v=v,

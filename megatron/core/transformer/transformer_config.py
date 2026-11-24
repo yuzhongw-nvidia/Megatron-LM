@@ -667,6 +667,12 @@ class TransformerConfig(ModelParallelConfig):
     there is no automatic fallback. ``torch`` selects the PyTorch-native reference
     implementation and is required when deterministic mode is enabled."""
 
+    kda_backend: Literal["fla", "cudnn"] = "fla"
+    """Recurrence backend for Kimi Delta Attention."""
+
+    kda_kernel_backend: Optional[Literal["fla", "cudnn"]] = None
+    """Deprecated spelling of kda_backend for existing Kimi recipes and Python configs."""
+
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
 
@@ -696,13 +702,6 @@ class TransformerConfig(ModelParallelConfig):
 
     kda_lower_bound: Optional[float] = None
     """Optional lower bound for KDA's bounded gate values."""
-
-    kda_kernel_backend: Literal["fla", "cudnn"] = "fla"
-    """Kernel backend for KDA. The selected backend is required to be available; there is no
-    automatic fallback. ``cudnn`` selects cudnn-frontend's native KDA kernels, including under
-    chunkwise context parallelism. They run on Blackwell GPUs, require ``kda_lower_bound`` (the
-    bounded gate) and do not support deterministic mode. Their plans are built per token count:
-    with packed sequences, keep it static with ``pad_packed_seq_alignment``."""
 
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use streamed Triton pre-GDR preprocessing for GDN-family attention."""
@@ -2535,6 +2534,12 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.kda_kernel_backend is not None:
+            if self.kda_kernel_backend not in ("fla", "cudnn"):
+                raise ValueError("kda_kernel_backend must be one of {'fla', 'cudnn'}.")
+            if self.kda_backend != "fla" and self.kda_backend != self.kda_kernel_backend:
+                raise ValueError("Conflicting kda_backend and kda_kernel_backend values.")
+            self.kda_backend = self.kda_kernel_backend
         # Dynamic CP can assign a multi-rank group even when configured CP is one.
         has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
 
@@ -2787,11 +2792,6 @@ class TransformerConfig(ModelParallelConfig):
                 "gdn_kernel_backend must be one of {'transformer_engine', 'fla', 'torch'}, "
                 f"got {self.gdn_kernel_backend!r}."
             )
-        if self.kda_kernel_backend not in {"fla", "cudnn"}:
-            raise ValueError(
-                "kda_kernel_backend must be one of {'fla', 'cudnn'}, "
-                f"got {self.kda_kernel_backend!r}."
-            )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if (
@@ -3010,6 +3010,23 @@ class TransformerConfig(ModelParallelConfig):
             ), "linear_num_value_heads must be set for a GDN-family layer."
 
             if self.experimental_attention_variant == "kda":
+                if self.kda_backend not in ("fla", "cudnn"):
+                    raise ValueError(
+                        f"kda_backend must be 'fla' or 'cudnn', got {self.kda_backend!r}."
+                    )
+                if (
+                    self.kda_backend == "cudnn"
+                    and has_context_parallelism
+                    and self.linear_cp_mode != "chunkwise"
+                ):
+                    raise ValueError(
+                        "cuDNN KDA context parallelism requires linear_cp_mode='chunkwise'."
+                    )
+                if self.kda_backend == "cudnn" and self.linear_key_head_dim not in (64, 128):
+                    raise ValueError(
+                        "cuDNN KDA requires equal key/value head dimensions of 64 or 128, "
+                        f"got {self.linear_key_head_dim}."
+                    )
                 if self.linear_num_key_heads != self.linear_num_value_heads:
                     raise ValueError("KDA requires equal key and value head counts.")
                 if self.linear_key_head_dim != self.linear_value_head_dim:

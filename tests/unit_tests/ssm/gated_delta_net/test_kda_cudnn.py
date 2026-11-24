@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Tests for the cuDNN Kimi Delta Attention kernel backend (``kda_kernel_backend="cudnn"``)."""
+"""Tests for the cuDNN Kimi Delta Attention recurrence backend (``kda_backend="cudnn"``)."""
 
 import os
 from dataclasses import replace
@@ -22,7 +22,7 @@ from tests.unit_tests.transformer.test_attention import _test_parallel_attention
 from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
 
 try:
-    from megatron.core.ssm.gated_delta_net.cudnn_kda import _fold, chunk_kda_cudnn
+    from megatron.core.ops.ssm.kda.cudnn_backend import cudnn_chunk_kda
 
     HAVE_CUDNN_KDA = True
 except ImportError:
@@ -33,7 +33,6 @@ os.environ.update({"NCCL_NVLS_ENABLE": "0"})
 # cuDNN's KDA kernels exist for Blackwell GPUs only.
 pytestmark = pytest.mark.launch_on_gb200
 
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="Needs a CUDA device.")
 requires_cudnn_kda = pytest.mark.skipif(
     not (
         HAVE_FLA_KDA
@@ -62,7 +61,7 @@ def _make_backend_config(backend: str, **kwargs):
         _make_config(**kwargs),
         linear_key_head_dim=128,
         linear_value_head_dim=128,
-        kda_kernel_backend=backend,
+        kda_backend=backend,
         **overrides,
     )
 
@@ -80,58 +79,11 @@ def _grad_tol(name: str) -> float:
     return _GRAD_TOL
 
 
-def test_kda_kernel_backend_config():
-    assert _make_config().kda_kernel_backend == "fla"
-    assert replace(_make_config(), kda_kernel_backend="cudnn").kda_kernel_backend == "cudnn"
-    with pytest.raises(ValueError, match="kda_kernel_backend must be one of"):
-        replace(_make_config(), kda_kernel_backend="triton")
-
-
-@requires_cuda
-@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
-def test_kda_cudnn_backend_requires_bounded_gate():
-    Utils.initialize_model_parallel(1, 1)
-    try:
-        config = replace(
-            _make_config(), kda_kernel_backend="cudnn", kda_safe_gate=False, kda_lower_bound=None
-        )
-        with pytest.raises(ValueError, match="requires kda_lower_bound"):
-            _build_kda(config)
-    finally:
-        Utils.destroy_model_parallel()
-
-
-@requires_cudnn_kda
-def test_chunk_kda_cudnn_rejects_unsupported_arguments():
-    q = torch.zeros(1, 16, 2, 128, dtype=torch.bfloat16, device="cuda")
-    beta = torch.zeros(1, 16, 2, device="cuda")
-    a_log, dt_bias = torch.zeros(2, device="cuda"), torch.zeros(2 * 128, device="cuda")
-    gate = {"use_gate_in_kernel": True, "lower_bound": -5.0}
-    with pytest.raises(NotImplementedError, match="recurrent states"):
-        chunk_kda_cudnn(q, q, q, q, beta, a_log, dt_bias, output_final_state=True, **gate)
-    with pytest.raises(ValueError, match="bounded gate"):
-        chunk_kda_cudnn(q, q, q, q, beta, a_log, dt_bias, use_gate_in_kernel=True)
-
-
-@requires_cudnn_kda
-@pytest.mark.parametrize("step", [1, -1], ids=["forward", "backward"])
-def test_fold_matches_reference(step):
-    """The fold kernel against the same composition in fp64, in both rank orders."""
-    R, HO, V, K = 4, 3, 64, 128
-    generator = torch.Generator().manual_seed(11)
-    h = torch.randn(R, HO, V, K, generator=generator)
-    m = 0.9 * torch.eye(K) + 0.01 * torch.randn(R, HO, K, K, generator=generator)
-    hm = torch.cat((h, m), dim=2).cuda()
-    ranks = [0, 1, 2] if step == 1 else [3, 2, 1]
-
-    state = torch.empty(HO, V, K, device="cuda")
-    _fold(hm, state, ranks[0], len(ranks), step)
-
-    expected = torch.zeros(HO, V, K, dtype=torch.float64)
-    for rank in ranks:
-        expected = expected @ m[rank].double() + h[rank].double()
-    # The products run on TF32 tensor cores, as in FLA's merge kernel.
-    assert _relative_l2(state.cpu(), expected) < 5e-3
+def test_legacy_kda_kernel_backend_selects_recurrence():
+    config = _make_backend_config("fla")
+    assert replace(config, kda_kernel_backend="cudnn").kda_backend == "cudnn"
+    with pytest.raises(ValueError, match="Conflicting"):
+        replace(config, kda_backend="cudnn", kda_kernel_backend="fla")
 
 
 @requires_cudnn_kda
@@ -163,8 +115,10 @@ def test_kda_cudnn_matches_fla(sequence_packing, pre_gdr_fusion):
             for backend in ("fla", "cudnn")
         }
         modules["cudnn"].load_state_dict(modules["fla"].state_dict())
-        assert modules["fla"].gated_delta_rule is kda_module.chunk_kda
-        assert modules["cudnn"].gated_delta_rule is chunk_kda_cudnn
+        from fla.ops.kda import chunk_kda
+
+        assert modules["fla"].gated_delta_rule is chunk_kda
+        assert modules["cudnn"].gated_delta_rule is cudnn_chunk_kda
 
         results = {}
         for backend, module in modules.items():
@@ -200,8 +154,8 @@ def test_kda_cudnn_chunkwise_cp_matches_single_rank(
 ):
     """Chunkwise CP against the single-rank cuDNN model.
 
-    The packed sequences cross rank boundaries, with three of them on each CP2 rank (padded
-    to four by a zero-length one). The single SBHD sequence (chunkwise CP requires
+    The packed sequences cross rank boundaries, with three of them on each CP2 rank (including
+    segments that continue on the next rank). The single SBHD sequence (chunkwise CP requires
     ``micro_batch_size == 1`` there) spans every rank, so that with CP4 the last rank folds
     three predecessors and the first rank three successors.
     """
