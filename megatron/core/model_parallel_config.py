@@ -62,6 +62,17 @@ def resolve_tensor_parallel_weight_shards(
     return tensor_parallel_num_weight_shards, gtp_weight_remat_size
 
 
+def normalize_gtp_nccl_ub(value) -> Optional[list[str]]:
+    """Normalize a ``gtp*_remat_nccl_ub`` value: ``None``/``False`` -> ``None`` (off);
+    ``True`` (the old boolean form) or ``[]`` (a bare flag) -> ``["ag", "rs"]``; otherwise the
+    sorted, de-duplicated collectives."""
+    if value is None or value is False:
+        return None
+    if value is True:
+        return ["ag", "rs"]
+    return sorted(set(value)) or ["ag", "rs"]
+
+
 @dataclass
 @experimental_api
 class ModelParallelConfig:
@@ -95,6 +106,19 @@ class ModelParallelConfig:
        ``__post_init__`` from ``tensor_parallel_num_weight_shards`` (= that value divided by
        ``tensor_model_parallel_size``). Use ``tensor_parallel_num_weight_shards`` to control GTP.
     """
+
+    gtp_remat_nccl_ub: Optional[list[Literal["ag", "rs"]]] = field(
+        default=None, metadata={"argparse_meta": {"nargs": "*"}}
+    )
+    """Use NCCL symmetric memory for GTP communication on the dense GTP group, independent of
+    --use-nccl-ub (which covers the DP group). Takes a subset of {ag, rs}: "ag" registers the
+    weight all-gather buffers, "rs" the wgrad reduce-scatter send buffers. A bare flag enables
+    both."""
+
+    gtp_expert_remat_nccl_ub: Optional[list[Literal["ag", "rs"]]] = field(
+        default=None, metadata={"argparse_meta": {"nargs": "*"}}
+    )
+    """Like gtp_remat_nccl_ub but for the routed-expert (EGTP) groups."""
 
     tensor_parallel_num_sequence_shards: Optional[int] = None
     """Number of sequence partitions within a TP x GTP_remat weight-sharding group.
@@ -845,6 +869,9 @@ class ModelParallelConfig:
             shards_field="expert_tensor_parallel_num_weight_shards",
             tp_field="expert_tensor_parallel_size",
         )
+
+        for name in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
+            setattr(self, name, normalize_gtp_nccl_ub(getattr(self, name)))
 
         if self.pipeline_model_parallel_size > 1:
             if self.pipeline_dtype is None:
