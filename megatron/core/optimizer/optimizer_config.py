@@ -1,4 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Hybrid Muon dispatch ported from (Apache-2.0):
+# https://github.com/fanshiqing/Megatron-LM/commit/6c77e623b582b024a3a6434ce62223b0a7b20fc0
 
 import fnmatch
 import logging
@@ -138,6 +140,25 @@ class ParamKey:
                 if predicate(param, param_name):
                     return True
         return False
+
+
+def muon_effective_expert_tp_mode(config) -> str:
+    """NS mode the routed MoE expert weights run under: ``muon_expert_tp_mode`` when set,
+    otherwise ``muon_tp_mode``.
+
+    Accepts any object carrying the two attributes (an OptimizerConfig or the parsed training
+    args), so the CLI validation and the optimizer builders share this one definition.
+    """
+    return getattr(config, 'muon_expert_tp_mode', None) or getattr(
+        config, 'muon_tp_mode', 'duplicated'
+    )
+
+
+def muon_modes_are_hybrid(config) -> bool:
+    """Whether dense and expert weights run DIFFERENT NS modes, so the Muon builder keeps the
+    two weight families in separate base optimizers (see
+    ``megatron.core.optimizer._get_megatron_emerging_optimizer``)."""
+    return muon_effective_expert_tp_mode(config) != getattr(config, 'muon_tp_mode', 'duplicated')
 
 
 @dataclass
@@ -319,7 +340,27 @@ class OptimizerConfig:
     stages scatter the result back to the original shards. layer_sharded requires
     optimizer='muon', the layer-wise distributed optimizer path and muon_split_qkv=False
     (split-QKV Newton-Schulz is not implemented on the layer-sharded path); validate_run
-    checks all three. Defaults to "duplicated"."""
+    checks all three. Works with chunked_optimizer_state_offload: the optimizer is then
+    stepped once per state chunk, each chunk's weights are routed to NS homes balanced
+    within that chunk, and the exchange buffers are bounded by the chunk size. Defaults to
+    "duplicated"."""
+
+    muon_expert_tp_mode: Optional[str] = None
+    """NS mode for the routed MoE expert weights. None (default): expert weights follow
+    muon_tp_mode. Any muon_tp_mode value gives the expert weights their own mode — e.g.
+    muon_tp_mode='auto' with muon_expert_tp_mode='layer_sharded' runs the per-weight
+    duplicated/distributed cost model on dense weights while layer-sharding the MoE expert
+    weights, where the layer-sharded win concentrates (many identically shaped matrices per
+    NS home). When the effective modes differ, the optimizer builder keys the param groups
+    by the routed-expert marker (``param.expert_tp``, the semantic marker TensorParallelMuon
+    already keys its expert process groups on; not the expert-parallel communication flag,
+    so EP=1 experts count too) and constructs one base optimizer per weight family, on the
+    layer-wise path and on the plain Float16/FP32 path alike. Only optimizer='muon'
+    implements it; validate_run rejects an explicit value for every other optimizer, which
+    would silently apply muon_tp_mode to all weights. layer_sharded on either side needs the
+    layer-wise path; the split-QKV restriction is keyed to muon_tp_mode only, since expert
+    weights own no QKV. Requires num_experts when set explicitly (validate_args: a model
+    without expert weights has no expert bucket to route)."""
 
     muon_use_syrk: bool = False
     """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
@@ -328,16 +369,34 @@ class OptimizerConfig:
     """Additional scale factor for the muon update."""
 
     muon_ns_batch_size: int = 1
-    """Max number of same-shape matrices fused into one batched Newton-Schulz under
-    muon_tp_mode='layer_sharded', on each NS home or in a single-rank (GTP_remat x TP)
-    domain. MoE gives such a rank hundreds of identically shaped expert weights, where
-    the per-matrix loop is kernel-launch bound; batching trades transient memory for
-    fewer launches. Local NS inputs and updates are consumed one batch at a time. The
-    value is an upper bound per same-shape bucket, so a value above the matrix count
-    adds no memory. Batches of more than one use baddbmm instead of addmm and differ
-    from the per-matrix path by kernel-level rounding, so bitwise parity with duplicated
-    mode is lost; the default of 1 keeps the bit-exact path. Values > 1 require
-    emerging-optimizers >= 0.3.0."""
+    """Max number of same-shape matrices fused into one batched Newton-Schulz. Under
+    muon_tp_mode='layer_sharded' MoE assigns hundreds of identically shaped expert weights
+    to a single NS home, where the per-matrix loop is kernel-launch bound; batching trades a
+    transient stack of this many matrices for far fewer launches. Under
+    muon_tp_mode='duplicated' with GTP, same-shape GTP-sharded weights whose gathered matrix
+    carries no TP sharding are likewise stacked: the batch's GTP shards are all-gathered
+    with one collective instead of one per weight, and the per-matrix Newton-Schulz becomes
+    one batched call (bounded by muon_ns_batch_max_mb). The value is
+    an upper bound per same-shape bucket, so oversizing it is harmless. Batches of more than
+    one use baddbmm instead of addmm and differ from the per-matrix path by kernel-level
+    rounding, so bitwise parity with the unbatched step is lost; the default of 1 keeps the
+    bit-exact path. Values > 1 require emerging-optimizers >= 0.3.0."""
+
+    muon_ns_batch_max_mb: int = 2048
+    """Upper bound, in MiB, on the gathered fp32 momentum one batched Newton-Schulz of the
+    duplicated-GTP path stacks (muon_ns_batch_size matrices at most). It caps the transient
+    memory of the batch: the stacked shards, the (rank-major) gather buffer and its
+    per-weight reordering, the result, and the bf16 Newton-Schulz working set. Only
+    used when muon_ns_batch_size > 1 under
+    muon_tp_mode='duplicated'. Defaults to 2048."""
+
+    muon_ns_gather_ahead: int = 0
+    """Under muon_tp_mode='duplicated' with GTP and muon_ns_batch_size > 1: issue each batch's
+    all-gather this many batches ahead of the Newton-Schulz that consumes it, on a side
+    stream, so the gathers overlap the preceding batches' GEMMs; each batch in flight holds
+    one more gather buffer (bounded by muon_ns_batch_max_mb). 0 (default) gathers in order on
+    the compute stream. Same collectives in the same order on every rank, so the result is
+    unchanged; 1 is enough when a gather is shorter than a Newton-Schulz."""
 
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
@@ -601,24 +660,39 @@ class OptimizerConfig:
             and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
         )
 
-        if self.muon_tp_mode == 'layer_sharded':
+        if self.muon_expert_tp_mode is not None and self.optimizer not in ('muon', 'dist_muon'):
+            # Only the muon entry builds one base optimizer per weight family; every other
+            # optimizer applies muon_tp_mode to all weights and would ignore the override.
+            raise ValueError(
+                f"muon_expert_tp_mode is only implemented for optimizer='muon' (got "
+                f"{self.optimizer!r}); other optimizers, including adaptive_muon, apply "
+                "muon_tp_mode to every weight and would silently ignore it."
+            )
+        # Expert weights follow muon_tp_mode unless muon_expert_tp_mode overrides it.
+        muon_expert_tp_mode = muon_effective_expert_tp_mode(self)
+        if 'layer_sharded' in (self.muon_tp_mode, muon_expert_tp_mode):
+            selector = (
+                "muon_tp_mode" if self.muon_tp_mode == 'layer_sharded' else "muon_expert_tp_mode"
+            ) + "='layer_sharded'"
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.
             if self.optimizer not in ('muon', 'dist_muon'):
                 raise ValueError(
-                    f"muon_tp_mode='layer_sharded' requires optimizer='muon' (got "
-                    f"{self.optimizer!r}); other optimizers, including adaptive_muon, do not "
-                    "implement layer sharding."
+                    f"{selector} requires optimizer='muon' (got {self.optimizer!r}); other "
+                    "optimizers, including adaptive_muon, do not implement layer sharding."
                 )
             if not will_be_layer_wise:
                 raise ValueError(
-                    "muon_tp_mode='layer_sharded' requires the layer-wise distributed "
-                    "optimizer path (use_layer_wise_distributed_optimizer=True)."
+                    f"{selector} requires the layer-wise distributed optimizer path "
+                    "(use_layer_wise_distributed_optimizer=True)."
                 )
-            if self.muon_split_qkv:
-                raise ValueError(
-                    "muon_tp_mode='layer_sharded' does not implement split-QKV Newton-Schulz; "
-                    "set muon_split_qkv=False."
-                )
+        # Keyed to the dense side only: split-QKV lives on TensorParallelMuon's path and
+        # expert weights own no QKV, so muon_tp_mode='auto' with
+        # muon_expert_tp_mode='layer_sharded' keeps dense QKV splitting available.
+        if self.muon_tp_mode == 'layer_sharded' and self.muon_split_qkv:
+            raise ValueError(
+                "muon_tp_mode='layer_sharded' does not implement split-QKV Newton-Schulz; "
+                "set muon_split_qkv=False."
+            )
 
         # Dtypes may still be CLI strings here; finalize_optimizer_config maps them to torch.dtype.
         fp32 = (torch.float32, 'fp32')

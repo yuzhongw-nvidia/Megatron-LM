@@ -28,6 +28,7 @@ from megatron.core.optimizer.layer_sharded_a2a import (
     route_from_ns_home,
     route_to_ns_home,
 )
+from megatron.core.optimizer.param_layout import newton_schulz_cost
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import (
     get_emerging_optimizers_version,
@@ -250,8 +251,7 @@ class ParamShardSpec:
         weight NS-home balancing uses; non-2-D shapes count their elements."""
         if len(self.full_shape) != 2:
             return math.prod(self.full_shape)
-        m, n = self.full_shape
-        return m * n * min(m, n)
+        return newton_schulz_cost(*self.full_shape)
 
 
 @dataclasses.dataclass
@@ -277,6 +277,47 @@ class _GroupExchangePlan:
     # a2a routing metadata per stage ("s1f", "s1b", ("s2f", pd), ("s2b", pd)), filled by
     # the route_* helpers on the first step.
     route_plans: dict = dataclasses.field(default_factory=dict)
+
+
+def assign_ns_homes_lpt(
+    specs: list[ParamShardSpec], gtp_remat_size: int, tp_size: int
+) -> dict[int, tuple[int, int]]:
+    """Assign each sharded param an NS home ``(g_home, t_home)`` in the domain.
+
+    Longest Processing Time (LPT) bin-packing over ``gtp_remat_size * tp_size`` bins:
+    params sorted by :attr:`ParamShardSpec.ns_cost` descending, each placed in the bin
+    with the least accumulated cost. REPLICATED params are omitted: they are whole on
+    every rank of the domain, so every rank orthogonalizes its own copy instead of
+    electing a home, and giving them a bin would charge one rank for work all of them do.
+
+    A pure function of the specs (sort is stable: equal costs keep spec order), so every
+    rank of a domain that sees the same params in the same order derives the same homes
+    without a collective. Used by the LayerWise wiring over a whole domain and by
+    :meth:`LayerShardedMuon._build_plan` over one ``step()`` call's params.
+
+    Args:
+        specs: ``ParamShardSpec`` per param, in the order the exchange plan indexes them.
+        gtp_remat_size: Size of the gtp_remat axis.
+        tp_size: Size of the tp axis.
+
+    Returns:
+        Dict mapping the spec index -> ``(g_home, t_home)`` for every non-REPLICATED spec.
+    """
+    num_bins = gtp_remat_size * tp_size
+    candidates = [
+        (spec.ns_cost, i)
+        for i, spec in enumerate(specs)
+        if spec.sharding is not ParamSharding.REPLICATED
+    ]
+    candidates.sort(key=lambda c: -c[0])  # stable: equal costs keep param order
+    bin_cost = [0] * num_bins
+    assignment: dict[int, tuple[int, int]] = {}
+    for cost, i in candidates:
+        min_bin = min(range(num_bins), key=lambda b: bin_cost[b])
+        # Bin b -> (g_home, t_home) = (b // tp_size, b % tp_size).
+        assignment[i] = (min_bin // tp_size, min_bin % tp_size)
+        bin_cost[min_bin] += cost
+    return assignment
 
 
 class LayerShardedMuon(TensorParallelMuon):
@@ -381,6 +422,8 @@ class LayerShardedMuon(TensorParallelMuon):
         gtp_remat_group: torch.distributed.ProcessGroup | None,
         tp_group: torch.distributed.ProcessGroup | None = None,
         ns_batch_size: int = 1,
+        ns_batch_max_mb: int = 2048,
+        ns_gather_ahead: int = 0,
         use_syrk: bool = False,
         concurrent_groups: bool = True,
         use_decoupled_weight_decay: bool = True,
@@ -439,6 +482,11 @@ class LayerShardedMuon(TensorParallelMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
             use_syrk=use_syrk,
+            # The parent's batched duplicated-GTP step applies to the no-homes fallback
+            # (``super().step``) only; the layer-sharded path batches in _run_ns itself.
+            ns_batch_size=ns_batch_size,
+            ns_batch_max_mb=ns_batch_max_mb,
+            ns_gather_ahead=ns_gather_ahead,
         )
         self.gtp_remat_group = gtp_remat_group
         self.tp_group = tp_group
@@ -462,14 +510,25 @@ class LayerShardedMuon(TensorParallelMuon):
         # param_group index -> (gtp_remat_group, tp_group), overriding the constructor
         # defaults. Set via set_group_process_groups().
         self._group_process_groups: dict[int, tuple] = {}
+        # group['is_expert_parallel'] marker -> (gtp_remat_group, tp_group). Preferred over
+        # the index mapping when set: the chunked optimizer-state offload steps the
+        # optimizer on subsets of ``param_groups`` whose positions do not match the wired
+        # indices, but every subset group clones the marker of the group it came from.
+        self._marker_process_groups: dict[bool, tuple] = {}
+        # Re-run the LPT home assignment over the params of each step() call instead of
+        # reading the global assignment: under chunked optimizer-state offload a call sees
+        # one state chunk, and the globally balanced homes of that handful of weights can
+        # all land on one rank. Set via set_rebalance_homes_per_call().
+        self._rebalance_homes_per_call = False
         # Per-group exchange plan (param specs, homes, a2a routing metadata): a pure
         # function of the group's params, their sharding attributes and the domain sizes,
         # all static across steps; only the tensor packing is per-step. Keyed by the
-        # grad-filtered param identities so the wired path (persistent grad buffers,
-        # always fully populated) hits every step, while direct-API callers that drop a
-        # grad on some step safely trigger a rebuild. Metadata only, never buffers:
-        # persistent exchange buffers would raise steady-state memory between steps.
-        self._plans: dict[int, _GroupExchangePlan] = {}
+        # grad-filtered param identities and the domain so the wired path (persistent grad
+        # buffers, always fully populated) hits every step, chunked-offload subsets each
+        # keep their own plan, and direct-API callers that drop a grad on some step safely
+        # trigger a rebuild. Metadata only, never buffers: persistent exchange buffers
+        # would raise steady-state memory between steps.
+        self._plans: dict[tuple, _GroupExchangePlan] = {}
 
     def set_param_ns_homes(self, param_ns_homes: dict[int, tuple[int, int]]) -> None:
         """Set the NS home for each param (by id).
@@ -486,7 +545,11 @@ class LayerShardedMuon(TensorParallelMuon):
         self._warned_missing_homes = False
         self._plans.clear()
 
-    def set_group_process_groups(self, group_process_groups: dict[int, tuple]) -> None:
+    def set_group_process_groups(
+        self,
+        group_process_groups: dict[int, tuple],
+        marker_process_groups: dict[bool, tuple] | None = None,
+    ) -> None:
         """Override the (GTP, TP) process groups per param group.
 
         Different param groups can be sharded over different domains — e.g. under
@@ -498,10 +561,44 @@ class LayerShardedMuon(TensorParallelMuon):
             group_process_groups: Maps the index of a ``self.param_groups`` entry to
                 ``(gtp_remat_group, tp_group)``. Either entry may be None (treated as
                 size 1 / not available).
+            marker_process_groups: Maps the ``is_expert_parallel`` marker of a param
+                group (False = dense, True = expert) to ``(gtp_remat_group, tp_group)``.
+                When given, a group that carries the marker resolves its domain through
+                it, so the resolution survives the chunked optimizer-state offload
+                re-packing ``param_groups`` into per-chunk subsets (whose positions do not
+                match the wired indices). Groups without the marker use the index mapping.
         """
         self._group_process_groups = group_process_groups
+        self._marker_process_groups = dict(marker_process_groups or {})
         self._warned_shared_domain = False
         self._plans.clear()
+
+    def set_rebalance_homes_per_call(self, enabled: bool) -> None:
+        """Balance NS homes over the params of each ``step()`` call instead of globally.
+
+        The LayerWise wiring balances all params of a domain at once (LPT), which is the
+        right thing when ``step()`` sees them all. The chunked optimizer-state offload
+        steps the optimizer once per state chunk: each call sees a handful of weights,
+        and the globally balanced homes of that handful can all sit on one rank while
+        the others idle through its Newton-Schulz. With this enabled, ``_build_plan``
+        runs the same LPT over the call's own routed params (a pure function of their
+        shapes, hence identical on every rank of the domain) and ignores the global
+        assignment. Any assignment is mathematically valid; this only changes balance.
+        """
+        if enabled != self._rebalance_homes_per_call:
+            self._plans.clear()
+        self._rebalance_homes_per_call = bool(enabled)
+
+    def _group_axes(self, group_index: int, group: dict) -> tuple:
+        """The ``(gtp_remat_group, tp_group)`` domain of one param group.
+
+        Marker first (robust to re-packed subsets), then the wired index mapping, then
+        the constructor defaults.
+        """
+        marker = group.get('is_expert_parallel')
+        if marker is not None and bool(marker) in self._marker_process_groups:
+            return self._marker_process_groups[bool(marker)]
+        return self._group_process_groups.get(group_index, (self.gtp_remat_group, self.tp_group))
 
     def _apply_update(self, p: torch.Tensor, update: torch.Tensor, lr: float) -> None:
         """Apply one weight update through the base-class hook points.
@@ -587,8 +684,8 @@ class LayerShardedMuon(TensorParallelMuon):
         if not torch.cuda.is_available():
             return None
         domain_keys = []
-        for group_index in range(len(self.param_groups)):
-            pgs = self._group_process_groups.get(group_index, (self.gtp_remat_group, self.tp_group))
+        for group_index, group in enumerate(self.param_groups):
+            pgs = self._group_axes(group_index, group)
             domain_keys.append((id(pgs[0]), id(pgs[1])))
         if len(set(domain_keys)) != len(domain_keys):
             if not self._warned_shared_domain:
@@ -658,10 +755,11 @@ class LayerShardedMuon(TensorParallelMuon):
         the wired path hits the cache every step.
         """
         param_ids = tuple(id(p) for p in params)
-        plan = self._plans.get(group_index)
-        if plan is None or plan.param_ids != param_ids:
+        key = (param_ids, id(gtp_remat_group), id(tp_group))
+        plan = self._plans.get(key)
+        if plan is None:
             plan = self._build_plan(params, gtp_remat_group, tp_group)
-            self._plans[group_index] = plan
+            self._plans[key] = plan
         return plan
 
     def _build_plan(
@@ -674,22 +772,29 @@ class LayerShardedMuon(TensorParallelMuon):
         replicated = [i for i, s in enumerate(specs) if s.sharding is ParamSharding.REPLICATED]
         routed = [i for i, s in enumerate(specs) if s.sharding is not ParamSharding.REPLICATED]
 
-        n_missing = sum(1 for i in routed if id(params[i]) not in self._param_ns_homes)
-        if n_missing and not self._warned_missing_homes:
-            # Any home is mathematically valid (assignment only affects load balance),
-            # but a miss usually means homes were wired against stale param objects
-            # (e.g. before an fp32 main-param swap): surface it.
-            self._warned_missing_homes = True
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                f"LayerShardedMuon: {n_missing}/{len(routed)} params missing from "
-                "param_ns_homes; falling back to round-robin (g=i%G, t=0). Load "
-                "balancing (LPT) is NOT in effect for these params.",
-            )
-        ns_homes = [
-            self._param_ns_homes.get(id(params[i]), (i % gtp_remat_size, 0)) for i in routed
-        ]
+        if self._rebalance_homes_per_call and gtp_remat_size * tp_size > 1:
+            # Balance this call's routed params on their own (see
+            # set_rebalance_homes_per_call): a pure function of the specs, so every rank
+            # of the domain derives the same homes without a collective.
+            per_call = assign_ns_homes_lpt(specs, gtp_remat_size, tp_size)
+            ns_homes = [per_call[i] for i in routed]
+        else:
+            n_missing = sum(1 for i in routed if id(params[i]) not in self._param_ns_homes)
+            if n_missing and not self._warned_missing_homes:
+                # Any home is mathematically valid (assignment only affects load balance),
+                # but a miss usually means homes were wired against stale param objects
+                # (e.g. before an fp32 main-param swap): surface it.
+                self._warned_missing_homes = True
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"LayerShardedMuon: {n_missing}/{len(routed)} params missing from "
+                    "param_ns_homes; falling back to round-robin (g=i%G, t=0). Load "
+                    "balancing (LPT) is NOT in effect for these params.",
+                )
+            ns_homes = [
+                self._param_ns_homes.get(id(params[i]), (i % gtp_remat_size, 0)) for i in routed
+            ]
         g_home = {n: home[0] for n, home in enumerate(ns_homes)}
 
         # This rank's share of the stage-1 exchange, by the rule the router itself applies
@@ -734,9 +839,7 @@ class LayerShardedMuon(TensorParallelMuon):
                 streams[group_index].wait_event(ready)
                 torch.cuda.set_stream(streams[group_index])
             # Each param group may live in its own domain (dense vs expert).
-            gtp_remat_group, tp_group = self._group_process_groups.get(
-                group_index, (self.gtp_remat_group, self.tp_group)
-            )
+            gtp_remat_group, tp_group = self._group_axes(group_index, group)
 
             self._init_group(group)
             lr = group["lr"]

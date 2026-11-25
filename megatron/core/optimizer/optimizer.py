@@ -314,6 +314,7 @@ class MegatronOptimizer(ABC):
         optimizer_owned_master_dtypes: Dict[torch.Tensor, torch.dtype] | None = None,
         d2h_stream: torch.cuda.Stream | None = None,
         h2d_stream: torch.cuda.Stream | None = None,
+        chunk_partition_key: Callable[[torch.Tensor], object] | None = None,
     ) -> None:
         """Enable chunked state execution for this wrapped optimizer.
 
@@ -325,6 +326,10 @@ class MegatronOptimizer(ABC):
                 a separate ``master_param`` entry for them.
             d2h_stream: Optional D2H stream shared by related optimizer wrappers.
             h2d_stream: Optional H2D stream shared by related optimizer wrappers.
+            chunk_partition_key: Optional function of a parameter; a state chunk never spans
+                two values of it. For optimizers whose per-chunk step issues collectives that
+                every peer must form identically (see
+                ``emerging_optimizers.offload_chunk_partition_key``).
         """
 
         if (
@@ -342,6 +347,7 @@ class MegatronOptimizer(ABC):
             optimizer_owned_master_dtypes=optimizer_owned_master_dtypes,
             d2h_stream=d2h_stream,
             h2d_stream=h2d_stream,
+            chunk_partition_key=chunk_partition_key,
         )
 
     def set_optimizer_state_offload_deferred_lifecycle(

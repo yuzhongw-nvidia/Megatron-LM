@@ -123,3 +123,8 @@ The deprecated `--offload-optimizer-states` argument remains as a parser compati
 Configuration validation emits a visible `FutureWarning`, enables the new mode, and consumes the
 legacy field so copying the normalized configuration does not warn again. Its default-equivalent
 settings are chunk size `0` and fraction `1.0`, with the restrictions above.
+
+LayerWise Muon can offload both the dense and routed expert optimizer children. Each
+owns disjoint parameters and has its own state manager. Managers share transfer
+streams and staging windows. Only the child about to step stages its state. Chunk
+boundaries respect the expert GTP group so all participants issue matching collectives.

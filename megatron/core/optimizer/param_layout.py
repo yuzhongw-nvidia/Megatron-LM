@@ -21,6 +21,16 @@ def pad_to_divisor(value: int, divisor: int) -> int:
     return int(math.ceil(value / divisor) * divisor)
 
 
+def newton_schulz_cost(rows: int, cols: int) -> int:
+    """Cost estimate of orthogonalizing a ``rows x cols`` matrix: ``max * min^2``.
+
+    The dominant term of a Newton-Schulz iteration. The one cost model behind the layer-wise
+    shard layout, whole-param ownership and the layer-sharded Muon NS homes, so the three
+    balance the same quantity.
+    """
+    return rows * cols * min(rows, cols)
+
+
 def pad_param_start(param_start_index: int) -> int:
     """Align parameter start index to a 64-element boundary."""
     return pad_to_divisor(param_start_index, 64)

@@ -326,6 +326,90 @@ class MuonExcludedMatrixModel(nn.Module):
         return self.muon(F.relu(self.scalar(x)))
 
 
+@pytest.mark.parametrize("overlap", [False, True])
+def test_layerwise_initializes_effective_ddp_sync_config(monkeypatch, overlap):
+    """Muon uses its owned bucket policy, excluding sibling DistOpt settings."""
+
+    class FakeWrappedOptimizer:
+        def __init__(self, optimizer, config, grad_scaler, init_state_fn):
+            self.optimizer = optimizer
+            self.config = config
+            self._optimizer_state_offloader = None
+
+    def fake_shard_params(self, optimizers, full_param_layouts=None, model_chunks=None):
+        self.dp_cp_params_list = []
+        self.expt_dp_params_list = []
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.layer_wise_optimizer.Float16OptimizerWithFloat16Params",
+        FakeWrappedOptimizer,
+    )
+    monkeypatch.setattr(LayerWiseDistributedOptimizer, "shard_params", fake_shard_params)
+    metadata_calls = []
+    monkeypatch.setattr(
+        LayerWiseDistributedOptimizer,
+        "set_bucket_layerwise_params_list",
+        lambda self, chunks: metadata_calls.append(chunks),
+    )
+    config = OptimizerConfig(
+        bf16=True, overlap_param_gather=not overlap, use_layer_wise_param_layout=False
+    )
+    ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=False, overlap_param_gather=overlap
+    )
+    sibling_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True, overlap_param_gather=overlap
+    )
+    layerwise_param = SimpleNamespace(is_managed_by_layer_wise_optimizer=True)
+    sibling_param = SimpleNamespace(is_managed_by_layer_wise_optimizer=False)
+    layerwise_group = SimpleNamespace(
+        ddp_config=ddp_config, buckets=[SimpleNamespace(params_list=[layerwise_param])]
+    )
+    sibling_group = SimpleNamespace(
+        ddp_config=sibling_config, buckets=[SimpleNamespace(params_list=[sibling_param])]
+    )
+    chunks = [
+        SimpleNamespace(
+            ddp_config=sibling_config,
+            bucket_groups=[sibling_group, layerwise_group],
+            expert_parallel_bucket_groups=[],
+            # ``get_model_config`` reads the chunk's config for the CUDA-graph policy.
+            config=SimpleNamespace(cuda_graph_impl="none"),
+        )
+    ]
+    optimizer = LayerWiseDistributedOptimizer(
+        [object()], config, pg_collection=SimpleNamespace(tp=None), model_chunks=chunks
+    )
+
+    assert optimizer.ddp_config is ddp_config
+    assert optimizer.overlap_param_gather is overlap
+    assert optimizer.layerwise_param_sync_via_bucket_group is overlap
+    assert metadata_calls == ([chunks] if overlap else [])
+
+
+@pytest.mark.parametrize("owned_buckets", [False, True])
+def test_layerwise_rejects_inconsistent_effective_ddp_configs(owned_buckets):
+    """Preserve cross-chunk consistency checks for owned and fallback policies."""
+    chunks = []
+    for overlap in (False, True):
+        ddp_config = DistributedDataParallelConfig(overlap_param_gather=overlap)
+        param = SimpleNamespace(is_managed_by_layer_wise_optimizer=True)
+        group = SimpleNamespace(
+            ddp_config=ddp_config, buckets=[SimpleNamespace(params_list=[param])]
+        )
+        chunks.append(
+            SimpleNamespace(
+                ddp_config=ddp_config,
+                bucket_groups=[group] if owned_buckets else [],
+                expert_parallel_bucket_groups=[],
+            )
+        )
+    with pytest.raises(ValueError, match="must share one DDP config"):
+        LayerWiseDistributedOptimizer(
+            [], OptimizerConfig(), pg_collection=SimpleNamespace(tp=None), model_chunks=chunks
+        )
+
+
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )

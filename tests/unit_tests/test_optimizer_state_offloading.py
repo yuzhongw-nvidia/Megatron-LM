@@ -23,7 +23,9 @@ from megatron.core.optimizer import (
 from megatron.core.optimizer.cpu_offloading.chunked_optimizer_state_offload import (
     ChunkedOptimizerStateOffloader,
     OptimizerStateChunk,
+    _PinnedHostArena,
 )
+from megatron.core.optimizer.emerging_optimizers import offload_chunk_partition_key
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import parse_args, validate_args
@@ -666,6 +668,96 @@ def test_oversized_atomic_state_chunks_log_once():
     assert optimizer_name == "SimpleNamespace"
 
 
+def _chunk_planner(chunk_size_bytes, partition_key=None):
+    """A ChunkedOptimizerStateOffloader with only the byte-planning state populated."""
+
+    manager = object.__new__(ChunkedOptimizerStateOffloader)
+    manager.chunk_size_bytes = chunk_size_bytes
+    manager._state_bytes_per_param = 1
+    manager._chunk_partition_key = partition_key
+    manager.optimizer = SimpleNamespace()
+    return manager
+
+
+def _tagged_params(spec):
+    """Parameters from ``[(numel, expert_tp), ...]``; ``expert_tp`` is the MCore expert tag."""
+
+    params = []
+    for numel, expert_tp in spec:
+        param = nn.Parameter(torch.empty(numel))
+        param.expert_tp = expert_tp
+        params.append(param)
+    return tuple(params)
+
+
+def _chunk_shapes(chunks):
+    return [tuple(param.numel() for param in chunk.params) for chunk in chunks]
+
+
+def test_chunk_partition_key_gives_every_partition_its_own_chunks():
+    """Ranks with different dense bytes must pack the (shared) expert parameters identically.
+
+    The duplicated-GTP Muon step batches the parameters of one chunk and issues one all-gather
+    per batch over the expert GTP remat group, whose ranks own different dense parameters. Two
+    such ranks are modelled here: a dense prefix of 150 or 30 bytes before the same four expert
+    weights, with 200-byte chunks. Byte packing alone splits the experts as (3, 1) on one rank
+    and (2, 2) on the other; with the partition key both ranks produce the same expert chunks.
+    """
+
+    experts = [(60, True)] * 4
+    rank_a = _tagged_params([(100, False), (50, False)] + experts)
+    rank_b = _tagged_params([(30, False)] + experts)
+
+    plain = [_chunk_shapes(_chunk_planner(200)._build_chunks(p)) for p in (rank_a, rank_b)]
+    assert plain == [[(100, 50), (60, 60, 60), (60,)], [(30, 60, 60), (60, 60)]]
+
+    keyed = [
+        _chunk_shapes(_chunk_planner(200, offload_chunk_partition_key)._build_chunks(p))
+        for p in (rank_a, rank_b)
+    ]
+    assert keyed == [[(100, 50), (60, 60, 60), (60,)], [(30,), (60, 60, 60), (60,)]]
+    assert keyed[0][1:] == keyed[1][1:]
+
+
+def test_chunk_partition_key_separates_a_dense_run_that_follows_the_experts():
+    """A boundary falls at every key change, not only at the first one."""
+
+    params = _tagged_params([(10, False), (10, True), (10, True), (10, False), (10, False)])
+    chunks = _chunk_planner(100, offload_chunk_partition_key)._build_chunks(params)
+    assert _chunk_shapes(chunks) == [(10,), (10, 10), (10, 10)]
+    assert [tuple(p.expert_tp for p in c.params) for c in chunks] == [
+        (False,),
+        (True, True),
+        (False, False),
+    ]
+
+
+def test_partial_offload_selection_stops_only_between_partition_runs():
+    """A byte budget must not cut a run of equal keys at a rank-dependent position."""
+
+    params = _tagged_params([(100, False), (60, True), (60, True), (60, True), (20, False)])
+    manager = _chunk_planner(0, offload_chunk_partition_key)
+    manager._params = params
+    manager.offload_fraction = 0.5  # 150 of 300 bytes: lands inside the expert run
+    manager._explicit_master_param_ids = set()
+    manager._optimizer_owned_master_dtypes = {}
+
+    selected = manager._select_params_for_offload()
+    assert tuple(p.numel() for p in selected) == (100, 60, 60, 60)
+
+    manager._chunk_partition_key = None
+    selected = manager._select_params_for_offload()
+    assert tuple(p.numel() for p in selected) == (100, 60)
+
+
+def test_mcore_offload_chunk_partition_key_is_the_expert_tp_tag():
+    dense = nn.Parameter(torch.empty(1))
+    expert = nn.Parameter(torch.empty(1))
+    expert.expert_tp = True
+    assert offload_chunk_partition_key(dense) is False
+    assert offload_chunk_partition_key(expert) is True
+
+
 def test_h2d_targets_record_the_transfer_stream():
     """State and master allocations remain live if an update exits before its H2D completes."""
 
@@ -712,7 +804,8 @@ def test_h2d_targets_record_the_transfer_stream():
     master_param.data = master_cpu
     master_manager = object.__new__(ChunkedOptimizerStateOffloader)
     master_manager._selected_params = (master_param,)
-    master_manager._master_h2d_event = None
+    master_manager._master_h2d_pending = {}
+    master_manager._master_h2d_events = {}
     master_manager._explicit_master_param_ids = {id(master_param)}
     master_manager._master_weights_resident = True
     master_manager._param_devices = {master_param: object()}
@@ -741,6 +834,75 @@ def test_initialize_state_for_loading_requires_an_initializer():
 
     with pytest.raises(RuntimeError, match="requires an optimizer state initializer"):
         manager.initialize_state_for_loading(None, object())
+
+
+def test_pinned_arena_carves_exact_size_aligned_views_from_power_of_two_blocks():
+    """Buffers share blocks, keep exact shapes, stay 256-byte aligned, and oversized requests
+    get a dedicated power-of-two block; nothing is rounded per tensor."""
+
+    blocks = []
+
+    def pageable_block(nbytes):
+        blocks.append(nbytes)
+        return torch.empty(nbytes, dtype=torch.uint8)
+
+    arena = _PinnedHostArena(block_bytes=1 << 20, block_allocator=pageable_block)
+    a = arena.allocate((100, 7), torch.float32)  # 2800 B -> padded 2816
+    b = arena.allocate((3,), torch.bfloat16)  # 6 B -> padded 256
+    big = arena.allocate((300_000,), torch.float32)  # 1.2 MB > block -> dedicated 2 MiB
+
+    assert a.shape == (100, 7) and a.dtype == torch.float32
+    assert b.shape == (3,) and b.dtype == torch.bfloat16
+    assert a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()
+    assert b.data_ptr() - a.data_ptr() == 2816
+    assert big.untyped_storage().nbytes() == 2 << 20
+    assert blocks == [1 << 20, 2 << 20]
+    assert arena.allocated_bytes == 2800 + 6 + 1_200_000
+    assert arena.reserved_bytes == (1 << 20) + (2 << 20)
+
+    # Filling the first block moves to a second one; the tail of the first stays unused.
+    c = arena.allocate((1 << 20 - 2,), torch.float32)  # exactly 1 MiB - 2816 does not fit
+    assert c.untyped_storage().data_ptr() != a.untyped_storage().data_ptr()
+    assert blocks[-1] == 1 << 20
+
+    a.fill_(1.5)
+    b.fill_(2.0)
+    assert float(a.sum()) == 1050.0 and float(b.float().sum()) == 6.0
+
+    with pytest.raises(ValueError, match="power of two"):
+        _PinnedHostArena(block_bytes=3 << 20, block_allocator=pageable_block)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_cpu_buffers_are_pinned_views_of_shared_blocks():
+    """Offloaded masters and states land in pinned arena blocks, not one allocation per tensor."""
+
+    params = [nn.Parameter(torch.full((1000,), float(i), device="cuda")) for i in range(3)]
+    optimizer = torch.optim.SGD(params, lr=0.1, momentum=0.9)
+    for param in params:
+        param.grad = torch.ones_like(param)
+    optimizer.step()
+    manager = ChunkedOptimizerStateOffloader(
+        optimizer=optimizer,
+        master_params=params,
+        chunk_size_bytes=0,
+        offload_fraction=1.0,
+        state_dtypes=(torch.float32,),
+        pinned_block_bytes=1 << 20,
+    )
+    manager.synchronize_for_checkpoint()
+
+    masters = [manager._cpu_master[p] for p in params]
+    states = [manager._cpu_state[p]["momentum_buffer"] for p in params]
+    assert all(t.is_pinned() and t.shape == (1000,) for t in masters + states)
+    # Six 4000-byte buffers fit in one 1 MiB block: one storage, six 4096-byte-aligned slices.
+    storages = {t.untyped_storage().data_ptr() for t in masters + states}
+    assert len(storages) == 1
+    assert manager._pinned_arena.reserved_bytes == 1 << 20
+    assert manager._pinned_arena.allocated_bytes == 6 * 4000
+    for i, (master, state) in enumerate(zip(masters, states)):
+        torch.testing.assert_close(master, torch.full((1000,), float(i) - 0.1))
+        torch.testing.assert_close(state, torch.ones(1000))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
@@ -1128,6 +1290,73 @@ def test_master_h2d_allocates_on_compute_stream():
     assert allocation_streams == [compute_stream.cuda_stream]
     assert param.is_cuda
     torch.testing.assert_close(param, torch.ones_like(param))
+    manager.synchronize_for_checkpoint()
+
+
+def _chunked_sgd_manager():
+    """Four one-parameter chunks of SGD-with-momentum state, offloaded to the CPU."""
+
+    params = [nn.Parameter(torch.full((4096,), float(i + 1), device="cuda")) for i in range(4)]
+    optimizer = torch.optim.SGD(params, lr=0.1, momentum=0.9)
+    for param in params:
+        param.grad = torch.ones_like(param)
+    optimizer.step()  # materialize the momentum buffers so the state is chunkable
+    manager = ChunkedOptimizerStateOffloader(
+        optimizer=optimizer,
+        master_params=params,
+        chunk_size_bytes=4096 * torch.float32.itemsize,
+        offload_fraction=1.0,
+        state_dtypes=(torch.float32,),
+    )
+    assert len(manager.chunks) == 4
+    manager.synchronize_for_checkpoint()
+    assert all(param.device.type == "cpu" for param in params)
+    return params, manager, [param.detach().clone() for param in params]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_master_h2d_streams_one_chunk_ahead():
+    """Masters are bound at once but copied per chunk, so chunk 0 never waits for the rest."""
+
+    params, manager, before = _chunked_sgd_manager()
+
+    manager.prefetch_master_for_step()
+    # Every master already has CUDA storage: gradients can attach before any copy lands.
+    assert all(param.is_cuda for param in params)
+    assert not manager._master_weights_resident
+    first_chunk_ids = {id(param) for param in manager.chunks[0].params}
+    later_chunk_ids = {id(param) for chunk in manager.chunks[1:] for param in chunk.params}
+    assert set(manager._master_h2d_events) == first_chunk_ids
+    assert set(manager._master_h2d_pending) == later_chunk_ids
+
+    for param in params:
+        param.grad = torch.ones_like(param)
+    manager.step()
+    torch.cuda.synchronize()
+
+    assert not manager._master_h2d_in_flight()
+    assert manager._master_weights_resident
+    # Second SGD step with the restored momentum buffer (1.0): p -= lr * (0.9 * 1.0 + 1.0).
+    for param, previous in zip(params, before):
+        torch.testing.assert_close(param.detach().cpu(), previous - 0.1 * 1.9)
+    manager.synchronize_for_checkpoint()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_master_restore_for_param_sync_drains_pending_chunks():
+    """A whole-master consumer enqueues the copies the per-chunk prefetch left pending."""
+
+    params, manager, before = _chunked_sgd_manager()
+
+    manager.prefetch_master_for_step()
+    assert manager._master_h2d_pending
+    manager.ensure_master_for_param_sync()
+    torch.cuda.synchronize()
+
+    assert not manager._master_h2d_in_flight()
+    assert manager._master_weights_resident
+    for param, previous in zip(params, before):
+        torch.testing.assert_close(param.detach().cpu(), previous)
     manager.synchronize_for_checkpoint()
 
 

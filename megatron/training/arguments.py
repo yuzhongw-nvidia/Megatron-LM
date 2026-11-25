@@ -1,4 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Hybrid Muon dispatch ported from (Apache-2.0):
+# https://github.com/fanshiqing/Megatron-LM/commit/6c77e623b582b024a3a6434ce62223b0a7b20fc0
 
 """Megatron arguments."""
 
@@ -1956,6 +1958,14 @@ def validate_args(args, defaults={}):
         )
         args.iterations_to_skip.extend(iterations_to_skip_from_file)
 
+    if getattr(args, 'muon_expert_tp_mode', None) is not None:
+        assert args.optimizer in ('muon', 'dist_muon'), (
+            "--muon-expert-tp-mode requires --optimizer muon."
+        )
+        assert args.num_experts is not None and args.num_experts > 0, (
+            "--muon-expert-tp-mode requires a model with routed experts (--num-experts)."
+        )
+
     # emerging optimizer check
     # Dev keeps resolving the effective LayerWise optimizer (including the deprecated dist_muon
     # alias) on the legacy args namespace for args-based consumers. The rule is identical to
@@ -3623,15 +3633,50 @@ def _add_regularization_args(parser):
         'requires --use-distributed-optimizer and --muon-no-split-qkv. See '
         'OptimizerConfig.muon_tp_mode.',
     )
+    group.add_argument('--muon-expert-tp-mode', type=str, default=None,
+                       choices=['blockwise', 'duplicated', 'distributed', 'auto',
+                                'layer_sharded'],
+                       help='NS mode for expert-parallel weights. Default (unset): '
+                       'expert weights follow --muon-tp-mode. Set to give the expert '
+                       'domain its own mode — e.g. --muon-tp-mode auto '
+                       '--muon-expert-tp-mode layer_sharded runs the per-weight '
+                       'cost model on dense weights while layer-sharding the MoE '
+                       'expert weights. When the modes differ, the optimizer builder '
+                       'keeps dense/expert buckets separate and constructs one base '
+                       'optimizer per bucket. Requires --num-experts when set; only '
+                       '--optimizer muon implements it. See '
+                       'OptimizerConfig.muon_expert_tp_mode.')
     group.add_argument(
         '--muon-ns-batch-size',
         type=int,
         default=1,
         help='Max number of same-shape matrices fused into one batched '
-        'Newton-Schulz on an NS home under --muon-tp-mode layer_sharded. '
-        'The default of 1 keeps the bit-exact per-matrix path; raise '
-        '(e.g. to 32) to cut kernel launches on MoE expert homes at '
-        'the cost of bitwise parity (baddbmm vs addmm rounding).',
+        'Newton-Schulz: on an NS home under --muon-tp-mode layer_sharded, '
+        'or, under --muon-tp-mode duplicated with GTP, across GTP-sharded '
+        'weights whose gathered matrix has no TP sharding (one all-gather per '
+        'batch instead of one per weight). The default of 1 keeps '
+        'the bit-exact per-matrix path; raise (e.g. to 32) to cut kernel '
+        'launches on MoE expert weights at the cost of bitwise parity '
+        '(baddbmm vs addmm rounding). See OptimizerConfig.muon_ns_batch_size.',
+    )
+    group.add_argument(
+        '--muon-ns-batch-max-mb',
+        type=int,
+        default=2048,
+        help='Under --muon-tp-mode duplicated with --muon-ns-batch-size > 1, '
+        'cap in MiB on the gathered fp32 momentum one batched Newton-Schulz '
+        'stacks; bounds the transient memory of a batch (stack, gather buffer, '
+        'result, bf16 working set). Default 2048.',
+    )
+    group.add_argument(
+        '--muon-ns-gather-ahead',
+        type=int,
+        default=0,
+        help='Under --muon-tp-mode duplicated with --muon-ns-batch-size > 1, '
+        'issue each batch\'s all-gather this many batches ahead of its '
+        'Newton-Schulz on a side stream so the gathers overlap the GEMMs; '
+        'each batch in flight costs one more gather buffer. Default 0 '
+        '(gathers in order on the compute stream).',
     )
     group.add_argument(
         '--muon-use-syrk',
