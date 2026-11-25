@@ -1226,7 +1226,6 @@ def _dsa_fwd_flash_mla(
             d_v=d_v,
             attn_sink=attn_sink,
             topk_length=topk_length,
-            indexer_topk=0,
         )
 
     if padded_num_heads != actual_num_heads:
