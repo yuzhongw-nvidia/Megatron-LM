@@ -5,6 +5,12 @@ blocks (69 KDA and 24 MLA) and one additional MLA/MoE multi-token prediction (MT
 depth. The 9-block proxy has seven KDA blocks, two MLA blocks and one MTP depth.
 Both use the full widths, 96 attention heads and 896 routed experts with top-16 routing.
 
+## GTP on 256 GB300 GPUs
+
+The [GTP training guide](GTP_1M_TRAINING_GUIDE.md) describes the full K3 model with
+64 dense weight shards, 4 expert weight shards, and a 128-rank context group.
+It includes the mock-data recipe, launcher, and the source branch's 1M-context measurements.
+
 ## Full-model throughput on GB300
 
 | Packed THD length | GPUs | TP/PP/EP/CP | GBS | Median step | Median TFLOP/s/GPU | Measurement |

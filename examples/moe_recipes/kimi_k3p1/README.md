@@ -5,6 +5,16 @@ attention (DSA). The full decoder has 69 KDA and 24 DSA blocks, plus one DSA/MoE
 MTP depth. The 9-block decoder has seven KDA and two DSA blocks, plus MTP.
 The entry point for both is `pretrain_hybrid.py`.
 
+## GTP at 256K context
+
+The [256-GPU GTP recipe](gb300/mxfp8_THD256K_256GPU_GTP64EP64CP128_muon.yaml)
+uses 64 dense and four expert weight shards with an effective context-parallel
+group of 128, with no MTP layer. K3.1 DSA uses all-gather for context parallelism
+and keeps its absorbed K/V up-projection whole on each tensor-parallel rank. The original K3
+MLA recipe uses a hierarchical latent exchange. To launch K3.1, set
+`RECIPE=examples/moe_recipes/kimi_k3p1/gb300/mxfp8_THD256K_256GPU_GTP64EP64CP128_muon.yaml`
+when submitting the [K3 GTP launcher](../kimi_k3/GTP_1M_TRAINING_GUIDE.md).
+
 ## Full-model throughput on GB300
 
 | Packed THD length | GPUs | TP/PP/EP/CP | GBS | Tokens per CP rank | Median step | Median TFLOP/s/GPU | Status |

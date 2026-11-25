@@ -1,0 +1,269 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Kimi-K3 full text backbone on Generalized Tensor Parallelism (GTP): 93 decoder blocks,
+# 256 GB300 GPUs, one packed THD sequence of 1048576 tokens per microbatch.
+# TP1 / PP1, GTP64 (dense weight shards) / EGTP4 (expert weight shards), EP64, 64 sequence
+# shards x CP2 = a context-parallel group of 128 (8192 tokens per GPU), DP2, two microbatches
+# per optimizer step. MLA latent CP: a2a32 + p2p4. No MTP depth.
+# Use the cuDNN KDA recurrence with chunkwise CP and keep attention activations on GPU.
+# See ../GTP_1M_TRAINING_GUIDE.md for the launch and the historical FLA measurements.
+# Entry point: gtp_launch/kimi_k3_gtp_entry.py (wraps pretrain_hybrid.py).
+# The Kimi-K3 Dockerfile pins cuDNN frontend 1.33.0 with the FROST state-chain kernels.
+DEPENDENCIES:
+  pytorch_base_image: nvcr.io/nvidia/pytorch:26.04-py3
+  dockerfile_path: examples/moe_recipes/kimi_k3/Dockerfile
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: '32'
+  TORCH_NCCL_AVOID_RECORD_STREAMS: '0'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  PYTHONWARNINGS: ignore
+  MIMALLOC_PURGE_DELAY: '0'
+  # NVLink SHARP and NCCL's symmetric-memory collectives for the GTP weight all-gathers and
+  # gradient reduce-scatters (gtp_remat_nccl_ub / gtp_expert_remat_nccl_ub below).
+  NCCL_NVLS_ENABLE: '1'
+  NCCL_SYM_CE_THRESHOLD: '1099511627776'
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
+  NVTE_NORM_FWD_USE_CUDNN: '1'
+  NVTE_NORM_BWD_USE_CUDNN: '1'
+  # SMs left to the communication kernels that overlap the normalization kernels.
+  NVTE_FWD_LAYERNORM_SM_MARGIN: '40'
+  NVTE_BWD_LAYERNORM_SM_MARGIN: '40'
+  NVTE_INF_LAYERNORM_SM_MARGIN: '40'
+  NVTE_CUTEDSL_FUSED_GROUPED_MLP: '1'
+  CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL: 'TRUE'
+  # Select the activation-only TE CPU offload path.
+  NVTE_CPU_OFFLOAD_V1: '1'
+  # Node-local kernel caches (the measurement used a directory under /tmp).
+  TRITON_CACHE_DIR: /tmp/kimi_k3_gtp/triton
+  CUDA_CACHE_PATH: /tmp/kimi_k3_gtp/cuda
+  # Launch wrapper switches (gtp_launch/kimi_k3_gtp_entry.py): host memory bound to the GPU's
+  # NUMA node; master weights of an optimizer-state chunk copied to the host right after the
+  # chunk is stepped. Deferred validation of the NaN/Inf checks is the wrapper's default.
+  MCORE_NUMA_MEMBIND: gpu
+  MCORE_EARLY_MASTER_D2H: '1'
+  MCORE_EARLY_MASTER_D2H_VERIFY: '0'
+ARGS:
+  tokenizer_type: HuggingFaceTokenizer
+  tokenizer_model: moonshotai/Kimi-K3
+  trust_remote_code: true
+  vocab_size: 163840
+  make_vocab_size_divisible_by: 1280
+  spec:
+  - megatron.core.models.hybrid.hybrid_layer_specs
+  - hybrid_stack_spec
+  enable_experimental: true
+  hidden_size: 7168
+  ffn_hidden_size: 33792
+  num_attention_heads: 96
+  kv_channels: 64
+  max_position_embeddings: 1048576
+  init_method_std: 0.02
+  # K=KDA, +=MLA, -=dense MLP, E=LatentMoE. 186 entries (69 KDA, 24 MLA, 1 dense MLP, 92 MoE),
+  # no pipeline split and no MTP depth (the reference recipes end in /+E).
+  hybrid_layer_pattern: 'K-KEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+E+E'
+  experimental_attention_variant: kda
+  kda_backend: cudnn
+  linear_conv_kernel_dim: 4
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_num_key_heads: 96
+  linear_num_value_heads: 96
+  kda_f_lora_rank: 128
+  kda_safe_gate: true
+  kda_lower_bound: -5.0
+  multi_latent_attention: true
+  q_lora_rank: 1536
+  kv_lora_rank: 512
+  qk_head_dim: 128
+  qk_pos_emb_head_dim: 64
+  v_head_dim: 128
+  qk_layernorm: true
+  attention_latent_norm_epsilon: 1e-06
+  attention_output_gate: true
+  gated_attention_proj_granularity: elementwise
+  no_rope_freq: 1
+  position_embedding_type: 'none'
+  enable_attention_residuals: true
+  # Counts HybridModel entries (one attention or MLP sublayer per entry).
+  attn_res_block_layers: 24
+  normalization: RMSNorm
+  norm_epsilon: 1e-05
+  situ_glu: true
+  situ_glu_beta1: 4.0
+  situ_glu_beta2: 25.0
+  disable_bias_linear: true
+  untie_embeddings_and_output_weights: true
+  num_experts: 896
+  moe_ffn_hidden_size: 3072
+  moe_latent_size: 3584
+  moe_latent_up_projection_rmsnorm: true
+  moe_shared_expert_intermediate_size: 6144
+  moe_router_topk: 16
+  moe_router_score_function: sigmoid
+  moe_router_dtype: fp32
+  moe_router_topk_scaling_factor: 1.0
+  moe_router_load_balancing_type: quantile_balancing
+  moe_aux_loss_coeff: 0.0
+  moe_router_quantile_balancing_estimation_scope: global_batch
+  moe_router_qb_num_bins: 1000
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  # Throughput measurement: mock data and forced balanced routing, not a convergence run.
+  mock_data: true
+  seq_length: 1048576
+  moe_router_force_load_balancing: true
+  # DP2 x two microbatches of one 1M sequence: 4,194,304 tokens per optimizer step.
+  # global_batch_size 2 is the one-microbatch variant (790.6 TFLOP/s/GPU as printed).
+  micro_batch_size: 1
+  global_batch_size: 4
+  train_iters: 20
+  seed: 20260901
+  transformer_impl: transformer_engine
+  attention_backend: fused
+  distributed_timeout_minutes: 60
+  # No TP and no PP. context_parallel_size is the configured CP inside one sequence shard;
+  # the runtime CP group is 64 sequence shards x 2 = 128 ranks (two NVL72 racks).
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  context_parallel_size: 2
+  expert_model_parallel_size: 64
+  expert_tensor_parallel_size: 1
+  distributed_backend: nccl
+  # GTP: dense weights in 64 shards, expert weights in 4; a layer's weights are
+  # all-gathered before use and its gradients reduce-scattered afterwards.
+  tensor_parallel_num_weight_shards: 64
+  expert_tensor_parallel_num_weight_shards: 4
+  gtp_remat_opt_in_modules:
+  - moe_latent_proj
+  attn_res_impl: fla
+  gdn_pre_gated_delta_rule_fusion: true
+  # EP64 inside one NVLink domain, HybridEP dispatcher.
+  moe_token_dispatcher_type: flex
+  moe_flex_dispatcher_backend: hybridep
+  moe_hybridep_num_sms: 32
+  moe_grouped_gemm: true
+  moe_permute_fusion: true
+  use_transformer_engine_op_fuser: true
+  moe_mlp_glu_interleave_size: 32
+  bf16: true
+  fp8_format: e4m3
+  fp8_recipe: mxfp8
+  fp8_param_gather: true
+  reuse_grad_buf_for_mxfp8_param_ag: true
+  moe_router_padding_for_quantization: true
+  # Recompute KDA and MoE/MLP activations. Keep attention activations on GPU.
+  recompute_granularity: selective
+  recompute_modules:
+  - gdn
+  - moe
+  - mlp
+  # Muon; dense matrices layer-wise distributed, expert matrices layer-sharded.
+  optimizer: muon
+  muon_momentum: 0.95
+  muon_scale_mode: spectral
+  muon_extra_scale_factor: 1.0
+  muon_num_ns_steps: 5
+  muon_coefficient_type: quintic
+  muon_tp_mode: auto
+  muon_ns_batch_size: 8
+  muon_fp32_matmul_prec: medium
+  use_distributed_optimizer: true
+  overlap_grad_reduce: true
+  overlap_param_gather: true
+  # Short benchmark schedule.
+  lr: 0.0001
+  min_lr: 1e-05
+  lr_warmup_init: 1e-05
+  lr_decay_style: cosine
+  lr_decay_iters: 20
+  lr_warmup_iters: 0
+  weight_decay: 0.1
+  clip_grad: 1.0
+  no_create_attention_mask_in_dataloader: true
+  cross_entropy_loss_fusion: true
+  cross_entropy_fusion_impl: native
+  cuda_graph_impl: 'none'
+  manual_gc: true
+  manual_gc_interval: 10
+  eval_iters: 0
+  eval_interval: 1000
+  ckpt_format: torch_dist
+  dist_ckpt_strictness: raise_all
+  log_interval: 1
+  log_throughput: true
+  log_memory_interval: 1
+  log_device_memory_used: true
+  grad_reduce_in_bf16: true
+  # bf16 gradient reduction with an fp32 accumulator in the GTP reduce-scatter.
+  gtp_remat_reduce_scatter_with_fp32_accumulation: true
+  attn_res_norm_fusion: true
+  gdn_gated_output_norm_fusion: true
+  strict_runtime_validation_frequency: once_per_microbatch
+  calculate_per_token_loss: true
+  fine_grained_activation_offloading: true
+  activation_offload_fraction: 0.0
+  offload_modules:
+  - core_attn
+  - attn_proj
+  # Optimizer states live on the host and visit the GPU in 1 GiB chunks.
+  chunked_optimizer_state_offload: true
+  optimizer_state_offload_chunk_size_mb: 1024
+  optimizer_state_offload_fraction: 1.0
+  muon_split_qkv_per_head: true
+  no_save_optim: true
+  no_load_optim: true
+  muon_ns_batch_max_mb: 2048
+  muon_ns_gather_ahead: 1
+  moe_glu_interleave_with_gtp_sharding: true
+  no_use_layer_wise_param_layout: true
+  attention_output_gate_fusion: true
+  # GTP all-gather / reduce-scatter on NCCL user buffers (symmetric memory).
+  gtp_remat_nccl_ub:
+  - ag
+  - rs
+  gtp_expert_remat_nccl_ub:
+  - ag
+  - rs
+  muon_expert_tp_mode: layer_sharded
+  timing_log_level: 1
+  # Packed THD input: every mock document is exactly 1048576 tokens; 8192 tokens per
+  # (DP, CP) rank, padded to the maximum so every microbatch has the same static shape.
+  use_varlen_dataset: true
+  sequence_packing_scheduler: dp_balanced
+  max_seqlen_per_dp_cp_rank: 8192
+  pad_packed_seq_alignment: max
+  varlen_mock_dataset_config_json: '{"mode":"distribution","type":"lognormal","format":"thd","min_seq_len":1048576,"max_seq_len":1048576,"mean_seq_len":1048576,"lognormal_sigma":1.1}'
+  # 64 sequence shards on the GTP group: with context_parallel_size 2 the sequence is
+  # split over 128 ranks. Contiguous partition for KDA (chunkwise CP).
+  tensor_parallel_num_sequence_shards: 64
+  cp_partition_mode: contiguous
+  linear_cp_mode: chunkwise
+  # MLA latent CP on the 128-rank group: an all-to-all over groups of 32 consecutive ranks
+  # (3 of the 96 heads per rank), then a latent ring of 4 steps per MLA layer.
+  cp_comm_type: 'a2a+p2p'
+  # Pin Triton autotuners to one configuration per kernel so that all ranks compile the
+  # same kernels; the kernels on the config-invariant list keep Triton's timed choice
+  # (the KDA cross-rank merge kernel is 25x slower on the pinned default).
+  triton_autotune_mode: pinned
+  triton_autotune_modules:
+  - mamba_ssm
+  - transformer_engine
+  - megatron.core
+  - fla
+  mla_latent_cp: true
+  hierarchical_context_parallel_sizes:
+  - 32
+  - 4
+  # Contiguous residual stream: KDA layers need no layout conversion; MLA converts its own
+  # input to zigzag. cp_contiguous_padded_qkv_seqlens (last line) gives the contiguous view
+  # the padded lengths.
+  linear_cp_layout: contiguous
+  triton_autotune_config_invariant:
+  - transformer_engine.common.triton.permutation._permute_kernel
+  - transformer_engine.common.triton.permutation._unpermute_kernel
+  - transformer_engine.common.triton.permutation._sort_chunks_by_map_kernel
+  - transformer_engine.pytorch.triton.permutation._permute_kernel
+  - transformer_engine.pytorch.triton.permutation._unpermute_kernel
+  - transformer_engine.pytorch.triton.permutation._sort_chunks_by_map_kernel
+  - fla.ops.cp.chunk_delta_h.merge_fwd_bwd_kernel
+  triton_autotune_enumerate_autotuners: true
+  cp_contiguous_padded_qkv_seqlens: true
