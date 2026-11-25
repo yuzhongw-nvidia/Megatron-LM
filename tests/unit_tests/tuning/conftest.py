@@ -19,6 +19,7 @@ def isolated_policy(monkeypatch):
         Autotuner = None
     if Autotuner is not None:
         monkeypatch.setattr(Autotuner, "run", inspect.unwrap(Autotuner.run))
+        monkeypatch.setattr(Autotuner, "_bench", inspect.unwrap(Autotuner._bench))
     for name, value in {
         "_installed": False,
         "_policy": None,

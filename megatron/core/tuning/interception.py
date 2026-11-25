@@ -11,8 +11,10 @@ the intervention at all.
 from __future__ import annotations
 
 import atexit
+import gc
 import json
 import logging
+import math
 import os
 from collections.abc import Mapping
 from functools import wraps
@@ -261,8 +263,60 @@ def _autotuner_class():
     return Autotuner
 
 
+def _benchmark_failed(timings) -> bool:
+    """Whether ``Autotuner._bench`` reported a config it could not run (all-inf timings)."""
+    values = timings if isinstance(timings, (list, tuple)) else [timings]
+    try:
+        return bool(values) and all(math.isinf(float(v)) for v in values)
+    except (TypeError, ValueError):
+        return False
+
+
+def _install_bench_collector(autotuner_class) -> None:
+    """Collect the garbage a swallowed autotune failure leaves behind, right away.
+
+    When a candidate config cannot run (``OutOfResources`` over the shared-memory
+    limit is the common case), Triton's ``Autotuner._bench`` catches the exception
+    and returns infinite timings. The exception object itself is not freed: Triton
+    raises it from a nested ``raise_(err)`` closure in ``CompiledKernel._init_handles``,
+    so the raising frame holds the exception in a local while the exception's
+    traceback holds that frame — a reference cycle that only the cyclic collector
+    breaks. Every frame on that traceback stays alive with its locals, including
+    ``_bench``'s kernel arguments: the activations and gradients of the layer being
+    tuned. Under ``gc.disable()`` (Megatron's ``--manual-gc``) they survive until the
+    next manual collection, through the first optimizer step, and nothing else
+    collects them in between unless a later ``torch.compile`` happens to run
+    ``gc.collect()`` itself. One young-generation collection after each failed
+    benchmark frees the cycle while it is still young, for a few milliseconds at
+    compile time and nothing at steady state.
+    """
+    original = getattr(autotuner_class, "_bench", None)
+    if original is None or getattr(original, "_mcore_collects_after_failure", False):
+        return
+
+    @wraps(original)
+    def collecting_bench(self, *args, **kwargs):
+        timings = original(self, *args, **kwargs)
+        if _benchmark_failed(timings):
+            gc.collect(1)
+        return timings
+
+    collecting_bench._mcore_collects_after_failure = True
+    autotuner_class._bench = collecting_bench
+
+
 def _install(policy: AutotunePolicy) -> None:
     global _installed, _policy
+
+    # Independent of the policy: every autotuner run must not leave a failed
+    # candidate's call chain (and the kernel arguments in it) pinned until the
+    # next manual collection.
+    try:
+        bench_owner = _autotuner_class()
+    except ImportError:
+        bench_owner = None  # Triton without the autotuner: nothing benchmarks
+    if bench_owner is not None:
+        _install_bench_collector(bench_owner)
 
     # Look the autotuner up before changing any state, so that a policy which
     # cannot be carried out leaves the previous one in place.
