@@ -1117,7 +1117,8 @@ def test_exchange_plan_cache_bitwise_and_reused():
             opt.step()
         for pa, pb in zip(params_a, params_b):
             assert torch.equal(pa.data, pb.data), f"warm/cold divergence at step {step}"
-        current = {tag: id(sub) for tag, sub in opt_a._plans[0].route_plans.items()}
+        (plan,) = opt_a._plans.values()  # one group, one domain: exactly one cached plan
+        current = {tag: id(sub) for tag, sub in plan.route_plans.items()}
         assert current, "no plans were cached"
         if plan_ids is None:
             plan_ids = current
@@ -1142,11 +1143,106 @@ def test_exchange_plan_rebuilds_when_param_set_changes():
     for p, w in zip(params, full_w):
         p.grad = _shard(torch.randn_like(w))
     opt.step()
-    key_both = opt._plans[0].param_ids
+    plans_both = set(opt._plans)  # keyed by (param ids, domain): one entry so far
+    assert len(plans_both) == 1
 
     params[1].grad = None
     params[0].grad = _shard(torch.randn_like(full_w[0]))
     before = params[1].data.clone()
     opt.step()
-    assert opt._plans[0].param_ids != key_both, "stale plan reused"
+    assert set(opt._plans) - plans_both, "stale plan reused"
     assert torch.equal(params[1].data, before), "grad-less param must not move"
+
+
+# ---------------------------------------------------------------------------
+# Chunked optimizer-state offload compatibility: step() on per-chunk subsets of the groups
+# ---------------------------------------------------------------------------
+
+
+class TestPerCallSubsets:
+    """What the chunked optimizer-state offload needs from the optimizer: a group's domain
+    must not depend on its position in ``param_groups`` (subsets are re-packed per chunk),
+    and homes must balance within the call."""
+
+    def test_assign_ns_homes_lpt_is_deterministic_and_skips_replicated(self):
+        specs = [
+            ParamShardSpec(tp_dim=None, gtp_sharded=True, pad_length=0, full_shape=(64, 64)),
+            ParamShardSpec(tp_dim=None, gtp_sharded=False, pad_length=0, full_shape=(8, 8)),
+            ParamShardSpec(tp_dim=0, gtp_sharded=True, pad_length=0, full_shape=(32, 16)),
+            ParamShardSpec(tp_dim=1, gtp_sharded=True, pad_length=0, full_shape=(16, 32)),
+        ]
+        assert specs[1].sharding is ParamSharding.REPLICATED
+        homes = lsm.assign_ns_homes_lpt(specs, gtp_remat_size=2, tp_size=2)
+        assert set(homes) == {0, 2, 3}, "REPLICATED params get no home"
+        assert homes == lsm.assign_ns_homes_lpt(list(specs), 2, 2), "not a pure function"
+        # Three routed params, four empty bins: LPT never stacks two on one home.
+        assert len(set(homes.values())) == 3
+        assert all(0 <= g < 2 and 0 <= t < 2 for g, t in homes.values())
+
+    def test_layer_wise_assignment_delegates_to_the_shared_lpt(self):
+        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+        params = [torch.nn.Parameter(torch.zeros(4, 4)) for _ in range(3)]
+        specs = [ParamShardSpec(None, True, 0, (64 * (i + 1), 64)) for i in range(3)]
+        by_id = LayerWiseDistributedOptimizer._assign_ns_homes(params, specs, 2, 1)
+        by_index = lsm.assign_ns_homes_lpt(specs, 2, 1)
+        assert by_id == {id(params[i]): home for i, home in by_index.items()}
+
+    def test_group_axes_prefer_the_marker_over_the_index(self, monkeypatch):
+        opt = _make_opt(monkeypatch)
+        dense_axes, expert_axes = ("dense_g", "dense_t"), ("expert_g", None)
+        opt.set_group_process_groups(
+            {0: dense_axes, 1: expert_axes},
+            marker_process_groups={False: dense_axes, True: expert_axes},
+        )
+        # A chunk holding only expert params re-packs that group at position 0.
+        assert opt._group_axes(0, {"is_expert_parallel": True}) == expert_axes
+        assert opt._group_axes(0, {"is_expert_parallel": False}) == dense_axes
+        # Without a marker the wired index mapping applies, then the constructor default.
+        assert opt._group_axes(1, {}) == expert_axes
+        assert opt._group_axes(5, {}) == (None, None)
+        # Legacy single-argument call: index mapping only.
+        opt.set_group_process_groups({0: expert_axes})
+        assert opt._group_axes(0, {"is_expert_parallel": False}) == expert_axes
+
+    def test_rebalance_toggle_clears_plans(self, monkeypatch):
+        opt = _make_opt(monkeypatch)
+        opt._plans[("sentinel",)] = object()
+        opt.set_rebalance_homes_per_call(True)
+        assert opt._plans == {} and opt._rebalance_homes_per_call
+        opt._plans[("sentinel",)] = object()
+        opt.set_rebalance_homes_per_call(True)  # unchanged: the cache is kept
+        assert opt._plans
+
+
+@pytest.mark.launch_on_gb200
+def test_per_call_rebalanced_homes_match_global_homes_bitwise():
+    """Home placement only decides where Newton-Schulz runs: balancing within a call (what
+    chunked offload enables) must reproduce the globally wired homes bitwise, and must
+    spread a subset whose global homes all collide on one rank."""
+    _require_multi_rank()
+    S, r = dist.get_world_size(), dist.get_rank()
+    torch.manual_seed(_SEED + 720)
+    full_w = [torch.randn(4 * S, 8 * (i + 1)) for i in range(S)]
+    full_g = [torch.randn_like(w) for w in full_w]
+
+    def _shard(x):
+        return x[r * 4 : (r + 1) * 4].clone()
+
+    def _run(rebalance):
+        params = [_gtp_param(_shard(w)) for w in full_w]
+        for p, g in zip(params, full_g):
+            p.grad = _shard(g)
+        opt = _muon([{"params": params}], nesterov=False, gtp_remat_group=_world())
+        opt.set_param_ns_homes({id(p): (0, 0) for p in params})  # the collision
+        opt.set_rebalance_homes_per_call(rebalance)
+        opt.step()
+        (plan,) = opt._plans.values()
+        return [p.data.clone() for p in params], list(plan.ns_homes)
+
+    ref, homes_ref = _run(False)
+    out, homes = _run(True)
+    assert all(home == (0, 0) for home in homes_ref)
+    assert len({home[0] for home in homes}) > 1, "rebalancing left every home on one rank"
+    for i, (a, b) in enumerate(zip(ref, out)):
+        assert torch.equal(a, b), f"param {i} differs between global and per-call homes"
