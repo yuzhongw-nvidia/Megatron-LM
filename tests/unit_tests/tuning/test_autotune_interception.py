@@ -2,6 +2,7 @@
 
 """Test Triton's real Autotuner, with focused CUDA and distributed coverage."""
 
+import gc
 import json
 import logging
 import os
@@ -54,6 +55,72 @@ def make_tuner(*, prune=None, fail=False, module="mamba_ssm.ops.triton.test"):
 def forbid_benchmark(*args, **kwargs):
     """A pinned launch must never time even a single candidate."""
     pytest.fail("pinned execution benchmarked a config")
+
+
+def make_out_of_resources_tuner():
+    """A tuner whose smaller config cannot run, raised the way Triton's loader raises it.
+
+    ``CompiledKernel._init_handles`` raises ``OutOfResources`` from a nested closure
+    that holds the exception in a local: the exception's traceback then keeps that
+    frame, and the frame keeps the exception, so the swallowed failure survives as a
+    reference cycle with every frame (and kernel argument) on the traceback.
+    """
+    from triton.runtime.errors import OutOfResources
+
+    class Kernel:
+        def __init__(self):
+            self.fn = lambda *args, **kwargs: None
+            self.fn.__module__ = "mamba_ssm.ops.triton.test"
+            self.fn.__name__ = "oor_kernel"
+
+        def run(self, *args, **kwargs):
+            if kwargs["BLOCK_SIZE"] == 32:
+
+                def raise_(err):
+                    raise err
+
+                raise_(OutOfResources(239904, 232448, "shared memory"))
+            return kwargs["BLOCK_SIZE"]
+
+    configs = [triton.Config({"BLOCK_SIZE": size}) for size in (32, 128)]
+    return Autotuner(
+        Kernel(), ["x", "size"], configs, ["size"], reset_to_zero=None, restore_value=None
+    )
+
+
+def _lingering_out_of_resources():
+    from triton.runtime.errors import OutOfResources
+
+    found = []
+    for candidate in gc.get_objects():
+        try:
+            if isinstance(candidate, OutOfResources):
+                found.append(candidate)
+        except ReferenceError:
+            # A weakref.proxy whose referent is gone raises on isinstance (CUDA runtimes
+            # leave such proxies behind); it is not the exception object looked for.
+            continue
+    return found
+
+
+def test_failed_benchmark_garbage_is_collected_in_auto_mode(isolated_policy, monkeypatch):
+    """The swallowed OutOfResources (and the frames it pins) must not outlive the autotune."""
+    gc.collect()
+    gc.disable()  # --manual-gc: the cycle would otherwise live until the next manual collect
+    try:
+        tuner = make_out_of_resources_tuner()
+        tuner.run(object(), 16, grid=(1,), warmup=False)
+        assert _lingering_out_of_resources(), "precondition: Triton no longer leaves the cycle"
+        gc.collect()
+
+        interception.install(AutotunePolicy(mode="auto"))
+        assert not interception._installed  # auto mode patches nothing else
+        tuner = make_out_of_resources_tuner()
+        result = tuner.run(object(), 16, grid=(1,), warmup=False)
+        assert result == 128
+        assert not _lingering_out_of_resources()
+    finally:
+        gc.enable()
 
 
 def test_install_is_cuda_lazy(isolated_policy, monkeypatch):
