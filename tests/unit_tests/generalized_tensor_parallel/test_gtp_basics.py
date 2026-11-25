@@ -117,6 +117,23 @@ class TestGTPWeightCacheSchedulingDomain:
         other_ticket = cache.reserve(other, torch.bfloat16, fwd=True)
         assert cache.get(other_ticket) is not first_buffer
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
+    def test_released_rs_output_is_not_reused_by_its_previous_owner(self):
+        """Releasing an eager RS output gives up the ticket's ownership: once another ticket
+        has acquired the buffer, the first ticket's next get() returns a different buffer.
+        """
+        cache = GTPWeightCache()
+        group = _FakeGroup(size=2)
+        a = self._make_param(group, GTPChain.UNGRAPHED.value)
+        b = self._make_param(group, GTPChain.UNGRAPHED.value)
+        a_ticket = cache.reserve(a, torch.float32, fwd=False, reduce_scatter=True)
+        b_ticket = cache.reserve(b, torch.float32, fwd=False, reduce_scatter=True)
+        a_buffer = cache.get(a_ticket)
+        cache.release(a_ticket)
+        assert cache.get(b_ticket) is a_buffer, "B should acquire the buffer A released"
+        assert cache.get(a_ticket) is not a_buffer, "A reused the buffer B now owns"
+        assert cache.get(b_ticket) is a_buffer, "B lost the buffer it owns"
+
 
 def _worker_sharding_aligned(rank, world_size, port):
     K, M = world_size * 32, 16  # K divisible by 16*world_size → no padding
@@ -581,7 +598,7 @@ class TestGroupedExpertChainClassification:
         )
 
     def test_graphness_helpers(self):
-        # "ungraphed" is the eager suffix; everything else is captured.
+        # Built-in chains have metadata even before model classification.
         assert not gtp_module._chain_is_graphed("GTP_remat_grouped_fc1_ungraphed")
         assert not gtp_module._chain_is_graphed("GTP_ungraphed")
         assert gtp_module._chain_is_graphed("GTP_graphed")
@@ -609,18 +626,19 @@ class TestLatentProjectionChainClassification:
         gtp_module.classify_gtp_remat_chains(
             _Model(), cuda_graph_modules=cuda_graph_modules, cuda_graph_impl=cuda_graph_impl
         )
-        return tuple(param.chain_id for param in params)
+        assert params[0].chain_id == params[1].chain_id
+        return tuple(gtp_module._chain_is_graphed(param.chain_id) for param in params)
 
     def test_eager_latent_projections_are_ungraphed(self):
-        assert self._chains() == (GTPChain.UNGRAPHED.value, GTPChain.UNGRAPHED.value)
+        assert self._chains() == (False, False)
 
     def test_local_router_captures_both_latent_projections(self):
         chains = self._chains(cuda_graph_modules={"moe_router"}, cuda_graph_impl="local")
-        assert chains == (GTPChain.GRAPHED.value, GTPChain.GRAPHED.value)
+        assert chains == (True, True)
 
     def test_unrelated_local_scope_leaves_latent_projections_ungraphed(self):
         chains = self._chains(cuda_graph_modules={"mamba", "attn"}, cuda_graph_impl="local")
-        assert chains == (GTPChain.UNGRAPHED.value, GTPChain.UNGRAPHED.value)
+        assert chains == (False, False)
 
 
 class TestGroupedDoubleBuffer:
@@ -666,7 +684,7 @@ class TestGroupedDoubleBuffer:
 
     def test_non_grouped_key_includes_scheduling_domain(self):
         assert self._key("GTP_ungraphed") == (
-            ("GTP_ungraphed", 0),
+            (("GTP_ungraphed", 0), "GTP_ungraphed"),
             (128, 256),
             torch.bfloat16,
             0,
@@ -745,7 +763,7 @@ class TestSameKeyNeighbourTiebreak:
         assert (
             self._key(0)
             == self._key()
-            == (("GTP_ungraphed", 0), (128, 256), torch.bfloat16, 0, False)
+            == ((("GTP_ungraphed", 0), "GTP_ungraphed"), (128, 256), torch.bfloat16, 0, False)
         )
 
     def test_parity_one_gets_its_own_buffer(self):
@@ -1846,21 +1864,16 @@ class TestGTPGraphWgradRing:
 
 
 class TestActivationRecomputePhaseFlag:
-    """GTP's forward-only readiness gate rests on TE's recompute flag being dtype-agnostic."""
+    """Both checkpoint implementations must select GTP's recompute gather lifecycle."""
 
-    def test_recompute_phase_flag_is_set_under_bf16(self):
-        """``in_activation_recompute_phase`` must be True for BF16 recompute, not just FP8.
-
-        GTP aliases TE's ``in_fp8_activation_recompute_phase`` under a name without ``fp8``
-        because TE assigns the underlying global unconditionally. ``_all_gather_weight`` uses it
-        to skip publishing during recompute (see
-        ``test_gtp_ddp_param_sync_race.py::test_recompute_forward_does_not_request_publication``).
-        If TE ever made it FP8-only, BF16 recompute would start asking DDP to publish inside
-        backward -- silently, since the failure is a wrong-buffer gather rather than an error.
-        """
+    @pytest.mark.parametrize("backend", ["te", "native", "native_without_output"])
+    def test_recompute_phase_flag_is_set_under_bf16(self, backend):
+        """BF16 recomputation must not consume the ordinary forward/bwd prefetch slot."""
         _requires_multi_gpu(1)
         import transformer_engine.pytorch as te
         from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        from megatron.core.tensor_parallel.random import CheckpointWithoutOutput, checkpoint
 
         assert not FP8GlobalStateManager.is_fp8_enabled(), "must run outside fp8_autocast"
 
@@ -1877,19 +1890,31 @@ class TestActivationRecomputePhaseFlag:
                 return self.lin(x)
 
         x = torch.randn(8, hidden, dtype=dtype, device="cuda", requires_grad=True)
-        out = te.checkpoint(
-            _Probe(),
-            x,
-            distribute_saved_activations=False,
-            get_rng_state_tracker=None,
-            tp_group=None,
-        )
+
+        probe = _Probe()
+        if backend == "te":
+            out = te.checkpoint(
+                probe,
+                x,
+                distribute_saved_activations=False,
+                get_rng_state_tracker=None,
+                tp_group=None,
+            )
+        elif backend == "native":
+            out = checkpoint(probe, False, x)
+        else:
+            checkpoint_without_output = CheckpointWithoutOutput(fp8=False)
+            value = checkpoint_without_output.checkpoint(probe, x)
+            out = value * x
+            checkpoint_without_output.discard_output_and_register_recompute(out)
         out.sum().backward()  # replays the forward -> second observation
 
         assert observed == [False, True], (
             f"expected [original fwd=False, recompute fwd=True], got {observed}: "
             "in_activation_recompute_phase no longer tracks BF16 activation recompute"
         )
+
+        assert not gtp_module.in_activation_recompute_phase()
 
 
 class TestGTPCaptureParamReadiness:
@@ -2020,62 +2045,54 @@ class TestGTPCaptureParamReadiness:
         assert ordinary._recompute_already_drained is False
         assert incoming._prefetch_handle is None
 
-    def test_drained_cross_graph_prefetch_still_waits_on_ag_event(self, monkeypatch):
+    @pytest.mark.parametrize("recompute", [False, True], ids=["ordinary", "recompute"])
+    @pytest.mark.parametrize("pending", [False, True], ids=["already_drained", "new_handle"])
+    def test_prefetch_handoff_readiness(self, monkeypatch, recompute, pending):
+        """Retain the event dependency and wait any handle newer than the drain marker."""
+        calls = []
+
         class ExpectedEventWait(Exception):
             pass
-
-        calls = []
 
         class FakeEvent:
             def wait(self):
                 calls.append("event_wait")
                 raise ExpectedEventWait
 
+        handle_attr = "_recompute_prefetch_handle" if recompute else "_prefetch_handle"
+        marker_attr = "_recompute_already_drained" if recompute else "_already_ag_drained"
+        wait_method = "_wait_recompute_param_gather" if recompute else "_wait_param_gather"
+        event_attr = "_recompute_ag_event" if recompute else "ag_event"
+
+        def wait_for_current_gather(param):
+            assert getattr(param, handle_attr) is not None
+            calls.append("handle_wait")
+            setattr(param, handle_attr, None)
+
         param = type(
             "Param",
             (),
             {
-                "_already_ag_drained": True,
+                marker_attr: True,
+                handle_attr: object() if pending else None,
                 "_weights": (),
-                "ag_event": FakeEvent(),
-                "_wait_param_gather": lambda self: calls.append("handle_wait"),
+                event_attr: FakeEvent(),
+                wait_method: wait_for_current_gather,
             },
         )()
         monkeypatch.setattr(gtp_module.GTP_CONFIG, "check_param_states", False)
 
         with pytest.raises(ExpectedEventWait):
-            GTPShardedParam._get_prefetched_weight(param, fwd=True)
+            if recompute:
+                GTPShardedParam._get_recompute_prefetched_weight(param)
+            else:
+                # Forward and backward share this readiness path; their buffer selection
+                # occurs after the event wait where this regression deliberately stops.
+                GTPShardedParam._get_prefetched_weight(param, fwd=True)
 
-        assert calls == ["event_wait"]
-        assert param._already_ag_drained is False
-
-    def test_drained_recompute_prefetch_still_waits_on_ag_event(self):
-        class ExpectedEventWait(Exception):
-            pass
-
-        calls = []
-
-        class FakeEvent:
-            def wait(self):
-                calls.append("event_wait")
-                raise ExpectedEventWait
-
-        param = type(
-            "Param",
-            (),
-            {
-                "_recompute_already_drained": True,
-                "_weights": (),
-                "_recompute_ag_event": FakeEvent(),
-                "_wait_recompute_param_gather": lambda self: calls.append("handle_wait"),
-            },
-        )()
-
-        with pytest.raises(ExpectedEventWait):
-            GTPShardedParam._get_recompute_prefetched_weight(param)
-
-        assert calls == ["event_wait"]
-        assert param._recompute_already_drained is False
+        assert calls == (["handle_wait", "event_wait"] if pending else ["event_wait"])
+        assert getattr(param, handle_attr) is None
+        assert getattr(param, marker_attr) is False
 
     def test_warmup_exception_is_not_masked_by_leaked_handle(self):
         class WarmupError(Exception):
@@ -2158,10 +2175,16 @@ class TestGTPCaptureParamReadiness:
         assert ag_streams == [graphed_ag_stream]
         assert rs_streams == [graphed_rs_stream]
 
-    def test_capture_comm_predicate_includes_future_graphed_chains(self):
+    def test_capture_comm_predicate_includes_future_graphed_chains(self, monkeypatch):
         state = gtp_cuda_graphs.GTPCaptureCommState()
-        future = type("Param", (), {"chain_id": "GTP_future_role_graphed"})()
-        eager = type("Param", (), {"chain_id": "GTP_future_role_ungraphed"})()
+        future = type("Param", (), {"chain_id": "future_captured"})()
+        eager = type("Param", (), {"chain_id": "future_eager"})()
+        for param, graphed in ((future, True), (eager, False)):
+            monkeypatch.setitem(
+                gtp_module._PREFETCH_CHAIN_METADATA,
+                param.chain_id,
+                gtp_module._PrefetchChainMetadata(grouped=True, graphed=graphed),
+            )
         ag_stream, rs_stream = object(), object()
         for param in (future, eager, object()):
             state.register_comm(param, ag_stream, reduce_scatter=False)
@@ -2392,14 +2415,10 @@ class TestGTPReplicatedBias:
 _NO_CALCULATOR = object()
 
 
-class TestWgradAccumBatchScheduleGate:
-    """Pre-RS wgrad accumulation stays off when num_microbatches can change mid-run.
+class TestWgradAccumBatchSchedule:
+    """Accumulation requires PP1, regardless of the global batch calculator."""
 
-    A rising consume count double-fires DDP grad-ready and drops that iteration's last
-    consume (see _is_last_expected_consume). CPU-only: the gate is decided at tagging time.
-    """
-
-    def _tag_output_layer(self, monkeypatch, schedule):
+    def _tag_output_layer(self, monkeypatch, schedule, pipeline_size):
         """Enabled flag for one output_layer param, under the calculator production builds."""
         from types import SimpleNamespace
 
@@ -2414,22 +2433,24 @@ class TestWgradAccumBatchScheduleGate:
                 data_parallel_size=1,
                 step_batch_size_schedule=schedule,
             )
-        # The stub stands in for a GTPShardedParam; only the name drives the decision.
+        # Only the parameter name and pipeline size drive eligibility.
         monkeypatch.setattr(gtp_module, "is_gtp_param", lambda p: True)
         param = SimpleNamespace()
         try:
             gtp_module.tag_gtp_params_with_names(
-                SimpleNamespace(named_parameters=lambda: [("module.output_layer.weight", param)])
+                SimpleNamespace(
+                    config=SimpleNamespace(pipeline_model_parallel_size=pipeline_size),
+                    named_parameters=lambda: [("module.output_layer.weight", param)],
+                )
             )
         finally:
             nmb.destroy_num_microbatches_calculator()
         return param._wgrad_accum_enabled
 
     @pytest.mark.parametrize(
-        "schedule, enabled",
-        # "THRESHOLD:BS THRESHOLD:BS ..." is what --step-batch-size-schedule takes.
-        [(None, True), ("0:16 1000:32", False), (_NO_CALCULATOR, True)],
-        ids=["fixed-batch", "step-schedule", "no-calculator"],
+        "schedule, pipeline_size, enabled",
+        [(None, 1, True), ("0:16 1000:32", 1, True), (_NO_CALCULATOR, 1, True), (None, 2, False)],
+        ids=["fixed-batch", "step-schedule", "no-calculator", "pipeline"],
     )
-    def test_gate(self, monkeypatch, schedule, enabled):
-        assert self._tag_output_layer(monkeypatch, schedule) is enabled
+    def test_accumulation_enabled(self, monkeypatch, schedule, pipeline_size, enabled):
+        assert self._tag_output_layer(monkeypatch, schedule, pipeline_size) is enabled

@@ -14,6 +14,7 @@ import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed import _coalescing_manager
 
+import megatron.core.allocator.vmm_symm_allocator as vmm_symm_allocator
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -1392,6 +1393,13 @@ class _ParamAndGradBuffer:
             tmp_warmup_tensor = torch.zeros([1], device="cuda")
             torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
             torch.distributed.barrier()
+        elif self.ddp_config.use_distributed_optimizer and any(
+            getattr(p, "needs_nccl_mem", False) for p in self.params
+        ):
+            # Params opted into symmetric-pool backing of param_data; they register the pool on
+            # their own groups (register_ub_pool below), so this branch only allocates.
+            self.param_nccl_mem_pool = vmm_symm_allocator.create_symm_mem_pool()
+            mem_alloc_context = functools.partial(torch.cuda.use_mem_pool, self.param_nccl_mem_pool)
         else:
             # If nccl_ub is False, the allocation context is nullcontext.
             mem_alloc_context = nullcontext
@@ -1495,6 +1503,10 @@ class _ParamAndGradBuffer:
                 with mem_alloc_context():
                     if self.ddp_config.use_distributed_optimizer:
                         allocate_param_buffer()
+                    if self.nccl_ub:
+                        allocate_grad_buffer()
+                # Without nccl_ub the pool (if any) backs only param_data; grads stay plain.
+                if not self.nccl_ub:
                     allocate_grad_buffer()
 
         self.grad_data_size = 0
@@ -1665,6 +1677,9 @@ class _ParamAndGradBuffer:
                                     "Failed to remap high-precision TE GroupedTensor parameter "
                                     "storage into DDP param_data."
                                 )
+                    # Hook to register the symmetric pool backing this param's data.
+                    if getattr(param, "needs_nccl_mem", False):
+                        param.register_ub_pool(self.param_nccl_mem_pool or self.nccl_mem_pool)
 
             # Grad buffer always uses full-numel offsets from param_index_map.
             param.main_grad = self._get(
@@ -1949,6 +1964,10 @@ class _ParamAndGradBuffer:
 
     def deregister_nccl_mem_pools(self) -> None:
         """Deregister every live NCCL memory pool owned by this buffer."""
+        if not self.nccl_ub:
+            # Only nccl_ub buffers register their pools on the DP group; pools handed to
+            # params via register_ub_pool are deregistered by whoever registered them.
+            return
         for pool in self.get_nccl_mem_pools():
             nccl_allocator.deregister_mem_pool(pool, self.data_parallel_group)
 
@@ -2275,9 +2294,30 @@ def partition_buckets(
                                 )
                             )
                     continue  # Skip the default bucket group creation below
-                else:
-                    # Merge only the non-fp8 buckets whose use_distributed_optimizer matches.
+                elif fp8_buffer.ddp_config.use_distributed_optimizer:
                     group_buckets = [bucket] + matching_non_fp8_buckets
+                else:
+                    # Without the distributed optimizer the group all-reduces its buckets in one
+                    # coalesced call, which needs one gradient dtype (allreduce_coalesced raises
+                    # "Tensors must have identical type"); reduce-scatter has no such limit.
+                    # Merge only the non-fp8 buckets whose gradient dtype matches (e.g. the bf16
+                    # biases) and give the others (fp32 router weights under bf16 gradient
+                    # reduction) groups of their own.
+                    grad_dtype = bucket.grad_data.dtype
+                    group_buckets = [bucket] + [
+                        b for b in matching_non_fp8_buckets if b.grad_data.dtype == grad_dtype
+                    ]
+                    for other_bucket in matching_non_fp8_buckets:
+                        if other_bucket.grad_data.dtype == grad_dtype:
+                            continue
+                        bucket_groups.append(
+                            _ParamAndGradBucketGroup(
+                                [other_bucket],
+                                fp8_buffer.ddp_config,
+                                fp8_buffer.data_parallel_group,
+                                fp8_buffer.data_parallel_world_size,
+                            )
+                        )
             else:
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]

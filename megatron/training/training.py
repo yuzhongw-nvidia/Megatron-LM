@@ -4338,22 +4338,35 @@ def setup_model_and_optimizer(
             reduce_scatter_with_fp32_accumulation=getattr(
                 args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
             ),
+            # Edge overlap assumes forward and backward alternate, which pipelining breaks.
+            grouped_edge_overlap=getattr(args, 'gtp_grouped_edge_overlap', True)
+            and args.pipeline_model_parallel_size == 1,
         )
 
-        if getattr(args, 'gtp_remat_nccl_ub', False):
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
-        if getattr(args, 'gtp_expert_remat_nccl_ub', False):
-            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
+        if getattr(args, 'gtp_remat_nccl_ub', None):
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(pg_collection, is_expert=False),
+                collectives=args.gtp_remat_nccl_ub,
+            )
+        if getattr(args, 'gtp_expert_remat_nccl_ub', None):
+            register_gtp_symm_pool(
+                resolve_gtp_remat_group(pg_collection, is_expert=True),
+                collectives=args.gtp_expert_remat_nccl_ub,
+            )
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
-    # Classify each GTP param's prefetch chain after model build + DDP wrap, before the
+    # Register default GTP prefetch chains and finalize capture scopes after DDP wrap, before the
     # first forward. Placed here (not in get_model) so it also covers the config-container
     # builder path.
     if is_gtp_remat_active(args):
-        from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+        from megatron.core.tensor_parallel.gtp_api import (
+            classify_gtp_remat_chains,
+            move_gtp_weights_to_symm_pool,
+        )
 
+        move_gtp_weights_to_symm_pool(model)
         classify_gtp_remat_chains(
             model,
             cuda_graph_modules=getattr(args, 'cuda_graph_modules', None),
