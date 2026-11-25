@@ -17,6 +17,16 @@ the fused DSA kernels need all 96 attention heads on one rank (see
 per rank. The full recipe applies the proxy's layout to the 93-block model and
 passes argument and config validation; whether it fits in memory is untested.
 
+## GTP at 256K context
+
+The [256-GPU GTP recipe](gb300/mxfp8_THD256K_256GPU_GTP64EP64CP128_muon.yaml)
+uses 64 dense and four expert weight shards with an effective context-parallel
+group of 128, with no MTP layer. K3.1 DSA uses all-gather for context parallelism
+and keeps its absorbed K/V up-projection whole on each tensor-parallel rank. The original K3
+MLA recipe uses a hierarchical latent exchange. To launch K3.1, set
+`RECIPE=examples/moe_recipes/kimi_k3p1/gb300/mxfp8_THD256K_256GPU_GTP64EP64CP128_muon.yaml`
+when submitting the [K3 GTP launcher](../kimi_k3/GTP_1M_TRAINING_GUIDE.md).
+
 ## Configurations
 
 | Recipe | GPUs | TP/PP/EP/CP | MBS/GBS/SL | Decoder blocks | DSA layers | Run |

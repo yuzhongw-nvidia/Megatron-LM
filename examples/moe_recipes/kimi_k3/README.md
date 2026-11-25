@@ -16,6 +16,12 @@ TFLOP/s/GPU at 64K, 813 at 256K and 813 at 1M for the full model; on the 9L
 proxy at 512K this release's settings move the previous release's 907 to
 978. See the measured-throughput and validation sections below.**
 
+## GTP on 256 GB300 GPUs
+
+The [GTP training guide](GTP_1M_TRAINING_GUIDE.md) describes the full K3 model with
+64 dense weight shards, 4 expert weight shards, and a 128-rank context group.
+It includes the mock-data recipe, launcher, and the source branch's 1M-context measurements.
+
 ## Configurations
 
 | Recipe | GPUs | TP/PP/EP/CP/ETP | MBS/GBS/SL | MLA CP communication | Decoder blocks / HybridModel entries | AttnRes block entries |
