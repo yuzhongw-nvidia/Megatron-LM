@@ -260,6 +260,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             else None
         ),
         tokens_per_sample=args.seq_length,
+        contiguous_padded_qkv_seqlens=config.cp_contiguous_padded_qkv_seqlens,
     )
 
 

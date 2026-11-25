@@ -288,7 +288,9 @@ class TransformerConfig(ModelParallelConfig):
     activation_func_tanh_clamp_scale: Optional[float] = None
     """If set, precondition the input of the activation function with `s * tanh(x / s)`, where `s`
     is this value. For a gated activation (silu only) this instead selects SiTU-GLU. The fused MoE
-    path (use_transformer_engine_op_fuser) requires a Transformer Engine with ScaledTanhSReLU."""
+    path (use_transformer_engine_op_fuser) requires a Transformer Engine with ScaledTanhSReLU for
+    the non-gated case, and with ScaledSiTUGLU (plus activation_func_tanh_clamp_scale_linear and
+    glu_linear_offset == 0) for SiTU-GLU."""
 
     activation_func_tanh_clamp_scale_linear: Optional[float] = None
     """Soft clamp scale for the linear (up) half of a gated activation, decoupled from the gate
@@ -1100,6 +1102,16 @@ class TransformerConfig(ModelParallelConfig):
     use_grouped_gemm_for_shared_expert is set.
     Requires BF16 or FP16 model parameters when GLU is enabled.
     """
+
+    moe_glu_interleave_with_gtp_sharding: bool = False
+    """Allow GLU interleave on FC1 weights that GTP shards along their output dimension
+    (expert_gtp_weight_remat_size > 1 for routed experts, gtp_weight_remat_size > 1 for grouped
+    shared experts). The runtime needs nothing else: interleaving is a fixed row permutation of
+    the whole FC1 weight and the GTP all-gather restores that whole weight before the GEMM. What
+    stays unsupported is the contiguous <-> interleaved checkpoint layout conversion of
+    GTP-sharded rows, so saving or loading model weights raises with this option set. Use it for
+    training runs that neither save nor load checkpoints.
+    """
     moe_shortcut_connection: bool = False
     """Enable ScMoE shortcut-connected routing. When enabled, the MoE router and routed experts
     process the preceding layer's output (via a shortcut connection) instead of the current layer's
@@ -1546,6 +1558,15 @@ class TransformerConfig(ModelParallelConfig):
 
     attention_cp_layout: CPLayout = "zigzag"
     """CP layout for softmax-attention layers."""
+
+    cp_contiguous_padded_qkv_seqlens: bool = False
+    """Give a contiguous CP view of a packed batch the padded sequence lengths.
+
+    By default a contiguous view under CP carries the sequences' actual lengths and padding
+    takes no part in attention, while a batch with a single zigzag view carries the padded
+    lengths. Set this to make a contiguous residual stream (``linear_cp_layout='contiguous'``)
+    compute the same thing as its zigzag counterpart on packed data.
+    """
 
     ##################
     # Cuda Graphs
@@ -2334,7 +2355,7 @@ class TransformerConfig(ModelParallelConfig):
         overlap), fine-grained activation offloading, and MTP in the standard
         or hybrid last-stage placement. Everything rejected below either has no
         mechanism yet (CUDA graphs, full recompute, EP-overlap fine-grained
-        schedule, zero-layer virtual chunks, the per-layer CP layout manager,
+        schedule, zero-layer virtual chunks, per-layer CP layout conversion,
         wide residuals, shortcut MoE blocks) or
         would silently bypass the AttnRes residual interception (fused residual
         norms, fp32 residual connection) or the interleaved schedule's uniform
@@ -2556,6 +2577,14 @@ class TransformerConfig(ModelParallelConfig):
         self._normalize_sync_compatibility_fields()
         self._validate_dsv4_execution_scope()
         self._validate_cp_layouts()
+        if (
+            self.sequence_packing_scheduler is not None
+            and self.enable_attention_residuals
+            and self.linear_cp_layout == self.cp_partition_mode
+        ):
+            # The scheduler supplies a single boundary layout for all depth sources.
+            # KDA and attention convert locally while the residual stream stays in place.
+            self._linear_cp_layout_explicit = False
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
@@ -4786,19 +4815,26 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "GLU interleave is not supported with FP32 model parameters. Use BF16 or FP16."
             )
-        if self.gated_linear_unit and self.moe_mlp_glu_interleave_size is not None:
+        if (
+            self.gated_linear_unit
+            and self.moe_mlp_glu_interleave_size is not None
+            and not self.moe_glu_interleave_with_gtp_sharding
+        ):
             assert self.expert_gtp_weight_remat_size == 1, (
                 "Routed expert GLU interleave is not supported with GTP weight sharding. "
-                "Disable routed expert GLU interleave or expert GTP weight sharding."
+                "Disable routed expert GLU interleave or expert GTP weight sharding, or set "
+                "moe_glu_interleave_with_gtp_sharding for runs without checkpoints."
             )
         if (
             self.gated_linear_unit
             and self.use_grouped_gemm_for_shared_expert
             and self.moe_shared_expert_glu_interleave_size is not None
+            and not self.moe_glu_interleave_with_gtp_sharding
         ):
             assert self.gtp_weight_remat_size == 1, (
                 "Shared expert GLU interleave is not supported with GTP weight sharding. "
-                "Disable shared expert GLU interleave or GTP weight sharding."
+                "Disable shared expert GLU interleave or GTP weight sharding, or set "
+                "moe_glu_interleave_with_gtp_sharding for runs without checkpoints."
             )
 
         if self.bias_activation_fusion:

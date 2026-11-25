@@ -110,6 +110,14 @@ _csa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
 _dsv4_o_group_proj = dsv4_hybrid_specs.get_dsv4_o_group_proj_spec()
 
 
+# Small attention projections kept whole along GTP_remat (still TP partitioned). Their GTP
+# shards are tiny (KDA f_b_proj: 12288 x 128), so the per-layer weight AG / grad RS costs more
+# than the replicated memory; gradients use the GTP_remat all-reduce for replicated params.
+_gtp_replicated_column_linear = ModuleSpec(
+    module=TEColumnParallelLinear, params={"gtp_remat_opt_out": True}
+)
+
+
 # MTP block spec - provides norms and projection only.
 # Inner layers are built by MultiTokenPredictionLayer using nested HybridStack
 _hybrid_mtp_block_spec = ModuleSpec(
@@ -197,7 +205,7 @@ hybrid_stack_spec = ModuleSpec(
                         # f_a/g_a are replicated (TELinear parallel_mode="duplicated").
                         f_proj=TEColumnParallelLinear,
                         f_a_proj=TELinear,
-                        f_b_proj=TEColumnParallelLinear,
+                        f_b_proj=_gtp_replicated_column_linear,
                         g_proj=TEColumnParallelLinear,
                         g_a_proj=TELinear,
                         g_b_proj=TEColumnParallelLinear,
@@ -249,9 +257,11 @@ hybrid_stack_spec = ModuleSpec(
                     submodules=AbsorbedMLASelfAttentionSubmodules(
                         linear_q_proj=TEColumnParallelLinear,
                         linear_q_down_proj=TELinear,
-                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_q_up_proj=_gtp_replicated_column_linear,
                         linear_kv_down_proj=TELinear,
-                        linear_kv_up_proj=TEColumnParallelLinear,
+                        # Absorbed DSA reads per-head K/V weights directly, outside a
+                        # linear forward that could gather a GTP shard.
+                        linear_kv_up_proj=_gtp_replicated_column_linear,
                         linear_gate=TEColumnParallelLinear,
                         core_attention=ModuleSpec(
                             module=DSAttention,
@@ -339,9 +349,9 @@ hybrid_stack_spec = ModuleSpec(
                     submodules=MLASelfAttentionSubmodules(
                         linear_q_proj=TEColumnParallelLinear,
                         linear_q_down_proj=TELinear,
-                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_q_up_proj=_gtp_replicated_column_linear,
                         linear_kv_down_proj=TELinear,
-                        linear_kv_up_proj=TEColumnParallelLinear,
+                        linear_kv_up_proj=_gtp_replicated_column_linear,
                         core_attention=TEDotProductAttention,
                         linear_gate=TEColumnParallelLinear,
                         linear_proj=TERowParallelLinear,
@@ -391,9 +401,9 @@ hybrid_stack_spec = ModuleSpec(
                     submodules=MLASelfAttentionSubmodules(
                         linear_q_proj=TEColumnParallelLinear,
                         linear_q_down_proj=TELinear,
-                        linear_q_up_proj=TEColumnParallelLinear,
+                        linear_q_up_proj=_gtp_replicated_column_linear,
                         linear_kv_down_proj=TELinear,
-                        linear_kv_up_proj=TEColumnParallelLinear,
+                        linear_kv_up_proj=_gtp_replicated_column_linear,
                         core_attention=IdentityOp,
                         linear_gate=TEColumnParallelLinear,
                         linear_proj=TERowParallelLinear,

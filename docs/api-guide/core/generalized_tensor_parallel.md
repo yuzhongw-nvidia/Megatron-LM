@@ -484,7 +484,14 @@ group. Use rank ordering with TP as the innermost axis and PP as the outermost a
 and place each weight-sharding group entirely within one NVLink domain.
 
 GTP sequence sharding requires Megatron DDP and `--ckpt-format torch_dist`;
-dynamic CP, FSDP, and sequence-packing schedulers are unsupported.
+dynamic CP and FSDP are unsupported. The `dp_balanced` sequence-packing scheduler assigns
+packed buffer `j // CP` to rank `j` of the data-distribution group, which matches the rank
+order above (TP, sequence shard, remaining GTP_remat ranks, configured CP, DP) when the CP
+ranks of one buffer are consecutive. It is therefore supported in two cases: without
+`--context-parallel-size` on top of the sequence shards, and with it when the sequence
+shards span the whole GTP_remat group (no remaining GTP_remat ranks), as in the 64 x 2
+example above. With configured CP on top of shards that leave batch shards in the group the
+scheduler is rejected; raise `--tensor-parallel-num-sequence-shards` first.
 
 ---
 
@@ -1137,3 +1144,26 @@ The suite targets ≥ 4 GPUs and TransformerEngine >= 2.19.
 
 A green suite run (skips for unmet hardware/config are acceptable) is the minimum bar for any
 GTP_remat change.
+
+
+## Kimi-K3 integration on dev
+
+The Kimi-K3 preview combines KDA low-rank decay projections, gated MLA,
+attention residuals, and Stable LatentMoE. The fused latent up-projection
+`TERMSNormDuplicatedLinear` accepts explicit `gtp_remat_group` and
+`gtp_replica_group` arguments and participates in the common presharding
+context when `moe_latent_proj` is opted in. Its linear weight is sharded;
+RMSNorm scale and optional bias retain their complete logical shapes.
+The owning TP group remains checkpoint metadata only: the duplicated
+projection executes without TE tensor-parallel communication.
+
+For a numerical comparison with the preview's TP1 non-GTP Muon baseline,
+use `muon_tp_mode=duplicated` on both arms. The `blockwise` mode independently
+orthogonalizes each GTP shard and therefore changes the optimizer update
+when the GTP degree changes. Compare from one checkpoint and retain identical
+logical batch/data ordering and learned router settings.
+
+The four-rank regression `test_kimi_latent_rmsnorm_gtp.py` compares padded
+and unpadded fused projections against native PyTorch RMSNorm plus a full
+linear weight, checking output, input/scale/bias gradients and summed
+weight gradients, including replicated parameter shapes.

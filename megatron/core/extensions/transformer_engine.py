@@ -466,13 +466,28 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
 
-def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+def _get_fp8_autocast_recipe_for_quant_params(
+    qparams: TEQuantizationParams | None, training: bool
+) -> TEQuantizationRecipe | None:
+    """Return the active module override, or None when it inherits the surrounding context.
+
+    Resolve this before entering any module-specific context. In particular, op-fuser callers
+    need to compare both linears' overrides against the same surrounding autocast state.
+    """
     if qparams is None:
-        return nullcontext()
+        return None
     elif not training and qparams.evaluation_recipe is not None:
-        return _get_fp8_autocast_for_quant_recipe(qparams.evaluation_recipe)
+        recipe = qparams.evaluation_recipe
     else:
-        return _get_fp8_autocast_for_quant_recipe(qparams.training_recipe)
+        recipe = qparams.training_recipe
+    if FP8GlobalStateManager.is_fp8_enabled():
+        return recipe if recipe.override_quantized_autocast else None
+    return recipe if recipe.override_nonquantized_autocast else None
+
+
+def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+    recipe = _get_fp8_autocast_recipe_for_quant_params(qparams, training)
+    return nullcontext() if recipe is None else _get_fp8_autocast_for_quant_recipe(recipe)
 
 
 def _get_should_context_be_quantized_recipe(
@@ -1586,6 +1601,8 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
         is_expert: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        gtp_remat_group: torch.distributed.ProcessGroup | None = None,
+        gtp_replica_group: torch.distributed.ProcessGroup | None = None,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -1621,15 +1638,19 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
             self.te_quant_params, torch.is_grad_enabled()
         )
 
-        # TODO: When GTP reaches LatentMoE on dev, accept its rematerialization and replica
-        # groups here and wrap TE construction in `_init_gtp_remat_context` with
-        # `rng_via_kwarg=False`. GTP should shard only the linear weight's output dimension
-        # (including any alignment padding); the RMSNorm scale stays replicated at [input_size],
-        # and the rematerialized output keeps the logical [..., output_size] shape.
-        with init_quant_context:
+        init_gtp_remat_context = _init_gtp_remat_context(
+            self,
+            output_size,
+            gtp_remat_group,
+            extra_kwargs,
+            rng_via_kwarg=False,
+            replica_group=gtp_replica_group,
+        )
+        # Only the linear weight is sharded; RMSNorm retains its full input width.
+        with init_quant_context, init_gtp_remat_context as gtp_output_size:
             super().__init__(
                 in_features=input_size,
-                out_features=output_size,
+                out_features=gtp_output_size,
                 eps=self.config.layernorm_epsilon,
                 sequence_parallel=False,
                 fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
@@ -1648,8 +1669,7 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
                 **extra_kwargs,
             )
 
-        # TODO: With GTP, restore the optional bias after pre-sharded TE construction. GTP
-        # shards only the linear weight, so bias must remain replicated at [output_size].
+        # The GTP context also restores the logical, replicated bias width.
         self._tp_group = (
             tp_group
             if tp_group is not None
@@ -1728,6 +1748,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         name: str | None = None,
         eps: float | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        gtp_remat_opt_out: bool = False,
     ):
         """
         Args:
@@ -1736,6 +1757,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 ``config.layernorm_epsilon`` when ``None``.
             pg_collection (ProcessGroupCollection | None): process groups used by this layer.
                 Falls back to the MPU global process groups when not given.
+            gtp_remat_opt_out (bool): Keep the weight whole along the GTP_remat axis (still TP
+                partitioned). Its gradient is then all-reduced across GTP_remat like any other
+                replicated param. For small weights whose gather/scatter costs more than the
+                memory it saves.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1827,7 +1852,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
+        gtp_remat_group = (
+            None if gtp_remat_opt_out else resolve_gtp_remat_group(pg_collection, is_expert)
+        )
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -2000,12 +2027,17 @@ class TEColumnParallelLinear(TELinear):
         stride: int = 1,
         name: str | None = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        gtp_remat_opt_out: bool = False,
     ):
         """
         Args:
             name (str | None): module instance name passed top-down from its paranet module
             pg_collection (ProcessGroupCollection | None): process groups used by this layer.
                 Falls back to the MPU global process groups when not given.
+            gtp_remat_opt_out (bool): Keep the weight whole along the GTP_remat axis (still TP
+                partitioned). Its gradient is then all-reduced across GTP_remat like any other
+                replicated param. For small weights whose gather/scatter costs more than the
+                memory it saves.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -2020,7 +2052,9 @@ class TEColumnParallelLinear(TELinear):
         world_size = get_pg_size(tp_group)
         rank = get_pg_rank(tp_group)
         self.stride = stride
-        gtp_remat_group = resolve_gtp_remat_group(pg_collection, is_expert)
+        gtp_remat_group = (
+            None if gtp_remat_opt_out else resolve_gtp_remat_group(pg_collection, is_expert)
+        )
 
         super().__init__(
             input_size=input_size,

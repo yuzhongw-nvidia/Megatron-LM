@@ -203,15 +203,18 @@ def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch)
 
 
 @pytest.mark.parametrize("remat_size", [1, 2])
-def test_latent_rmsnorm_preserves_dev_non_gtp_contract(monkeypatch, remat_size):
+def test_latent_rmsnorm_receives_gtp_groups(monkeypatch, remat_size):
     class RematGroup(_FakeProcessGroup):
         def size(self):
             return remat_size
 
     class RecordingRMSNormLinear(_RecordingLinear):
         def __init__(self, *args, **kwargs):
-            assert "gtp_remat_group" not in kwargs
-            assert "gtp_replica_group" not in kwargs
+            self.gtp_kwargs = {
+                key: kwargs[key]
+                for key in ("gtp_remat_group", "gtp_replica_group")
+                if key in kwargs
+            }
             super().__init__(*args, **kwargs)
 
     tp_group = _FakeProcessGroup()
@@ -238,15 +241,14 @@ def test_latent_rmsnorm_preserves_dev_non_gtp_contract(monkeypatch, remat_size):
     monkeypatch.setattr(moe_layer_module, "TERMSNormDuplicatedLinear", RecordingRMSNormLinear)
     monkeypatch.setattr(moe_layer_module, "MoEAllGatherTokenDispatcher", _DummyDispatcher)
     submodules = MoESubmodules(experts=_build_dummy_module, router=_build_dummy_module)
-    if remat_size > 1:
-        with pytest.raises(
-            ValueError, match="does not yet support.*moe_latent_up_projection_rmsnorm"
-        ):
-            MoELayer(config, submodules, pg_collection=pg_collection)
-    else:
-        layer = MoELayer(config, submodules, pg_collection=pg_collection)
-        assert isinstance(layer.fc2_latent_proj, RecordingRMSNormLinear)
-        assert layer.fc2_latent_proj._tp_group is tp_group
+    layer = MoELayer(config, submodules, pg_collection=pg_collection)
+    assert isinstance(layer.fc2_latent_proj, RecordingRMSNormLinear)
+    assert layer.fc2_latent_proj._tp_group is tp_group
+    # The RMSNorm wrapper shards only its linear weight, so it owns the same GTP groups as fc1.
+    assert layer.fc2_latent_proj.gtp_kwargs == {
+        "gtp_remat_group": pg_collection.gtp_remat,
+        "gtp_replica_group": pg_collection.dp_cp,
+    }
 
 
 @pytest.mark.skipif(

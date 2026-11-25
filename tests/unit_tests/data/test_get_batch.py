@@ -1503,6 +1503,36 @@ def test_packed_seq_params_expose_actual_thd_lengths_for_contiguous_cp(
     assert packed_seq_params.total_tokens == 8
 
 
+def test_packed_seq_params_contiguous_cp_can_expose_padded_thd_lengths():
+    """contiguous_padded_qkv_seqlens gives a contiguous CP view the lengths a zigzag-only batch
+    gets; without it the actual lengths stay (the test above)."""
+    actual_cu_seqlens = torch.tensor([[0, 3, 5]], dtype=torch.int32)
+    padded_cu_seqlens = torch.tensor([[0, 4, 8]], dtype=torch.int32)
+    batch = {
+        "cu_seqlens": actual_cu_seqlens,
+        "cu_seqlens_padded": padded_cu_seqlens,
+        "hybrid_cp_group": None,
+        "local_cp_size": None,
+        "max_seqlen": torch.tensor([4], dtype=torch.int32),
+    }
+    packed_seq_params = _build_packed_seq_params(
+        batch, "contiguous", 2, tokens_per_sample=8, contiguous_padded_qkv_seqlens=True
+    )
+    assert torch.equal(packed_seq_params.cu_seqlens_q, padded_cu_seqlens[0])
+    assert torch.equal(packed_seq_params.cu_seqlens_kv, padded_cu_seqlens[0])
+    assert torch.equal(packed_seq_params.cu_seqlens_q_padded, padded_cu_seqlens[0])
+    # A zigzag view that asks for the actual lengths keeps them.
+    zigzag = _build_packed_seq_params(
+        batch,
+        "zigzag",
+        2,
+        tokens_per_sample=8,
+        use_logical_qkv_seqlens=True,
+        contiguous_padded_qkv_seqlens=True,
+    )
+    assert torch.equal(zigzag.cu_seqlens_q, actual_cu_seqlens[0])
+
+
 def create_pretrain_data_iterator(
     seq_length: int = 1024, micro_batch_size: int = 1, create_attention_mask: bool = False
 ):
