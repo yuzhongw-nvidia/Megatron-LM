@@ -233,11 +233,17 @@ class QKNormConfigResolver:
         return linear_cls
 
     def _mla_fused_linear_or_default(self, module_spec, module_name):
-        """Return a fused MLA projection, using the backend default when available."""
+        """Return a fused MLA projection, using the backend default when available.
+
+        A plain-linear ModuleSpec is upgraded to the fused norm+linear; its params (e.g.
+        ``gtp_remat_opt_out``) carry over so the swap does not silently drop them.
+        """
         if self._is_fused_norm_linear(module_spec):
             fused_linear = module_spec
         else:
             fused_linear = self._require_linear(self.fused_norm_linear_impl, module_name)
+            if isinstance(module_spec, ModuleSpec) and module_spec.params:
+                fused_linear = ModuleSpec(module=fused_linear, params=dict(module_spec.params))
         return self._with_attention_latent_norm_epsilon(fused_linear)
 
     def _with_attention_latent_norm_epsilon(self, module_spec):

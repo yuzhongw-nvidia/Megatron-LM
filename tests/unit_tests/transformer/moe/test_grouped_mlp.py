@@ -3,12 +3,14 @@
 import argparse
 import os
 import sys
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+import megatron.core.extensions.transformer_engine as te_extension
 import megatron.core.transformer.moe.experts as experts_module
 from megatron.core.activations import situlu, squared_relu
 from megatron.core.enums import Fp8Recipe
@@ -371,6 +373,7 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
         moe_mlp_glu_interleave_size=16,
         delay_wgrad_compute=False,
         activation_func_clamp_value=None,
+        activation_func_tanh_clamp_scale=None,
         activation_func=F.silu,
     )
     module.activation_func = F.silu
@@ -501,7 +504,8 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments(fc2_bias):
     module.quantization_padding = lambda tensor, token_counts: (tensor, token_counts)
     module.quantization_unpadding = lambda tensor, token_counts: tensor
     module._fused_ops = None
-    module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias)
+    module.linear_fc1 = SimpleNamespace(te_quant_params=None, training=True)
+    module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias, te_quant_params=None, training=True)
     fused_ops = FakeFusedOps()
     module._make_fused_ops = lambda: fused_ops
     hidden_states = torch.zeros(2, 4)
@@ -577,6 +581,169 @@ def test_non_fused_forward_wraps_compute_in_paged_stash_scope(monkeypatch):
     torch.testing.assert_close(output, torch.ones_like(hidden_states))
     assert output_bias is None
     assert events == ["start", "context", "enter", "compute", "exit", "commit"]
+
+
+def _make_precision_fused_forward_module(monkeypatch, *, fc2_bias=False):
+    """Record the TE call while retaining MCore's actual precision and hook handling."""
+    state = SimpleNamespace(enabled=True, calls=[], hooks=[], builds=0)
+
+    @contextmanager
+    def autocast(*, enabled, **kwargs):
+        previous = state.enabled
+        state.enabled = enabled
+        try:
+            yield
+        finally:
+            state.enabled = previous
+
+    monkeypatch.setattr(
+        te_extension,
+        "FP8GlobalStateManager",
+        SimpleNamespace(is_fp8_enabled=lambda: state.enabled),
+        raising=False,
+    )
+    monkeypatch.setattr(te_extension, "fp8_autocast", autocast, raising=False)
+    monkeypatch.setattr(experts_module, "GRAD_INPUT_BUFFER_KEY", "grad_input")
+    monkeypatch.setattr(experts_module, "OUTPUT_BUFFER_KEY", "output")
+
+    class RecordingFusedOps(torch.nn.Module):
+        def forward(self, hidden_states, *extra_inputs, op_kwargs=None):
+            state.calls.append(
+                SimpleNamespace(
+                    enabled=state.enabled,
+                    grad_enabled=torch.is_grad_enabled(),
+                    extra_inputs=extra_inputs,
+                    kwargs=op_kwargs or {},
+                )
+            )
+            output = hidden_states + 1
+            output_buffer = (op_kwargs or {}).get(-1, {}).get("output")
+            if output_buffer is not None:
+                output_buffer.copy_(output)
+                return output_buffer
+            return output
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        fp8="e4m3",
+        fp4=False,
+        moe_router_padding_for_quantization=True,
+        moe_use_grouped_tensor=True,
+        moe_paged_stash=False,
+    )
+    module._with_fused_impl = True
+    module._use_grouped_tensor = True
+    module._fused_ops = None
+    for name in ("fc1", "fc2"):
+        linear = torch.nn.Linear(4, 4, bias=False)
+        linear.use_bias = fc2_bias and name == "fc2"
+        linear.te_quant_params = None
+        linear.register_forward_pre_hook(lambda original, args, name=name: state.hooks.append(name))
+        setattr(module, f"linear_{name}", linear)
+
+    def make_ops():
+        state.builds += 1
+        ops = RecordingFusedOps()
+        ops.register_forward_pre_hook(module._make_fused_impl_pre_forward_hook())
+        return ops
+
+    module._make_fused_ops = make_ops
+    return module, state
+
+
+@pytest.mark.parametrize("fc2_bias", [False, True])
+@pytest.mark.parametrize("use_buffers", [False, True])
+def test_fused_forward_honors_late_bf16_overrides(monkeypatch, fc2_bias, use_buffers):
+    module, state = _make_precision_fused_forward_module(monkeypatch, fc2_bias=fc2_bias)
+    hidden_states = torch.zeros(2, 4)
+    token_splits = torch.tensor([1, 1])
+    probs = torch.tensor([0.25, 0.75])
+    original_params = tuple(module.parameters())
+    module._fused_forward(hidden_states, token_splits, probs)
+    ops = module._fused_ops[0]
+    state.calls.clear()
+    state.hooks.clear()
+    # Full-model finish_init may install these overrides after the expert is constructed.
+    for linear in (module.linear_fc1, module.linear_fc2):
+        linear.te_quant_params = te_extension.TEQuantizationParams(
+            training_recipe=te_extension.TEQuantizationRecipe(), evaluation_recipe=None
+        )
+    output_buffer = torch.empty_like(hidden_states) if use_buffers else None
+    grad_buffer = torch.empty_like(hidden_states) if use_buffers else None
+    output = module._fused_forward(hidden_states, token_splits, probs, output_buffer, grad_buffer)
+    torch.testing.assert_close(output, torch.ones_like(hidden_states))
+    assert state.enabled is True, "The outer MXFP8 context must be restored"
+    assert module._with_fused_impl is True
+    assert module._fused_ops[0] is ops and state.builds == 1
+    assert tuple(map(id, module.parameters())) == tuple(map(id, original_params))
+    assert state.hooks == ["fc1", "fc2"]
+    assert len(state.calls) == 1 and state.calls[0].enabled is False
+    call = state.calls[0]
+    assert call.extra_inputs[0] is token_splits
+    assert call.extra_inputs[1] is probs
+    assert call.extra_inputs[2] is token_splits
+    assert len(call.extra_inputs) == (4 if fc2_bias else 3)
+    if fc2_bias:
+        assert call.extra_inputs[3] is probs
+    assert call.kwargs == (
+        {0: {"grad_input": grad_buffer}, -1: {"output": output_buffer}} if use_buffers else {}
+    )
+    if use_buffers:
+        assert output is output_buffer
+
+
+@pytest.mark.parametrize("bf16_fc", [1, 2])
+@pytest.mark.parametrize("warm_cache", [False, True])
+def test_fused_forward_rejects_different_precision_before_te_calls(
+    monkeypatch, bf16_fc, warm_cache
+):
+    module, state = _make_precision_fused_forward_module(monkeypatch)
+    args = (torch.zeros(2, 4), torch.tensor([1, 1]), torch.ones(2))
+    if warm_cache:
+        module._fused_forward(*args)
+    previous_builds = state.builds
+    state.calls.clear()
+    state.hooks.clear()
+    getattr(module, f"linear_fc{bf16_fc}").te_quant_params = te_extension.TEQuantizationParams(
+        training_recipe=te_extension.TEQuantizationRecipe(), evaluation_recipe=None
+    )
+    with pytest.raises(ValueError, match="same precision override"):
+        module._fused_forward(*args)
+    assert state.builds == previous_builds
+    assert state.calls == [] and state.hooks == []
+    assert state.enabled is True and module._with_fused_impl is True
+
+
+def test_fused_forward_rereads_precision_for_train_eval_and_recompute(monkeypatch):
+    module, state = _make_precision_fused_forward_module(monkeypatch)
+    args = (torch.zeros(2, 4), torch.tensor([1, 1]), torch.ones(2))
+    for linear in (module.linear_fc1, module.linear_fc2):
+        linear.te_quant_params = te_extension.TEQuantizationParams(
+            training_recipe=te_extension.TEQuantizationRecipe(),
+            evaluation_recipe=te_extension.TEQuantizationRecipe(override_quantized_autocast=False),
+        )
+    for training, grad_enabled, expected in (
+        (True, True, False),
+        (False, False, True),
+        (True, False, False),
+        (True, True, False),
+    ):
+        module.train(training)
+        state.calls.clear()
+        with torch.set_grad_enabled(grad_enabled):
+            module._fused_forward(*args)
+        assert state.calls[0].enabled is expected
+        assert state.calls[0].grad_enabled == grad_enabled
+        assert state.enabled is True
+    for linear in (module.linear_fc1, module.linear_fc2):
+        linear.te_quant_params = None
+    for enabled in (True, False):
+        state.enabled = enabled
+        state.calls.clear()
+        module._fused_forward(*args)
+        assert state.calls[0].enabled is enabled and state.enabled is enabled
+    assert state.builds == 1 and module._with_fused_impl is True
 
 
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():
@@ -818,6 +985,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
         moe_mlp_glu_interleave_size=8,
         delay_wgrad_compute=False,
         activation_func_clamp_value=None,
+        activation_func_tanh_clamp_scale=None,
         activation_func=F.silu,
         gated_linear_unit=True,
     )
@@ -944,6 +1112,16 @@ def _make_fake_te_namespace():
             self.tanh_clamp_scale = tanh_clamp_scale
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
 
+    class FakeScaledSiTUGLU(torch.nn.Module):
+        def __init__(
+            self, glu_interleave_size=None, *, activation_recompute_in_mlp=False, beta1, beta2
+        ):
+            super().__init__()
+            self.glu_interleave_size = glu_interleave_size
+            self.activation_recompute_in_mlp = activation_recompute_in_mlp
+            self.beta1 = beta1
+            self.beta2 = beta2
+
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
             self.forward_pre_hook = hook
@@ -962,6 +1140,7 @@ def _make_fake_te_namespace():
                     ScaledClampedQGeGLU=FakeScaledClampedQGeGLU,
                     ScaledSReLU=FakeScaledSReLU,
                     ScaledTanhSReLU=FakeScaledTanhSReLU,
+                    ScaledSiTUGLU=FakeScaledSiTUGLU,
                     Sequential=FakeSequential,
                 ),
             )
@@ -989,6 +1168,7 @@ def test_make_fused_ops_uses_clamped_qgeglu(
         moe_mlp_glu_interleave_size=4,
         delay_wgrad_compute=False,
         activation_func_clamp_value=7.0,
+        activation_func_tanh_clamp_scale=None,
         activation_func=activation_func,
         gated_linear_unit=True,
     )
@@ -1095,6 +1275,49 @@ def test_make_fused_ops_uses_scaled_tanh_srelu_when_clamp_is_set(monkeypatch):
     assert ops[1].activation_recompute_in_mlp is True
 
 
+def test_make_fused_ops_uses_scaled_situ_glu_for_gated_clamp(monkeypatch):
+    """SwiGLU with the tanh clamps (SiTU-GLU) selects ScaledSiTUGLU with beta1/beta2."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module._grouped_linear_kwargs = {}
+    module.config = SimpleNamespace(
+        moe_mlp_glu_interleave_size=32,
+        delay_wgrad_compute=False,
+        activation_func_clamp_value=None,
+        activation_func_tanh_clamp_scale=4.0,
+        activation_func_tanh_clamp_scale_linear=25.0,
+        glu_linear_offset=0.0,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+    )
+    module.activation_func = F.silu
+    module.activation_recompute = True
+    common = dict(
+        device="cuda",
+        dtype=torch.bfloat16,
+        accumulate_into_main_grad=False,
+        single_grouped_weight=False,
+    )
+    module.linear_fc1 = FakeGroupedLinear(2, 4, 8, bias=False, **common)
+    module.linear_fc2 = FakeGroupedLinear(2, 8, 4, bias=False, **common)
+    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4))
+    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
+    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
+
+    ops = module._make_fused_ops()
+
+    activation = ops[1]
+    assert type(activation).__name__ == "FakeScaledSiTUGLU"
+    assert activation.glu_interleave_size == 32
+    assert activation.beta1 == 4.0
+    assert activation.beta2 == 25.0
+    assert activation.activation_recompute_in_mlp is True
+
+
 def test_make_fused_ops_rejects_scaled_srelu_with_gated_linear_unit(monkeypatch):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
@@ -1106,6 +1329,7 @@ def test_make_fused_ops_rejects_scaled_srelu_with_gated_linear_unit(monkeypatch)
         moe_mlp_glu_interleave_size=None,
         delay_wgrad_compute=False,
         activation_func_clamp_value=None,
+        activation_func_tanh_clamp_scale=None,
         activation_func=squared_relu,
         gated_linear_unit=True,
         use_fused_weighted_squared_relu=True,
@@ -1135,6 +1359,7 @@ def _install_fake_te_ops_modules(
     include_clamped_qgeglu=True,
     include_scaled_srelu=True,
     include_scaled_tanh_srelu=False,
+    include_scaled_situ_glu=False,
 ):
     transformer_engine = ModuleType("transformer_engine")
     pytorch = ModuleType("transformer_engine.pytorch")
@@ -1148,6 +1373,8 @@ def _install_fake_te_ops_modules(
         ops.ScaledSReLU = fake_te.pytorch.ops.ScaledSReLU
     if include_scaled_tanh_srelu:
         ops.ScaledTanhSReLU = fake_te.pytorch.ops.ScaledTanhSReLU
+    if include_scaled_situ_glu:
+        ops.ScaledSiTUGLU = fake_te.pytorch.ops.ScaledSiTUGLU
     pytorch.ops = ops
     transformer_engine.pytorch = pytorch
     monkeypatch.setitem(sys.modules, "transformer_engine", transformer_engine)
@@ -1164,6 +1391,8 @@ def _make_fused_impl_support_module(
     moe_mlp_glu_interleave_size=32,
     activation_func_clamp_value=None,
     activation_func_tanh_clamp_scale=None,
+    activation_func_tanh_clamp_scale_linear=None,
+    glu_linear_offset=0.0,
 ):
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
@@ -1171,6 +1400,8 @@ def _make_fused_impl_support_module(
         activation_func=activation_func,
         activation_func_clamp_value=activation_func_clamp_value,
         activation_func_tanh_clamp_scale=activation_func_tanh_clamp_scale,
+        activation_func_tanh_clamp_scale_linear=activation_func_tanh_clamp_scale_linear,
+        glu_linear_offset=glu_linear_offset,
         gated_linear_unit=gated_linear_unit,
         use_fused_weighted_squared_relu=use_fused_weighted_squared_relu,
         moe_mlp_glu_interleave_size=moe_mlp_glu_interleave_size,
@@ -1438,11 +1669,12 @@ def test_is_fused_impl_supported_gates_scaled_srelu_on_weighted_flag_and_non_glu
         (squared_relu, False, False, False),
         (F.silu, True, True, False),
     ],
-    ids=["srelu-te-has-op", "srelu-te-lacks-op", "gated-clamp-is-situ-glu"],
+    ids=["srelu-te-has-op", "srelu-te-lacks-op", "gated-clamp-needs-situ-glu-op"],
 )
 def test_is_fused_impl_supported_gates_tanh_clamp_on_te_capability(
     monkeypatch, activation_func, gated_linear_unit, te_has_tanh_srelu, expected
 ):
+    """ScaledTanhSReLU admits the non-gated clamp only; a gated clamp is SiTU-GLU."""
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
     monkeypatch.setattr(experts_module, "HAVE_TE", True)
@@ -1455,25 +1687,79 @@ def test_is_fused_impl_supported_gates_tanh_clamp_on_te_capability(
         gated_linear_unit=gated_linear_unit,
         use_fused_weighted_squared_relu=not gated_linear_unit,
         activation_func_tanh_clamp_scale=16.0,
+        activation_func_tanh_clamp_scale_linear=25.0 if gated_linear_unit else None,
     )
 
     assert module._is_fused_impl_supported() is expected
 
 
 @pytest.mark.parametrize(
-    ("tanh_clamp_scale", "te_has_tanh_srelu", "raises"),
-    [(16.0, False, True), (16.0, True, False), (None, False, False)],
-    ids=["clamp-te-lacks-op", "clamp-te-has-op", "unclamped"],
+    ("te_has_situ_glu", "linear_scale", "glu_linear_offset", "expected"),
+    [
+        (True, 25.0, 0.0, True),
+        (False, 25.0, 0.0, False),
+        (True, None, 0.0, False),
+        (True, 25.0, 1.0, False),
+    ],
+    ids=["te-has-op", "te-lacks-op", "no-linear-scale", "linear-offset"],
 )
-def test_require_te_tanh_clamp_support(monkeypatch, tanh_clamp_scale, te_has_tanh_srelu, raises):
+def test_is_fused_impl_supported_gates_situ_glu_on_te_capability(
+    monkeypatch, te_has_situ_glu, linear_scale, glu_linear_offset, expected
+):
+    """SiTU-GLU fuses through ScaledSiTUGLU, which clamps both halves and adds no offset."""
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te, include_scaled_situ_glu=te_has_situ_glu)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+        activation_func_tanh_clamp_scale=4.0,
+        activation_func_tanh_clamp_scale_linear=linear_scale,
+        glu_linear_offset=glu_linear_offset,
+    )
+
+    assert module._is_fused_impl_supported() is expected
+
+
+@pytest.mark.parametrize(
+    ("tanh_clamp_scale", "gated_linear_unit", "te_has_tanh_srelu", "te_has_situ_glu", "match"),
+    [
+        (16.0, False, False, True, "ScaledTanhSReLU"),
+        (16.0, False, True, False, None),
+        (4.0, True, True, False, "ScaledSiTUGLU"),
+        (4.0, True, False, True, None),
+        (None, False, False, False, None),
+    ],
+    ids=[
+        "clamp-te-lacks-op",
+        "clamp-te-has-op",
+        "situ-glu-te-lacks-op",
+        "situ-glu-te-has-op",
+        "unclamped",
+    ],
+)
+def test_require_te_tanh_clamp_support(
+    monkeypatch, tanh_clamp_scale, gated_linear_unit, te_has_tanh_srelu, te_has_situ_glu, match
+):
     fake_te, _ = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
     monkeypatch.setattr(experts_module, "HAVE_TE", True)
-    _install_fake_te_ops_modules(monkeypatch, fake_te, include_scaled_tanh_srelu=te_has_tanh_srelu)
+    _install_fake_te_ops_modules(
+        monkeypatch,
+        fake_te,
+        include_scaled_tanh_srelu=te_has_tanh_srelu,
+        include_scaled_situ_glu=te_has_situ_glu,
+    )
 
-    config = SimpleNamespace(activation_func_tanh_clamp_scale=tanh_clamp_scale)
-    if raises:
-        with pytest.raises(RuntimeError, match="ScaledTanhSReLU"):
+    config = SimpleNamespace(
+        activation_func_tanh_clamp_scale=tanh_clamp_scale, gated_linear_unit=gated_linear_unit
+    )
+    if match is not None:
+        with pytest.raises(RuntimeError, match=match):
             experts_module._require_te_tanh_clamp_support(config)
     else:
         experts_module._require_te_tanh_clamp_support(config)
@@ -1508,6 +1794,7 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
         moe_mlp_glu_interleave_size=2,
         delay_wgrad_compute=False,
         activation_func_clamp_value=None,
+        activation_func_tanh_clamp_scale=None,
         activation_func=F.silu,
         gated_linear_unit=True,
     )
@@ -1946,17 +2233,11 @@ class TestTEGroupedMLP:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("override_pattern", (None, "*experts*", "*linear_fc1", "*linear_fc2"))
-    def test_gpu_precision_override_keeps_experts_unfused(self, override_pattern):
-        """A per-module precision override must keep these experts off the op-fuser path.
+    def test_gpu_precision_override_is_resolved_without_disabling_ops(self, override_pattern):
+        """Resolve per-linear overrides while leaving execution precision to forward.
 
-        The fused grouped-MLP kernels are FP8/NVFP4-only and select their recipe from the
-        global autocast state, not from the module's own quantization config. So a module the
-        precision config forces to high precision has to run unfused: otherwise it is silently
-        quantized anyway, and with GTP weight sharding its backward pass is handed an
-        unquantized weight the kernel cannot consume (AttributeError on `_columnwise_data`).
-
-        The fused op covers fc1 and fc2 jointly, so an override matching either one alone must
-        still disable it -- matching only fc2 is what the original GTP crash hit.
+        Matching BF16 overrides can use TE basic operations. Different FC1/FC2 overrides
+        are rejected at execution, as covered by the fused-forward precision tests.
         """
         try:
             from transformer_engine.pytorch.ops import GroupedLinear
@@ -2018,25 +2299,207 @@ class TestTEGroupedMLP:
         experts = layer.experts
         assert isinstance(experts, TEGroupedMLP)
 
-        if override_pattern is None:
-            assert experts._with_fused_impl
-        else:
-            assert not experts._with_fused_impl
+        assert experts._with_fused_impl
+        for name, linear in (
+            ("linear_fc1", experts.linear_fc1),
+            ("linear_fc2", experts.linear_fc2),
+        ):
+            overridden = override_pattern in ("*experts*", f"*{name}")
+            assert linear.will_execute_quantized(True) is not overridden
+
+    @staticmethod
+    def _mxfp8_override_recipe(pattern):
+        """A te-precision-config recipe keeping `pattern` quantized, but with MXFP8."""
+        return RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "mxfp8": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {"fp8_quantization_recipe": "mxfp8"},
+                    }
+                },
+                "matchers": {
+                    "experts_mxfp8": {
+                        "type": "glob",
+                        "enabled": True,
+                        "pattern": pattern,
+                        "config": "mxfp8",
+                    }
+                },
+            }
+        )
+
+    def _build_quantized_override_layer(self, quant_recipe, *, hidden, ffn):
+        """Build the weighted squared-ReLU expert path with MXFP8-compatible dimensions."""
+        tf_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=hidden,
+            ffn_hidden_size=ffn,
+            num_attention_heads=4,
+            num_moe_experts=self.num_experts,
+            use_cpu_initialization=False,
+            add_bias_linear=False,
+            gated_linear_unit=False,
+            activation_func=squared_relu,
+            use_fused_weighted_squared_relu=True,
+            bias_activation_fusion=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            moe_router_load_balancing_type="sinkhorn",
+            moe_router_topk=1,
+            moe_grouped_gemm=True,
+            use_transformer_engine_op_fuser=True,
+            quant_recipe=quant_recipe,
+        )
+        _set_random_seed(seed_=123, data_parallel_random_init=False)
+        submodules = get_submodules(
+            get_gpt_layer_with_transformer_engine_submodules(
+                self.num_experts, moe_grouped_gemm=True
+            ).mlp
+        )
+        # The override is resolved by module path, so the layer needs its name populated.
+        layer = MoELayer(tf_config, submodules, name="mlp")
+        layer = Float16Module(layer.config, layer).module
+        return layer.cuda()
+
+    def _skip_unless_quantized_override_testable(self):
+        try:
+            import transformer_engine.pytorch as te
+            from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
+        except ImportError:
+            pytest.skip("TE op fuser API not available")
+        for probe in (te.is_mxfp8_available, te.is_nvfp4_available):
+            available, reason = probe(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    def test_gpu_quantized_precision_override_runs_fused_with_module_recipe(
+        self, monkeypatch, request
+    ):
+        """MXFP8 experts under NVFP4 autocast match a global-MXFP8 reference exactly.
+
+        Check the recipe at the real TE sequence boundary, its selected fused kernel and
+        quantizers, and the resulting output and gradients.
+        """
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling, NVFP4BlockScaling
+        from transformer_engine.pytorch import MXFP8Quantizer
+        from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+        self._skip_unless_quantized_override_testable()
+        request.getfixturevalue("require_te_fused_srelu_mlp")
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+        hidden, ffn = 128, 256
+
+        overridden = self._build_quantized_override_layer(
+            self._mxfp8_override_recipe("*experts*"), hidden=hidden, ffn=ffn
+        )
+        reference = self._build_quantized_override_layer(None, hidden=hidden, ffn=ffn)
+        self._copy_params(dst=reference, src=overridden)
+        for layer in (overridden, reference):
+            assert isinstance(layer.experts, TEGroupedMLP)
+            assert layer.experts._with_fused_impl, "a quantized override must retain TE ops"
+
+        def record_execution_recipe(experts):
+            contexts = []
+            make_ops = experts._make_fused_ops
+
+            def record_context(_ops, _inputs):
+                contexts.append(
+                    (
+                        FP8GlobalStateManager.is_fp8_enabled(),
+                        type(FP8GlobalStateManager.get_fp8_recipe()),
+                    )
+                )
+
+            def make_ops_with_precision_probe():
+                ops = make_ops()
+                ops.register_forward_pre_hook(record_context)
+                return ops
+
+            monkeypatch.setattr(experts, "_make_fused_ops", make_ops_with_precision_probe)
+            return contexts
+
+        override_contexts = record_execution_recipe(overridden.experts)
+        reference_contexts = record_execution_recipe(reference.experts)
+        torch.manual_seed(1234)
+        hidden_states = torch.randn((64, 2, hidden), dtype=torch.bfloat16, device="cuda")
+
+        def run(layer, recipe):
+            x = hidden_states.clone().requires_grad_(True)
+            with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                out, _ = layer(x)
+                assert FP8GlobalStateManager.is_fp8_enabled()
+                assert FP8GlobalStateManager.get_fp8_recipe() is recipe
+            out.float().sum().backward()
+            grads = [p.grad.detach().clone() for p in layer.experts.parameters()]
+            return out.detach(), x.grad.detach(), grads
+
+        out, dx, grads = run(overridden, NVFP4BlockScaling())
+        ref_out, ref_dx, ref_grads = run(reference, MXFP8BlockScaling())
+        assert override_contexts == [(True, MXFP8BlockScaling)]
+        assert reference_contexts == [(True, MXFP8BlockScaling)]
+        for layer in (overridden, reference):
+            self._assert_fused_op_selected(layer.experts)
+
+        # The overridden fused op quantized with MXFP8, not the ambient NVFP4.
+        (sequential,) = overridden.experts._fused_ops
+        fused_op = sequential._module_groups[0]._forward_ops[0][0]
+        for fc in (fused_op.basic_ops[0], fused_op.basic_ops[-1]):
+            assert isinstance(fc.get_quantizer("forward", 1), MXFP8Quantizer)
+        torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
+        torch.testing.assert_close(dx, ref_dx, rtol=0, atol=0)
+        assert len(grads) == len(ref_grads)
+        for got, want in zip(grads, ref_grads):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    def test_gpu_quantized_precision_override_must_cover_fc1_and_fc2(self):
+        """The TE sequence rejects a quantized override matching only one of its linears."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import NVFP4BlockScaling
+
+        self._skip_unless_quantized_override_testable()
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(1, 1)
+
+        layer = self._build_quantized_override_layer(
+            self._mxfp8_override_recipe("*linear_fc2"), hidden=128, ffn=256
+        )
+        assert layer.experts._with_fused_impl
+        x = torch.randn((64, 2, 128), dtype=torch.bfloat16, device="cuda")
+        with te.fp8_autocast(enabled=True, fp8_recipe=NVFP4BlockScaling()):
+            with pytest.raises(ValueError, match="same precision override"):
+                layer(x)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize(
-        "offload_modules",
-        (["expert_fc1", "moe_act"], ["fused_group_mlp"], ["moe_act"]),
-        ids=("unfused_knobs", "fused_knob", "partial_unfused_knob"),
+        "use_op_fuser,offload_modules",
+        [
+            (False, ["expert_fc1", "moe_act"]),
+            (False, ["moe_act"]),
+            (True, ["expert_fc1", "moe_act"]),
+            (True, ["fused_group_mlp"]),
+            (True, ["moe_act"]),
+        ],
+        ids=("module_both", "module_partial", "ops_both", "ops_fused", "ops_partial"),
     )
-    @pytest.mark.parametrize("override_pattern", (None, "*experts*"), ids=("fused", "unfused"))
-    def test_gpu_offload_knobs_follow_the_experts_path(self, override_pattern, offload_modules):
+    @pytest.mark.parametrize("override_pattern", (None, "*experts*"), ids=("inherit", "bf16"))
+    def test_gpu_offload_knobs_follow_the_experts_path(
+        self, override_pattern, offload_modules, use_op_fuser
+    ):
         """'fused_group_mlp' and 'expert_fc1' + 'moe_act' are equivalent spellings; each
         GroupedMLP maps whichever is given onto its own path. A fused instance offloads the
         block input (a partial 'expert_fc1'/'moe_act' selection is widened to that, with a
         warning), an unfused instance offloads the fc1 and activation inputs. Listing the
-        unfused knobs must not force fusable experts onto the unfused path.
+        unfused knobs or selecting BF16 must not force fusable experts onto the unfused path.
         """
         try:
             from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
@@ -2082,7 +2545,7 @@ class TestTEGroupedMLP:
             moe_router_load_balancing_type="sinkhorn",
             moe_router_topk=1,
             moe_grouped_gemm=True,
-            use_transformer_engine_op_fuser=True,
+            use_transformer_engine_op_fuser=use_op_fuser,
             quant_recipe=quant_recipe,
             fine_grained_activation_offloading=True,
             offload_modules=offload_modules,
@@ -2093,7 +2556,7 @@ class TestTEGroupedMLP:
                 self.num_experts, moe_grouped_gemm=True
             ).mlp
         )
-        fused_instance = override_pattern is None
+        fused_instance = use_op_fuser
         partial = offload_modules == ["moe_act"]
         if fused_instance and partial:
             with pytest.warns(UserWarning, match=r"partial 'expert_fc1' or 'moe_act' selection"):
@@ -2516,20 +2979,20 @@ class TestTEGroupedMLP:
     CLAMP_HIDDEN, CLAMP_FFN, CLAMP_EXPERTS, CLAMP_PER_EXPERT = 128, 256, 2, 32
 
     @staticmethod
-    def _skip_unless_clamped_fusion_available(tanh_clamp_scale):
+    def _skip_unless_clamped_fusion_available(request, tanh_clamp_scale):
         if torch.cuda.get_device_capability()[0] < 10:
             pytest.skip("Fused cuDSL grouped MLP requires SM100+")
-        if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
-            pytest.skip("NVTE_CUTEDSL_FUSED_GROUPED_MLP is unset")
         try:
             from transformer_engine.pytorch.ops.fused import grouped_mlp as te_grouped_mlp
         except ImportError:
             pytest.skip("TE fused grouped MLP module not available")
         fused_cls = getattr(te_grouped_mlp, "GroupedMLP_CuTeGEMMUnary", None)
-        if fused_cls is None or not fused_cls.is_supported():
-            pytest.skip("TE fused unary grouped MLP unsupported here")
+        if fused_cls is None:
+            pytest.skip("Installed TE has no fused unary grouped MLP")
         if tanh_clamp_scale is not None and not experts_module._te_supports_scaled_tanh_srelu():
             pytest.skip("Installed TE has no ScaledTanhSReLU")
+        # A successful capability probe does not restore an import-time fusion registration.
+        request.getfixturevalue("require_te_fused_srelu_mlp")
 
     def _build_clamp_experts(self, tanh_clamp_scale, use_op_fuser):
         tf_config = TransformerConfig(
@@ -2607,9 +3070,9 @@ class TestTEGroupedMLP:
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("tanh_clamp_scale", [None, 2.0])
-    def test_gpu_fused_clamp_matches_unfused_reference(self, tanh_clamp_scale):
+    def test_gpu_fused_clamp_matches_unfused_reference(self, request, tanh_clamp_scale):
         """Fused cuDNN epilogue vs MCore's unfused path: forward and both gradients, MXFP8."""
-        self._skip_unless_clamped_fusion_available(tanh_clamp_scale)
+        self._skip_unless_clamped_fusion_available(request, tanh_clamp_scale)
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(1, 1)
 
@@ -2641,10 +3104,10 @@ class TestTEGroupedMLP:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
-    def test_gpu_clamp_scale_reaches_the_kernel(self):
+    def test_gpu_clamp_scale_reaches_the_kernel(self, request):
         """Saturated, the output scales as s^2: s=8 vs s=1 gives ~64x. An ignored scale gives
         ~1x and a scale applied without the square ~8x."""
-        self._skip_unless_clamped_fusion_available(2.0)
+        self._skip_unless_clamped_fusion_available(request, 2.0)
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(1, 1)
 
@@ -2660,6 +3123,8 @@ class TestTEGroupedMLP:
             return out.float().abs().max()
 
         ratio = (peak(tight) / peak(loose).clamp_min(1e-6)).item()
+        self._assert_fused_op_selected(loose)
+        self._assert_fused_op_selected(tight)
         assert 16.0 < ratio < 256.0, ratio
 
 

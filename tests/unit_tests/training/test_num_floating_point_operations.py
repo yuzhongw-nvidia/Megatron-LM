@@ -1,6 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""FLOPs must use the decoder's final attention type for every MTP depth."""
+"""FLOP accounting for the standard and hybrid model paths.
+
+The standard path must use the decoder's final attention type for every MTP depth; the
+hybrid path must cost KDA, the MLA output gate and attention residuals from the arguments.
+"""
 
 from types import SimpleNamespace
 
@@ -231,3 +235,67 @@ def test_dsv4_dense_csa_flops_do_not_require_an_indexer():
     # plus the full compressed attention core; logits add1536 FLOPs per token.
     expected = (6 * 538 + 1536) * 512 + 24 * (2 * 256**2)
     assert num_floating_point_operations(args, cfg, batch_size=2) == expected
+def _make_hybrid_args(**overrides):
+    """A three-layer hybrid stack: one KDA, one MLA and one MoE layer."""
+    hybrid = dict(
+        hybrid_layer_pattern="K+E",
+        experimental_attention_variant="kda",
+        linear_attention_freq=None,
+        # KimiDeltaAttention requires the same head geometry for K and V.
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        moe_layer_freq=1,
+        num_layers=3,
+        multi_latent_attention=True,
+        q_lora_rank=4,
+        kv_lora_rank=4,
+        qk_head_dim=2,
+        qk_pos_emb_head_dim=2,
+        v_head_dim=2,
+        mamba_state_dim=4,
+        mamba_head_dim=2,
+        mamba_num_groups=1,
+        mamba_num_heads=2,
+        gdp_num_householder=1,
+        kda_f_lora_rank=None,
+        kda_gate_lora_rank=None,
+        attention_output_gate=False,
+        enable_attention_residuals=False,
+        attn_res_block_layers=None,
+        dsa_indexer_n_heads=1,
+        dsa_indexer_head_dim=1,
+        dsa_indexer_topk=1,
+        dsa_indexer_loss_coeff=0.0,
+        dsa_indexer_skip_topk_offset=0,
+        dsa_indexer_topk_freq=1,
+    )
+    hybrid.update(overrides)
+    return _make_args(**hybrid)
+
+
+def _hybrid_flops(**overrides):
+    args, cfg = _make_hybrid_args(**overrides)
+    return num_floating_point_operations(args, cfg, batch_size=3)
+
+
+def test_hybrid_kda_flops_follow_the_configured_head_count():
+    # The hybrid path used to leave kda_num_qk_heads / kda_num_v_heads at their
+    # defaults (16) whatever --linear-num-key-heads said, undercounting KDA models.
+    narrow = _hybrid_flops(linear_num_key_heads=1, linear_num_value_heads=1)
+    wide = _hybrid_flops(linear_num_key_heads=8, linear_num_value_heads=8)
+    wider = _hybrid_flops(linear_num_key_heads=16, linear_num_value_heads=16)
+    assert narrow < wide < wider
+    # KDA FLOPs are linear in the head count: 8 -> 16 adds more than 1 -> 8.
+    assert wider - wide > wide - narrow
+
+
+def test_hybrid_mla_flops_count_the_output_gate():
+    assert _hybrid_flops(attention_output_gate=True) > _hybrid_flops(attention_output_gate=False)
+
+
+def test_hybrid_flops_count_attention_residuals():
+    plain = _hybrid_flops()
+    with_residuals = _hybrid_flops(enable_attention_residuals=True, attn_res_block_layers=1)
+    assert with_residuals > plain

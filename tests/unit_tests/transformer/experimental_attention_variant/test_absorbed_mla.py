@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import random
+from dataclasses import replace
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -691,6 +692,45 @@ _QUANT_RECIPES = [
         marks=pytest.mark.skipif(not nvfp4_available, reason=reason_for_no_nvfp4),
     ),
 ]
+
+
+def test_kimi_dsa_absorbs_complete_kv_up_weight_with_gtp():
+    """The hybrid DSA spec must expose every TP-local K/V head to weight absorption."""
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+
+    if Utils.world_size < 2 or Utils.world_size % 2:
+        pytest.skip("Requires a two-rank GTP group")
+    Utils.initialize_model_parallel(gtp_remat_size=2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = MLATransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            q_lora_rank=64,
+            kv_lora_rank=32,
+            qk_head_dim=32,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=16,
+            add_bias_linear=False,
+            normalization="RMSNorm",
+            qk_layernorm=True,
+        )
+        dsa_spec = hybrid_stack_spec.submodules.dsa_layer.submodules.self_attention
+        attention = AbsorbedMLASelfAttention(
+            config=config,
+            submodules=replace(dsa_spec.submodules, core_attention=MockCoreAttention),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        key, value = attention._get_kv_up_weights()
+        assert key.shape == (4, 32, 32)
+        assert value.shape == (4, 16, 32)
+        (key.sum() + value.sum()).backward()
+        weight = attention.linear_kv_up_proj.weight
+        torch.testing.assert_close(weight.grad, torch.ones_like(weight))
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def _build_absorbed_mla(config, combined_kv_up_projection, state_dict=None):

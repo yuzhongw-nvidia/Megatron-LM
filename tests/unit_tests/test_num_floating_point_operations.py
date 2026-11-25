@@ -1210,6 +1210,31 @@ class TestAccumulator:
         # the closed-form defaults.
         assert consume_seqlen_stats_in_iteration() == (None, None)
 
+    def test_update_does_not_add_to_seeded_global_totals(self):
+        # With a sequence-packing scheduler the training loop seeds the iteration with
+        # the totals of the whole global batch, and every rank's forward_step then
+        # reports its own micro-batch as well. The seeded totals must come back
+        # unchanged and must stay marked as global, so that consume does not sum them
+        # over all ranks.
+        set_seqlen_stats_in_iteration(4 * 16384, 4 * 16384**2)
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 16384], dtype=torch.int32))
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 16384], dtype=torch.int32))
+        assert training_module._seqlen_stats_are_global is True
+        assert consume_seqlen_stats_in_iteration() == (4 * 16384, 4 * 16384**2)
+
+    def test_update_counts_again_after_seeded_iteration_is_consumed(self):
+        # The seed only covers its own iteration: once it is drained, per-rank updates
+        # (the path without a scheduler) accumulate as before.
+        set_seqlen_stats_in_iteration(1000, 500000)
+        _ = consume_seqlen_stats_in_iteration()
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 100, 250], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == (250, 100**2 + 150**2)
+
+    def test_seed_replaces_earlier_per_rank_updates(self):
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 100], dtype=torch.int32))
+        set_seqlen_stats_in_iteration(1000, 500000)
+        assert consume_seqlen_stats_in_iteration() == (1000, 500000)
+
     def test_update_from_padding_mask_counts_real_tokens_only(self):
         # Two right-padded SBHD-validation samples of length 8 with 5 and 3
         # real tokens: the padded tail must not be counted as useful work.

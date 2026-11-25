@@ -25,6 +25,8 @@ from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+    _get_fp8_autocast_for_quant_recipe,
+    _get_fp8_autocast_recipe_for_quant_params,
 )
 from megatron.core.extensions.transformer_engine import (
     mark_grouped_tensor as _mark_te_grouped_tensor,
@@ -130,9 +132,38 @@ def _te_supports_scaled_tanh_srelu() -> bool:
     return "tanh_clamp_scale" in inspect.signature(ScaledTanhSReLU).parameters
 
 
+def _te_supports_scaled_situ_glu() -> bool:
+    """Whether the installed TE provides ``ScaledSiTUGLU`` accepting ``beta1`` and ``beta2``.
+
+    SiTU-GLU (a gated activation with activation_func_tanh_clamp_scale) is fused by this op: it
+    soft-clamps the gate half by ``beta1`` and the linear half by ``beta2``. Checked by
+    capability rather than version, and not cached because tests swap the TE module out.
+    """
+    if not HAVE_TE:
+        return False
+    try:
+        from transformer_engine.pytorch.ops import ScaledSiTUGLU
+    except ImportError:
+        return False
+    parameters = inspect.signature(ScaledSiTUGLU).parameters
+    return "beta1" in parameters and "beta2" in parameters
+
+
 def _require_te_tanh_clamp_support(config) -> None:
     """Raise an actionable error if the op fuser is asked to clamp and the installed TE cannot."""
-    if config.activation_func_tanh_clamp_scale is None or _te_supports_scaled_tanh_srelu():
+    if config.activation_func_tanh_clamp_scale is None:
+        return
+    if config.gated_linear_unit:
+        # A clamped gated activation is SiTU-GLU; the op fuser runs it through ScaledSiTUGLU.
+        if _te_supports_scaled_situ_glu():
+            return
+        raise RuntimeError(
+            "SiTU-GLU (activation_func_tanh_clamp_scale with a gated activation) with "
+            "use_transformer_engine_op_fuser requires a Transformer Engine providing "
+            "ops.ScaledSiTUGLU(beta1=..., beta2=...). Upgrade Transformer Engine, or unset "
+            "use_transformer_engine_op_fuser to use the unfused path."
+        )
+    if _te_supports_scaled_tanh_srelu():
         return
     raise RuntimeError(
         "activation_func_tanh_clamp_scale with use_transformer_engine_op_fuser requires a "
@@ -372,15 +403,9 @@ class TEGroupedMLP(MegatronModule):
 
             set_save_original_input(self.linear_fc2)
 
-        # The fused grouped-MLP kernels are FP8/NVFP4-only and take their recipe from the global
-        # autocast state, so they would ignore a --te-precision-config-file override and quantize
-        # anyway -- silently under plain TE, fatally under GTP, whose backward then hands the
-        # kernel an unquantized weight. Fusion spans fc1 and fc2, so either one opting out ends it.
-        self._with_fused_impl: bool = (
-            self.config.use_transformer_engine_op_fuser
-            and self.linear_fc1.will_execute_quantized(is_context_quantized=True)
-            and self.linear_fc2.will_execute_quantized(is_context_quantized=True)
-        )
+        # Keep BF16 overrides on the TE ops path. _fused_forward applies the resolved
+        # precision context, and TE selects either a joint fusion or its basic operations.
+        self._with_fused_impl: bool = self.config.use_transformer_engine_op_fuser
         # Fused implementation with Transformer Engine op fuser API
         if self.config.use_transformer_engine_op_fuser:
             _require_te_tanh_clamp_support(self.config)
@@ -392,8 +417,8 @@ class TEGroupedMLP(MegatronModule):
         # describe the same thing for the two GroupedMLP paths: the fused TE op-fuser path
         # exposes only the input of the whole fc1 -> act -> fc2 block, the unfused path exposes
         # the fc1 input and the activation input separately. The config accepts either spelling
-        # (they are mutually exclusive there); each instance maps it onto its own path, so a
-        # model mixing fused (quantized) and unfused (e.g. bf16 MTP) experts offloads both.
+        # (they are mutually exclusive there); each instance maps it onto its own path.
+        # BF16 overrides retain the TE ops path and offload the whole block input as well.
         offloading = self.config.fine_grained_activation_offloading
         self.offload_expert_fc1 = offloading and "expert_fc1" in self.config.offload_modules
         self.offload_moe_act = offloading and "moe_act" in self.config.offload_modules
@@ -658,9 +683,20 @@ class TEGroupedMLP(MegatronModule):
                 "Transformer Engine scaled GLU ops do not support activation recompute"
             )
         if self.config.activation_func_tanh_clamp_scale is not None:
-            # Soft-clamped gated activations require the unfused SiTU-GLU path.
-            if not use_srelu_fusion or not _te_supports_scaled_tanh_srelu():
-                return _unsupported("soft clamp requires ScaledTanhSReLU")
+            # Returning False selects the unfused (clamped) path.
+            if use_glu_fusion:
+                # A clamped gated activation is SiTU-GLU (config validation requires silu), fused
+                # by TE's ScaledSiTUGLU: it clamps the gate half by beta1 and the linear half by
+                # beta2 and adds no linear offset, so it needs both scales and a zero offset.
+                if (
+                    self.config.activation_func_tanh_clamp_scale_linear is None
+                    or self.config.glu_linear_offset != 0.0
+                    or not _te_supports_scaled_situ_glu()
+                ):
+                    return False
+            elif not _te_supports_scaled_tanh_srelu():
+                # Non-gated squared ReLU is soft-clamped by ScaledTanhSReLU.
+                return False
         if self.config.activation_func == situlu:
             if not hasattr(te_ops, "ScaledSiTUGLU"):
                 return _unsupported("SiTU-GLU needs ScaledSiTUGLU")
@@ -797,7 +833,22 @@ class TEGroupedMLP(MegatronModule):
             )
         elif self.config.activation_func == F.silu and self.config.gated_linear_unit:
             clamp_value = self.config.activation_func_clamp_value
-            if clamp_value is not None:
+            tanh_clamp_scale = self.config.activation_func_tanh_clamp_scale
+            if tanh_clamp_scale is not None:
+                # SiTU-GLU: beta1 clamps the gate half, beta2 the linear half.
+                # _is_fused_impl_supported admitted this only with both scales and no offset.
+                situ_glu_kwargs = {
+                    "glu_interleave_size": glu_interleave,
+                    "beta1": tanh_clamp_scale,
+                    "beta2": self.config.activation_func_tanh_clamp_scale_linear,
+                }
+                if (
+                    "activation_recompute_in_mlp"
+                    in inspect.signature(te.pytorch.ops.ScaledSiTUGLU).parameters
+                ):
+                    situ_glu_kwargs["activation_recompute_in_mlp"] = activation_recompute_in_mlp
+                op = te.pytorch.ops.ScaledSiTUGLU(**situ_glu_kwargs)
+            elif clamp_value is not None:
                 clamped_glu_kwargs = {
                     "glu_interleave_size": glu_interleave,
                     "alpha": 1.0,
@@ -997,6 +1048,23 @@ class TEGroupedMLP(MegatronModule):
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
+        # Resolve after GPTModel's finish_init sweep, using the original modules' current
+        # train/eval mode. The whole TE sequence must execute under one precision override.
+        fc1_recipe = _get_fp8_autocast_recipe_for_quant_params(
+            self.linear_fc1.te_quant_params, self.linear_fc1.training
+        )
+        fc2_recipe = _get_fp8_autocast_recipe_for_quant_params(
+            self.linear_fc2.te_quant_params, self.linear_fc2.training
+        )
+        if fc1_recipe != fc2_recipe:
+            raise ValueError(
+                "TE grouped-MLP op-fuser requires the same precision override for linear_fc1 "
+                "and linear_fc2. Apply the override to both linears."
+            )
+        quant_context = (
+            nullcontext() if fc1_recipe is None else _get_fp8_autocast_for_quant_recipe(fc1_recipe)
+        )
+
         # Construct fused impl if needed
         # Note: We initialize during the first forward pass in case
         # the params are modified after the constructor.
@@ -1100,7 +1168,7 @@ class TEGroupedMLP(MegatronModule):
                     )
                 post_probs = permuted_probs
                 permuted_probs = torch.ones_like(permuted_probs)
-            with stash_context:
+            with stash_context, quant_context:
                 # NCCL-EP zero-copy: route the fc2 output (fwd combine reads it one-sided) and the
                 # fc1 dgrad (bwd dispatch scatters it one-sided) into caller-provided symm buffers.
                 # op_kwargs keys are basic-op indices into [fc1, activation, fc2]: 0=fc1, -1=fc2.

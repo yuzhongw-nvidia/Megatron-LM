@@ -989,3 +989,24 @@ def test_dynamic_cp_rejects_unsupported_config(overrides, message):
             sequence_packing_scheduler="default_dynamic_cp",
             **overrides,
         )
+
+
+@pytest.mark.parametrize("kind", ["routed", "shared"])
+def test_glu_interleave_with_gtp_sharding_is_opt_in(kind):
+    gtp_kwargs = (
+        {"moe_mlp_glu_interleave_size": 32, "expert_gtp_weight_remat_size": 4}
+        if kind == "routed"
+        else {
+            "use_grouped_gemm_for_shared_expert": True,
+            "moe_shared_expert_intermediate_size": 256,
+            "moe_shared_expert_glu_interleave_size": 32,
+            "gtp_weight_remat_size": 4,
+        }
+    )
+    with pytest.raises(AssertionError, match="GLU interleave is not supported with GTP"):
+        _make_glu_interleave_config(params_dtype=torch.bfloat16, **gtp_kwargs)
+
+    config = _make_glu_interleave_config(
+        params_dtype=torch.bfloat16, moe_glu_interleave_with_gtp_sharding=True, **gtp_kwargs
+    )
+    assert config.moe_glu_interleave_with_gtp_sharding

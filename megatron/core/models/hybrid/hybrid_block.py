@@ -264,10 +264,17 @@ class HybridStack(MegatronModule):
             assert (
                 not self.uses_wide_residual_stream
             ), "enable_attention_residuals does not support wide_residual streams."
-            assert self._cp_layout_manager is None, (
-                "enable_attention_residuals does not support the per-layer CP layout manager "
-                "(explicit linear_cp_layout / attention_cp_layout): depth sources stay in the "
-                "stack boundary layout and would not follow per-layer layout conversions."
+            # Without a sequence-packing scheduler the stack owns a layout manager. It only
+            # moves the residual stream away from the boundary layout when some layer asks for
+            # another layout; when every layer uses the boundary layout it is never called and
+            # the depth sources all share that layout.
+            assert (
+                self._cp_layout_manager is None or not self._cp_layout_manager.requires_conversion
+            ), (
+                "enable_attention_residuals does not support per-layer CP layout conversion "
+                "(a linear_cp_layout / attention_cp_layout different from the stack boundary "
+                "layout): depth sources stay in the stack boundary layout and would not follow "
+                "per-layer layout conversions."
             )
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()

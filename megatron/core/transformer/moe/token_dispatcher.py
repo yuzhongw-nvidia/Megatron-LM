@@ -82,6 +82,22 @@ def _record_current_stream(*tensors: Optional[torch.Tensor]) -> None:
             tensor.record_stream(stream)
 
 
+def _record_current_stream(*tensors: Optional[torch.Tensor]) -> None:
+    """Keep CUDA tensors alive until the work already queued on the current stream has used them.
+
+    Routing tensors are allocated on the compute stream, but under the EP A2A overlap schedule the
+    combine reads them on the communication stream; releasing their last reference there without
+    ``record_stream`` hands the storage back to the compute stream while the read is in flight.
+    On the allocating stream this is a no-op.
+    """
+    cuda_tensors = [t for t in tensors if isinstance(t, torch.Tensor) and t.is_cuda]
+    if not cuda_tensors:
+        return
+    stream = torch.cuda.current_stream()
+    for tensor in cuda_tensors:
+        tensor.record_stream(stream)
+
+
 class MoETokenDispatcher:
     """
     MoE Token Dispatcher
@@ -1149,6 +1165,21 @@ class _DispatchManager(ABC):
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Get the restored hidden states by instances."""
         pass
+
+    def release_router_probs(self) -> None:
+        """Drop the router probabilities cached for this forward once combine has read them.
+
+        ``token_probs`` and ``dispatched_probs`` carry the router's autograd graph back to the
+        layer input. Kept until the layer's next forward, they hold that graph, and under MoE
+        recompute the checkpointed layer input with its gradient, across the rest of the step.
+        Other routing metadata stays: HybridEP drop-and-pad keeps a static ``tokens_per_expert``
+        that only ``setup_metadata`` writes and CUDA graph replay skips.
+        """
+        _record_current_stream(
+            getattr(self, "token_probs", None), getattr(self, "dispatched_probs", None)
+        )
+        self.token_probs = None
+        self.dispatched_probs = None
 
     def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Return the layer input unchanged."""

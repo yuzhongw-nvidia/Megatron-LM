@@ -1995,6 +1995,73 @@ class TestHybridBlock:
             self.get_mla_hybrid_block(layer_pattern)
 
 
+
+
+@pytest.mark.parametrize("linear_cp_layout", ["zigzag", "contiguous"])
+def test_attention_residuals_accept_a_layout_manager_that_never_converts(
+    monkeypatch, linear_cp_layout
+):
+    """Attention residuals read every depth source in the stack boundary layout.
+
+    Without a sequence-packing scheduler the stack builds a CP layout manager. When every
+    layer uses the boundary layout the manager never converts and the stack must build; a
+    layer layout that differs from the boundary layout must still be rejected.
+    """
+
+    class BuiltLayer(torch.nn.Module):
+        def __init__(self, config, layer_number):
+            super().__init__()
+            self.config = config
+            self.layer_number = layer_number
+            if isinstance(config, MambaLayerConfig):
+                self.mixer = SimpleNamespace()
+            else:
+                self.self_attention = SimpleNamespace()
+
+    monkeypatch.setattr(
+        hybrid_block_module,
+        "build_module",
+        lambda module_spec, **kwargs: BuiltLayer(kwargs["config"], kwargs["layer_number"]),
+    )
+    monkeypatch.setattr(
+        hybrid_block_module, "AttnResHybridLayer", lambda config, layer, is_mtp_layer: layer
+    )
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=4,
+        context_parallel_size=2,
+        linear_cp_layout=linear_cp_layout,
+        enable_attention_residuals=True,
+        attn_res_block_layers=1,
+        attn_res_impl="eager",
+    )
+
+    def build_stack():
+        return HybridStack(
+            config=config,
+            submodules=hybrid_stack_spec.submodules,
+            layer_config_list=validate_segment_layers("M*", config),
+            pre_process=False,
+            post_layer_norm=False,
+            post_process=False,
+            pg_collection=SimpleNamespace(
+                pp=None, tp=None, cp=SimpleNamespace(size=lambda: 2), tp_cp=None
+            ),
+        )
+
+    if linear_cp_layout == "contiguous":
+        # The attention layer stays zigzag, so the manager would convert between layers.
+        with pytest.raises(AssertionError, match="per-layer CP layout conversion"):
+            build_stack()
+        return
+
+    block = build_stack()
+    assert block._cp_layout_manager is not None
+    assert not block._cp_layout_manager.requires_conversion
+    assert block._cp_layout_manager.boundary_layout == "zigzag"
+
+
 _HAVE_MAMBA_SSM = __import__("importlib").util.find_spec("mamba_ssm") is not None
 requires_mamba_ssm = pytest.mark.skipif(
     not _HAVE_MAMBA_SSM, reason="mamba_ssm not installed in this environment"

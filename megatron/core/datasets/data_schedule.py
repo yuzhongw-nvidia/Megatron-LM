@@ -934,6 +934,10 @@ def get_batch_on_this_rank_for_sequence_packing(
                 tp_cp_group,
             ),
             tokens_per_sample=None,
+            # getattr: callers may pass a stand-in that carries the layouts only.
+            contiguous_padded_qkv_seqlens=getattr(
+                config, "cp_contiguous_padded_qkv_seqlens", False
+            ),
         )
         if not getattr(config, "_linear_cp_layout_explicit", True):
             # Match the tuple path's metadata for the legacy layout: static THD batches

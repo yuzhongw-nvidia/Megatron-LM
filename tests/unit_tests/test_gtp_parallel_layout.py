@@ -136,6 +136,73 @@ class TestGTPParallelLayout:
         assert layout.dp == 1
         assert layout.batch_parallel_size == (64 // tp) // num_sequence_shards
 
+    @pytest.mark.parametrize(
+        "cp,num_sequence_shards,weight,consecutive",
+        [
+            (1, 4, 8, True),  # no configured CP on top of the shards
+            (2, 8, 8, True),  # configured CP on shards that span the whole weight group
+            (4, 2, 2, True),
+            (2, 4, 8, False),  # batch shards sit between the shard and the configured CP rank
+            (3, 2, 4, False),
+        ],
+    )
+    def test_packed_buffer_ranks_are_consecutive(
+        self, cp, num_sequence_shards, weight, consecutive
+    ):
+        """DpBalancedScheduler gives packed buffer ``j // cp_size`` to data-group rank ``j``."""
+        layout = GTPParallelLayout(2 * cp * weight, 1, 1, cp, weight, num_sequence_shards)
+        cp_group_of = _by_rank(layout.data.get_ranks("cp"))
+        cp_size = cp * num_sequence_shards
+        blocks_are_cp_groups = all(
+            sorted(cp_group_of[group[start]]) == sorted(group[start : start + cp_size])
+            for group in layout.data.get_ranks("dp-cp-gtp_remat")
+            for start in range(0, len(group), cp_size)
+        )
+        assert blocks_are_cp_groups is consecutive
+        if consecutive:
+            # Rank ``j`` of the data group is also CP rank ``j % cp_size`` of its buffer, and
+            # the ranks that share a CP position are one sample group (one per buffer).
+            sample_group_of = _by_rank(layout.data.get_ranks("gtp_remat-dp"))
+            for group in layout.data.get_ranks("dp-cp-gtp_remat"):
+                for j, rank in enumerate(group):
+                    assert sorted(cp_group_of[rank]).index(rank) == j % cp_size
+                    assert sorted(sample_group_of[rank]).index(rank) == j // cp_size
+
+    def test_packing_scheduler_needs_consecutive_cp_ranks(self):
+        common = dict(
+            tensor_model_parallel_size=1,
+            tensor_parallel_num_weight_shards=8,
+            max_seqlen_per_dp_cp_rank=4096,
+            sequence_packing_scheduler="dp_balanced",
+        )
+        # Shards are the whole CP group.
+        config = ModelParallelConfig(
+            context_parallel_size=8, tensor_parallel_num_sequence_shards=8, **common
+        )
+        assert config.gtp_remat_num_sequence_shards == 8
+        assert config.variable_seq_lengths
+        ModelParallelConfig(
+            context_parallel_size=4, tensor_parallel_num_sequence_shards=4, **common
+        )
+        # Configured CP on shards that span the whole weight group.
+        config = ModelParallelConfig(
+            context_parallel_size=16, tensor_parallel_num_sequence_shards=8, **common
+        )
+        assert config.gtp_remat_num_sequence_shards == 8
+        # Configured CP with batch shards left in the weight group.
+        with pytest.raises(ValueError, match="batch shards remain"):
+            ModelParallelConfig(
+                context_parallel_size=8, tensor_parallel_num_sequence_shards=4, **common
+            )
+        # Dynamic CP selects its own scheduler, which regroups the ranks per microbatch.
+        with pytest.raises(ValueError, match="only the dp_balanced"):
+            ModelParallelConfig(
+                context_parallel_size=8,
+                tensor_parallel_num_sequence_shards=8,
+                dynamic_context_parallel=True,
+                **{**common, "sequence_packing_scheduler": None},
+            )
+
     @pytest.mark.parametrize("tp,sp", [(1, False), (2, False), (2, True)])
     def test_default_has_one_gtp_sequence_shard(self, tp, sp):
         shards, num_sequence_shards = resolve_tensor_parallel_sequence_shards(tp, None, 4, sp)

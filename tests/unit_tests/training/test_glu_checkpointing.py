@@ -560,3 +560,19 @@ def test_interleaving_rejects_inplace_load_even_for_supported_checkpoint_format(
 def test_invalid_interleave_size_is_rejected(size):
     with pytest.raises(ValueError):
         prepare_glu_checkpoint_for_load({}, _args(routed=size))
+
+
+@pytest.mark.parametrize("kind", ["routed", "shared"])
+def test_gtp_sharded_glu_rows_refuse_checkpoint_conversion(kind):
+    """The opt-in GTP + interleave runtime has no checkpoint layout conversion."""
+    if kind == "routed":
+        args = _args(routed=32)
+        args.expert_gtp_weight_remat_size = 4
+    else:
+        args = _args(shared=32)
+        args.gtp_weight_remat_size = 4
+    args.moe_glu_interleave_with_gtp_sharding = True
+    with pytest.raises(NotImplementedError, match="GTP-sharded FC1 rows"):
+        validate_glu_checkpoint_backend(args, ckpt_format="torch_dist")
+    # Unsharded FC1 rows keep converting as before.
+    validate_glu_checkpoint_backend(_args(routed=32, shared=32), ckpt_format="torch_dist")

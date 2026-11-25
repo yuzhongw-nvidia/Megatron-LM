@@ -180,10 +180,36 @@ def prepare_glu_checkpoint_for_load(state_dict, args):
     return _convert_model_sections(state_dict, _interleave_sizes(args), interleave=True)
 
 
+def _gtp_sharded_glu_kinds(config):
+    """GLU-interleaved FC1 kinds whose rows GTP shards; their layout cannot be converted."""
+    sizes = _interleave_sizes(config)
+    gtp = {
+        'routed': _config_value(
+            config,
+            'expert_gtp_weight_remat_size',
+            _config_value(config, 'expert_tensor_parallel_num_weight_shards', 1),
+        ),
+        'shared': _config_value(
+            config,
+            'gtp_weight_remat_size',
+            _config_value(config, 'tensor_parallel_num_weight_shards', 1),
+        ),
+    }
+    return [kind for kind, size in sizes.items() if size is not None and (gtp[kind] or 1) > 1]
+
+
 def validate_glu_checkpoint_backend(args, *, ckpt_format, skip_load_to_model_and_opt=False):
     """Require the explicit load-state-dict path used for GLU layout conversion."""
     if not any(size is not None for size in _interleave_sizes(args).values()):
         return
+    sharded = _gtp_sharded_glu_kinds(args)
+    if sharded:
+        raise NotImplementedError(
+            f'GLU checkpoint layout conversion does not support GTP-sharded FC1 rows ({sharded} '
+            'experts, moe_glu_interleave_with_gtp_sharding): the contiguous <-> interleaved row '
+            'permutation spans GTP shards. Disable GLU interleave or GTP weight sharding to save '
+            'or load checkpoints.'
+        )
     if ckpt_format not in ('torch', 'torch_dist') or skip_load_to_model_and_opt:
         raise NotImplementedError(
             'GLU checkpoint layout conversion requires torch or torch_dist checkpoints '
